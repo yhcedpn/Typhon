@@ -1,12 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Activity, Blocks, Clock, Crosshair, ExternalLink, FileCode, Layers, Tag } from 'lucide-react';
-import type { ChunkSpan, MarkerSelection, PhaseMarker, PhaseSpan, SpanData, TickData } from '@/libs/profiler/model/traceModel';
+import type { ChunkSpan, MarkerSelection, PhaseMarker, PhaseSpan, SpanData } from '@/libs/profiler/model/traceModel';
 import { TraceEventKind } from '@/libs/profiler/model/types';
-import type { TickSummary } from '@/libs/profiler/model/types';
-import type { TimeRange } from '@/libs/profiler/model/uiTypes';
 import type { ProfilerSelection } from '@/stores/useProfilerSelectionStore';
 import { useProfilerSessionStore } from '@/stores/useProfilerSessionStore';
-import { computeSelectionStats } from '@/libs/profiler/stats/selectionStats';
+import { useProfilerStatsStore } from '@/stores/useProfilerStatsStore';
+import { useProfilerViewStore } from '@/stores/useProfilerViewStore';
 import { useSourceLocationStore } from '@/stores/useSourceLocationStore';
 import { useOptionsStore } from '@/stores/useOptionsStore';
 import { openSourcePreview } from '@/shell/commands/openSchemaBrowser';
@@ -25,25 +24,16 @@ import { openSourcePreview } from '@/shell/commands/openSchemaBrowser';
 
 interface Props {
   /**
-   * Click selection from the profiler panel. When `null` the user hasn't clicked anything specific
-   * — caller should pass the current `ticks` + `tickSummaries` + `viewRange` so this renders the
-   * range-stats fallback (aggregates across the visible viewport instead of one element's metadata).
+   * Click selection from the profiler panel. When `null` the right-pane falls back to the range-
+   * stats view, which reads its data from `useProfilerStatsStore` (populated once per click by
+   * `useProfilerStatsWriter`) — no per-panel ticks/viewRange threading needed.
    */
   selection: ProfilerSelection | null;
-  /** Cache-resident tick data — required for the range-stats fallback. Optional otherwise. */
-  ticks?: TickData[];
-  /** All known tick summaries (cheap header-level data) — used to compute coverage caveats. */
-  tickSummaries?: TickSummary[] | null;
-  /** Current viewport — drives the range-stats aggregation. Required for the fallback. */
-  viewRange?: TimeRange;
 }
 
-export default function ProfilerDetail({ selection, ticks, tickSummaries, viewRange }: Props): React.JSX.Element | null {
+export default function ProfilerDetail({ selection }: Props): React.JSX.Element | null {
   if (selection === null) {
-    if (ticks && viewRange) {
-      return <RangeStatsDetail ticks={ticks} tickSummaries={tickSummaries ?? null} viewRange={viewRange} />;
-    }
-    return null;
+    return <RangeStatsDetail />;
   }
   switch (selection.kind) {
     case 'span':         return <SpanDetail span={selection.span} />;
@@ -75,81 +65,31 @@ const DL_CLASS = 'grid grid-cols-[auto,1fr] gap-x-3 gap-y-1 text-[11px] select-t
 
 // ─── Spans ─────────────────────────────────────────────────────────────────────────────────────
 
-/**
- * Source-location row for span details (#302). Resolves the span's `sourceLocationId` via the
- * compile-time table emitted by `SourceLocationGenerator` and offers a one-click "Open in editor"
- * handoff to the user's configured editor (VS Code / Cursor / Rider / VS / custom).
- *
- * Rendered only when the span carries a non-zero `sourceLocationId` AND the manifest is loaded.
- * For un-attributed spans (siteId = 0 — non-Engine call sites) this row simply doesn't render.
- */
-function SpanSourceRow({ span }: { span: SpanData }): React.JSX.Element | null {
+function SpanDetail({ span }: { span: SpanData }): React.JSX.Element {
+  const globalStartUs = useGlobalStartUs();
   const resolve = useSourceLocationStore((s) => s.resolve);
   const openInEditor = useOptionsStore((s) => s.openInEditor);
-  const [error, setError] = useState<string | null>(null);
-
-  const siteId = span.rawEvent?.sourceLocationId;
-  const loc = resolve(siteId);
-  if (!loc) return null;
+  const [openError, setOpenError] = useState<string | null>(null);
+  const loc = resolve(span.rawEvent?.sourceLocationId);
 
   async function handleOpen(): Promise<void> {
-    setError(null);
+    if (!loc) return;
+    setOpenError(null);
     try {
-      const result = await openInEditor(loc!.file, loc!.line);
-      if (!result.ok) {
-        setError(result.error || 'Editor launch failed');
-      }
+      const result = await openInEditor(loc.file, loc.line);
+      if (!result.ok) setOpenError(result.error || 'Editor launch failed');
     } catch (err) {
-      setError((err as Error).message);
+      setOpenError((err as Error).message);
     }
   }
 
-  const pathTitle = `${loc.file}:${loc.line}${loc.method ? ` · ${loc.method}` : ''}`;
   return (
-    <div className="mt-2 flex flex-col gap-1.5 rounded-md border border-border bg-muted/30 p-2 text-[12px]">
-      <div className="flex min-w-0 items-center gap-2">
-        <FileCode className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate select-text font-mono text-foreground" title={pathTitle}>
-          {loc.file}<span className="text-muted-foreground">:{loc.line}</span>
-          {loc.method && <span className="ml-2 text-muted-foreground"> · {loc.method}</span>}
-        </span>
-      </div>
-      <div className="flex items-center gap-2">
-        <button
-          type="button"
-          onClick={() => openSourcePreview(loc.file, loc.line)}
-          className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent"
-          title="Open an inline source-code preview around this line"
-        >
-          <FileCode className="h-3 w-3" /> Show inline
-        </button>
-        <button
-          type="button"
-          onClick={handleOpen}
-          className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent"
-          title="Open this file at the emission line in your configured editor"
-        >
-          <ExternalLink className="h-3 w-3" /> Open in editor
-        </button>
-        {error && (
-          <span className="ml-2 truncate text-[11px] text-destructive" title={error}>
-            {error.length > 60 ? error.slice(0, 60) + '…' : error}
-          </span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function SpanDetail({ span }: { span: SpanData }): React.JSX.Element {
-  const globalStartUs = useGlobalStartUs();
-  return (
-    <div className="flex h-full flex-col bg-background p-3">
+    <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3">
       <div className="rounded-md border border-border bg-card p-3 text-[12px]">
         <Header icon={<Activity className="h-4 w-4 text-muted-foreground" />} title={span.name} suffix="span" />
         <dl className={DL_CLASS}>
           <dt className="text-muted-foreground">Kind</dt>
-          <dd className="font-mono text-foreground">{span.kind}</dd>
+          <dd className="min-w-0 truncate font-mono text-foreground">{span.kind}</dd>
 
           <dt className="text-muted-foreground">Thread</dt>
           <dd className="font-mono tabular-nums text-foreground">Slot {span.threadSlot}</dd>
@@ -180,31 +120,25 @@ function SpanDetail({ span }: { span: SpanData }): React.JSX.Element {
           {span.spanId && (
             <>
               <dt className="text-muted-foreground">Span id</dt>
-              <dd className="truncate font-mono text-foreground">{span.spanId}</dd>
+              <dd className="min-w-0 truncate font-mono text-foreground">{span.spanId}</dd>
             </>
           )}
 
           {span.parentSpanId && (
             <>
               <dt className="text-muted-foreground">Parent</dt>
-              <dd className="truncate font-mono text-foreground">{span.parentSpanId}</dd>
+              <dd className="min-w-0 truncate font-mono text-foreground">{span.parentSpanId}</dd>
             </>
           )}
 
           {span.traceIdHi !== undefined && span.traceIdLo !== undefined && (
             <>
               <dt className="text-muted-foreground">Trace id</dt>
-              <dd className="truncate font-mono text-foreground">{span.traceIdHi}.{span.traceIdLo}</dd>
+              <dd className="min-w-0 truncate font-mono text-foreground">{span.traceIdHi}.{span.traceIdLo}</dd>
             </>
           )}
-        </dl>
 
-        {/* #302: source-attribution row — file:line · method + Open in editor / Show inline buttons. */}
-        <SpanSourceRow span={span} />
-
-        <dl className={DL_CLASS}>
-          {/* Kind-specific payload surfaced from the rawEvent. ClusterMigration carries archetype +
-              entity count + total component instances moved (= entities × per-entity component slots). */}
+          {/* Kind-specific payload */}
           {span.kind === TraceEventKind.ClusterMigration && span.rawEvent && (
             <>
               {span.rawEvent.archetypeId !== undefined && (
@@ -228,8 +162,6 @@ function SpanDetail({ span }: { span: SpanData }): React.JSX.Element {
             </>
           )}
 
-          {/* Page cache flush — pageCount tells us how many dirty pages this SaveChanges call wrote.
-              Small (1-3) = registry/bootstrap; medium (~10) = occupancy map grow; large = batched data flush. */}
           {(span.kind === TraceEventKind.PageCacheFlush || span.kind === TraceEventKind.PageCacheFlushCompleted) && span.rawEvent?.pageCount !== undefined && (
             <>
               <dt className="text-muted-foreground">Pages</dt>
@@ -237,7 +169,6 @@ function SpanDetail({ span }: { span: SpanData }): React.JSX.Element {
             </>
           )}
 
-          {/* Page cache disk read/write/allocate — the file page index that was being touched. */}
           {(span.kind === TraceEventKind.PageCacheDiskRead || span.kind === TraceEventKind.PageCacheDiskWrite
             || span.kind === TraceEventKind.PageCacheAllocatePage || span.kind === TraceEventKind.PageEvicted
             || span.kind === TraceEventKind.PageCacheDiskReadCompleted || span.kind === TraceEventKind.PageCacheDiskWriteCompleted)
@@ -257,7 +188,37 @@ function SpanDetail({ span }: { span: SpanData }): React.JSX.Element {
               )}
             </>
           )}
+
+          {/* Source attribution */}
+          {loc && (
+            <>
+              <dt className="text-muted-foreground">File</dt>
+              <dd className="min-w-0 truncate font-mono text-foreground" title={`${loc.file}:${loc.line}`}>
+                {loc.file}<span className="text-muted-foreground">:{loc.line}</span>
+              </dd>
+              {loc.method && (
+                <>
+                  <dt className="text-muted-foreground">Method</dt>
+                  <dd className="min-w-0 truncate font-mono text-foreground" title={loc.method}>{loc.method}</dd>
+                </>
+              )}
+            </>
+          )}
         </dl>
+
+        {loc && (
+          <div className="mt-2 flex flex-wrap gap-2 border-t border-border pt-2">
+            <button type="button" onClick={() => openSourcePreview(loc.file, loc.line)}
+              className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent">
+              <FileCode className="h-3 w-3" /> Show inline
+            </button>
+            <button type="button" onClick={handleOpen}
+              className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent">
+              <ExternalLink className="h-3 w-3" /> Open in editor
+            </button>
+            {openError && <span className="w-full truncate text-[11px] text-destructive" title={openError}>{openError.length > 60 ? openError.slice(0, 60) + '…' : openError}</span>}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -265,78 +226,31 @@ function SpanDetail({ span }: { span: SpanData }): React.JSX.Element {
 
 // ─── Chunks ────────────────────────────────────────────────────────────────────────────────────
 
-/**
- * Source-location row for chunk details (#302 system attribution). Resolves the chunk's source via
- * the synthesized system id (<c>0x8000 | systemIndex</c>) emitted by <c>RuntimeSourceLocationManifest</c>
- * on the engine side. Same shape as <see cref="SpanSourceRow"/> — file:line · method on row 1, the two
- * actions on row 2. Renders nothing when the system has no PDB-resolved attribution.
- */
-function ChunkSourceRow({ chunk }: { chunk: ChunkSpan }): React.JSX.Element | null {
+function ChunkDetail({ chunk }: { chunk: ChunkSpan }): React.JSX.Element {
+  const globalStartUs = useGlobalStartUs();
   const resolveSystem = useSourceLocationStore((s) => s.resolveSystem);
   const openInEditor = useOptionsStore((s) => s.openInEditor);
-  const [error, setError] = useState<string | null>(null);
-
+  const [openError, setOpenError] = useState<string | null>(null);
   const loc = resolveSystem(chunk.systemIndex);
-  if (!loc) return null;
 
   async function handleOpen(): Promise<void> {
-    setError(null);
+    if (!loc) return;
+    setOpenError(null);
     try {
-      const result = await openInEditor(loc!.file, loc!.line);
-      if (!result.ok) {
-        setError(result.error || 'Editor launch failed');
-      }
+      const result = await openInEditor(loc.file, loc.line);
+      if (!result.ok) setOpenError(result.error || 'Editor launch failed');
     } catch (err) {
-      setError((err as Error).message);
+      setOpenError((err as Error).message);
     }
   }
 
-  const pathTitle = `${loc.file}:${loc.line}${loc.method ? ` · ${loc.method}` : ''}`;
   return (
-    <div className="mt-2 flex flex-col gap-1.5 rounded-md border border-border bg-muted/30 p-2 text-[12px]">
-      <div className="flex min-w-0 items-center gap-2">
-        <FileCode className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate select-text font-mono text-foreground" title={pathTitle}>
-          {loc.file}<span className="text-muted-foreground">:{loc.line}</span>
-          {loc.method && <span className="ml-2 text-muted-foreground"> · {loc.method}</span>}
-        </span>
-      </div>
-      <div className="flex items-center gap-2">
-        <button
-          type="button"
-          onClick={() => openSourcePreview(loc.file, loc.line)}
-          className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent"
-          title="Open an inline source-code preview around this line"
-        >
-          <FileCode className="h-3 w-3" /> Show inline
-        </button>
-        <button
-          type="button"
-          onClick={handleOpen}
-          className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent"
-          title="Open this file at the system entry method in your configured editor"
-        >
-          <ExternalLink className="h-3 w-3" /> Open in editor
-        </button>
-        {error && (
-          <span className="ml-2 truncate text-[11px] text-destructive" title={error}>
-            {error.length > 60 ? error.slice(0, 60) + '…' : error}
-          </span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ChunkDetail({ chunk }: { chunk: ChunkSpan }): React.JSX.Element {
-  const globalStartUs = useGlobalStartUs();
-  return (
-    <div className="flex h-full flex-col bg-background p-3">
+    <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3">
       <div className="rounded-md border border-border bg-card p-3 text-[12px]">
         <Header icon={<Blocks className="h-4 w-4 text-muted-foreground" />} title={chunk.systemName || `System ${chunk.systemIndex}`} suffix="chunk" />
         <dl className={DL_CLASS}>
           <dt className="text-muted-foreground">System</dt>
-          <dd className="font-mono text-foreground">#{chunk.systemIndex} {chunk.systemName}</dd>
+          <dd className="min-w-0 truncate font-mono text-foreground">#{chunk.systemIndex} {chunk.systemName}</dd>
 
           <dt className="text-muted-foreground">Thread</dt>
           <dd className="font-mono tabular-nums text-foreground">Slot {chunk.threadSlot}</dd>
@@ -357,10 +271,37 @@ function ChunkDetail({ chunk }: { chunk: ChunkSpan }): React.JSX.Element {
 
           <dt className="text-muted-foreground">Entities</dt>
           <dd className="font-mono tabular-nums text-foreground">{chunk.entitiesProcessed.toLocaleString()}</dd>
+
+          {/* Source attribution (#302) */}
+          {loc && (
+            <>
+              <dt className="text-muted-foreground">File</dt>
+              <dd className="min-w-0 truncate font-mono text-foreground" title={`${loc.file}:${loc.line}`}>
+                {loc.file}<span className="text-muted-foreground">:{loc.line}</span>
+              </dd>
+              {loc.method && (
+                <>
+                  <dt className="text-muted-foreground">Method</dt>
+                  <dd className="min-w-0 truncate font-mono text-foreground" title={loc.method}>{loc.method}</dd>
+                </>
+              )}
+            </>
+          )}
         </dl>
 
-        {/* #302 system attribution: source row points to the system's entry method (PDB-resolved). */}
-        <ChunkSourceRow chunk={chunk} />
+        {loc && (
+          <div className="mt-2 flex flex-wrap gap-2 border-t border-border pt-2">
+            <button type="button" onClick={() => openSourcePreview(loc.file, loc.line)}
+              className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent">
+              <FileCode className="h-3 w-3" /> Show inline
+            </button>
+            <button type="button" onClick={handleOpen}
+              className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent">
+              <ExternalLink className="h-3 w-3" /> Open in editor
+            </button>
+            {openError && <span className="w-full truncate text-[11px] text-destructive" title={openError}>{openError.length > 60 ? openError.slice(0, 60) + '…' : openError}</span>}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -383,7 +324,7 @@ function TickDetail({ tickNumber }: { tickNumber: number }): React.JSX.Element {
   const globalStartUs = useGlobalStartUs();
 
   return (
-    <div className="flex h-full flex-col bg-background p-3">
+    <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3">
       <div className="rounded-md border border-border bg-card p-3 text-[12px]">
         <Header icon={<Clock className="h-4 w-4 text-muted-foreground" />} title={`Tick ${tickNumber}`} suffix="scheduler tick" />
         {tickSummary ? (
@@ -413,7 +354,7 @@ function TickDetail({ tickNumber }: { tickNumber: number }): React.JSX.Element {
 function MarkerDetail({ marker }: { marker: MarkerSelection }): React.JSX.Element {
   const globalStartUs = useGlobalStartUs();
   return (
-    <div className="flex h-full flex-col bg-background p-3">
+    <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3">
       <div className="rounded-md border border-border bg-card p-3 text-[12px]">
         <Header icon={<Tag className="h-4 w-4 text-muted-foreground" />} title={marker.kind} suffix="marker" />
         {marker.kind === 'memory-alloc' && (
@@ -476,7 +417,7 @@ function MarkerDetail({ marker }: { marker: MarkerSelection }): React.JSX.Elemen
 function PhaseDetail({ phase, tickNumber }: { phase: PhaseSpan; tickNumber: number }): React.JSX.Element {
   const globalStartUs = useGlobalStartUs();
   return (
-    <div className="flex h-full flex-col bg-background p-3">
+    <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3">
       <div className="rounded-md border border-border bg-card p-3 text-[12px]">
         <Header icon={<Layers className="h-4 w-4 text-muted-foreground" />} title={phase.phaseName} suffix="phase span" />
         <dl className={DL_CLASS}>
@@ -512,7 +453,7 @@ function PhaseDetail({ phase, tickNumber }: { phase: PhaseSpan; tickNumber: numb
 function PhaseMarkerDetail({ marker, tickNumber }: { marker: PhaseMarker; tickNumber: number }): React.JSX.Element {
   const globalStartUs = useGlobalStartUs();
   return (
-    <div className="flex h-full flex-col bg-background p-3">
+    <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3">
       <div className="rounded-md border border-border bg-card p-3 text-[12px]">
         <Header icon={<Tag className="h-4 w-4 text-muted-foreground" />} title={marker.label} suffix="phase marker" />
         <dl className={DL_CLASS}>
@@ -542,40 +483,24 @@ function PhaseMarkerDetail({ marker, tickNumber }: { marker: PhaseMarker; tickNu
 /**
  * Aggregates over the current viewport — shown in the right-pane Detail when nothing is clicked.
  * Mirrors the user's mental model "what am I looking at?": stats follow the viewRange, not a frozen
- * drag-selection. Aggregation is debounced 150 ms so wheel-zoom doesn't fire N recomputes per second,
- * and only walks the cache-resident ticks (`ticks` prop) — the cache loader keeps the visible window
- * resident so the resident set normally covers the viewport. When the cache covers only part of the
- * range (whole-trace zoom-out past the budget) we surface that as a "X of Y ticks loaded" caveat.
+ * drag-selection. The aggregation lives in `useProfilerStatsStore`, populated once per click by
+ * `useProfilerStatsWriter` (which `ProfilerPanel` runs). This component just subscribes — keeps the
+ * compute single-producer so it doesn't double up with TopSpansPanel's read of the same store.
  */
-function RangeStatsDetail({
-  ticks,
-  tickSummaries,
-  viewRange,
-}: {
-  ticks: TickData[];
-  tickSummaries: TickSummary[] | null;
-  viewRange: TimeRange;
-}): React.JSX.Element {
+function RangeStatsDetail(): React.JSX.Element {
   // Trace timestamps are absolute QPC-based microseconds (a 64-bit value that's effectively the
   // process's wall-clock counter, not 0). Subtract `globalStartUs` so From/To/Duration display as
   // milliseconds-since-trace-start, matching the ruler's labels.
   const globalStartUs = useGlobalStartUs();
-
-  // Debounce: a wheel-zoom event burst flips viewRange dozens of times per second. Recomputing the
-  // O(events) aggregation on each is wasteful — coalesce to one compute 150 ms after the user
-  // stops interacting. The render still shows the previous stats during the burst so the panel
-  // doesn't flash to "loading" on every wheel notch.
-  const [debounced, setDebounced] = useState<{ ticks: TickData[]; viewRange: TimeRange }>({ ticks, viewRange });
-  useEffect(() => {
-    const id = setTimeout(() => setDebounced({ ticks, viewRange }), 150);
-    return () => clearTimeout(id);
-  }, [ticks, viewRange]);
-
-  const stats = computeSelectionStats(debounced.ticks, tickSummaries, debounced.viewRange);
+  const stats = useProfilerStatsStore((s) => s.stats);
+  const viewRange = useProfilerViewStore((s) => s.viewRange);
+  const hasViewRange = viewRange.endUs > viewRange.startUs;
   if (stats === null) {
     return (
       <div className="flex h-full items-center justify-center bg-background p-3">
-        <p className="text-[11px] text-muted-foreground">Drag a range or pan/zoom to see stats.</p>
+        <p className="text-[11px] text-muted-foreground">
+          {hasViewRange ? 'Computing range stats…' : 'Drag a range or pan/zoom to see stats.'}
+        </p>
       </div>
     );
   }
@@ -667,7 +592,7 @@ function Header({ icon, title, suffix }: { icon: React.ReactNode; title: string;
   return (
     <div className="mb-2 flex items-center gap-2 border-b border-border pb-2">
       {icon}
-      <h3 className="truncate text-[13px] font-semibold text-foreground">{title}</h3>
+      <h3 className="min-w-0 truncate text-[13px] font-semibold text-foreground">{title}</h3>
       <span className="ml-auto font-mono text-[11px] text-muted-foreground">{suffix}</span>
     </div>
   );
