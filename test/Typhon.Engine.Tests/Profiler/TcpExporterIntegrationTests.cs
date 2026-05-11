@@ -6,7 +6,6 @@ using System.Net.Sockets;
 using System.Threading;
 using NUnit.Framework;
 using Typhon.Engine.Profiler;
-using Typhon.Engine.Profiler.Exporters;
 using Typhon.Profiler;
 
 namespace Typhon.Engine.Tests.Profiler;
@@ -312,8 +311,8 @@ public class TcpExporterIntegrationTests
 
             if (kind == TraceEventKind.ClusterMigration)
             {
-                var data = ClusterMigrationEventCodec.Decode(record);
-                if (data.ArchetypeId == 7 && data.MigrationCount == 3)
+                var dto = (Typhon.Profiler.Events.ClusterMigrationEventDto)Typhon.Profiler.Events.TraceEventDecoder.Decode(record, 0, 1);
+                if (dto.ArchetypeId == 7 && dto.MigrationCount == 3)
                 {
                     decodedClusterMigration = true;
                 }
