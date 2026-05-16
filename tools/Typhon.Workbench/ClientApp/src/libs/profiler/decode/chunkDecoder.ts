@@ -87,6 +87,8 @@ function isInstantKind(v: number): boolean {
   //   243 (RuntimePhaseSpan)        — SPAN, falls through.
   //   244 (QueueTickEnd)            — instant rollup, hand-coded codec, no span-header extension.
   if (v === 242 || v === 244) return true;
+  // OS thread scheduling (#ETW) — 254 (ThreadContextSwitch) is instant-shaped: 12-byte header + 13-byte payload, no span extension.
+  if (v === 254) return true;
   return false;
 }
 
@@ -237,6 +239,22 @@ function decodeInstant(
       return {
         kind, threadSlot, tickNumber, timestampUs,
         changeCount: reader.readI32(payloadOffset + 8),
+      };
+
+    case TraceEventKind.ThreadContextSwitch:
+      // OS thread context-switch — one ON-CPU slice. 13-byte payload, mirrors `ThreadSchedulingEvents.cs`:
+      //   u8 targetSlotIdx, u8 processorNumber, u8 waitReason, u8 threadState, u8 gettingIdle,
+      //   u32 durationQpc @ +5, u32 readyTimeQpc @ +9.
+      // durationQpc / readyTimeQpc are raw QPC ticks → microseconds via ticksPerUs (QPC == the trace clock).
+      return {
+        kind, threadSlot, tickNumber, timestampUs,
+        targetSlotIdx: reader.readU8(payloadOffset),
+        processorNumber: reader.readU8(payloadOffset + 1),
+        waitReason: reader.readU8(payloadOffset + 2),
+        threadState: reader.readU8(payloadOffset + 3),
+        gettingIdle: reader.readU8(payloadOffset + 4) !== 0,
+        durationUs: reader.readU32(payloadOffset + 5) / ticksPerUs,
+        readyTimeUs: reader.readU32(payloadOffset + 9) / ticksPerUs,
       };
 
     default:
@@ -592,6 +610,38 @@ function decodeSpan(
 
     case TraceEventKind.ClusterMigration:
       return decodeClusterMigration(reader, kind, threadSlot, tickNumber, timestampUs, header);
+
+    // WriteTickFenceCluster (61) — per-archetype body span. archetypeId only at Begin; everything else optional.
+    case 61 as TraceEventKind:
+      return decodeWriteTickFenceCluster(reader, kind, threadSlot, tickNumber, timestampUs, header);
+
+    // WriteTickFenceClusterShadow (62) — ProcessClusterShadowEntries span.
+    case 62 as TraceEventKind:
+      return decodeWriteTickFenceClusterShadow(reader, kind, threadSlot, tickNumber, timestampUs, header);
+
+    // WriteTickFenceClusterSpatial (63) — cluster spatial-maintenance span.
+    case 63 as TraceEventKind:
+      return decodeWriteTickFenceClusterSpatial(reader, kind, threadSlot, tickNumber, timestampUs, header);
+
+    // SpatialClusterMigrationDetectScan (249) — fence-time scan span.
+    case 249 as TraceEventKind:
+      return decodeClusterMigrationDetectScan(reader, kind, threadSlot, tickNumber, timestampUs, header);
+
+    // SpatialClusterAabbRefresh (250) — fence-time AABB refresh span.
+    case 250 as TraceEventKind:
+      return decodeClusterAabbRefresh(reader, kind, threadSlot, tickNumber, timestampUs, header);
+
+    // WriteTickFenceTable (251) — per-ComponentTable fence body span.
+    case 251 as TraceEventKind:
+      return decodeWriteTickFenceTable(reader, kind, threadSlot, tickNumber, timestampUs, header);
+
+    // WriteTickFenceShadow (252) — ProcessShadowEntries span for one table.
+    case 252 as TraceEventKind:
+      return decodeWriteTickFenceShadow(reader, kind, threadSlot, tickNumber, timestampUs, header);
+
+    // WriteTickFenceSpatial (253) — ProcessSpatialEntries span for one table.
+    case 253 as TraceEventKind:
+      return decodeWriteTickFenceSpatial(reader, kind, threadSlot, tickNumber, timestampUs, header);
 
     case TraceEventKind.RuntimePhaseSpan:
       return decodeRuntimePhaseSpan(reader, kind, threadSlot, tickNumber, timestampUs, header);
@@ -969,6 +1019,244 @@ function decodeClusterMigration(
   if (o + 10 <= header.recordEnd) {
     evt.componentCount = reader.readI32(o + 6);
   }
+  return evt;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Fence-span optional-field decoder — shared by the 8 WriteTickFence* / Spatial* span codecs.
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * One optional field in a fence-span payload: `bit` selects it in the mask byte, `type` picks the read width, `field`
+ * names the {@link TraceEvent} property it lands in. Constrained to the numeric-valued keys of {@link TraceEvent} so the
+ * decoded i32/u8 value assigns cleanly. Fields are listed in wire order (mask-bit order).
+ */
+type NumericTraceEventKey = {
+  [K in keyof TraceEvent]-?: NonNullable<TraceEvent[K]> extends number ? K : never;
+}[keyof TraceEvent];
+
+interface OptionalFieldSpec {
+  bit: number;
+  type: 'i32' | 'u8';
+  field: NumericTraceEventKey;
+}
+
+/**
+ * Decode the optional-field block shared by every fence span: a u8 mask byte followed by mask-selected typed fields in
+ * wire order. Returns nothing — fields are written onto `evt` in place.
+ *
+ * **Bounds discipline.** The mask byte is read only when it fits before `recordEnd`. Each optional field is read only
+ * when `cursor + size <= recordEnd`: a truncated trace, or an older trace whose mask bit is set but whose payload bytes
+ * were never written, must not advance the cursor into the adjacent record. `BinaryReader` would throw on a read past
+ * the LZ4 block end, but a stale mask bit inside a well-formed chunk reads *valid* bytes from the next record — silent
+ * corruption that only the explicit `recordEnd` guard catches.
+ */
+function decodeOptionalMaskedFields(
+  reader: BinaryReader, evt: TraceEvent, optMaskOffset: number, recordEnd: number, spec: readonly OptionalFieldSpec[],
+): void {
+  if (optMaskOffset >= recordEnd) return;
+  const mask = reader.readU8(optMaskOffset);
+  let cursor = optMaskOffset + 1;
+  // The write target is keyed dynamically; `field` is constrained to numeric-valued TraceEvent keys, so a numeric
+  // index-write is sound — TS cannot prove the single-property case, hence the local Record view.
+  const sink = evt as Record<NumericTraceEventKey, number>;
+  for (const f of spec) {
+    if ((mask & f.bit) === 0) continue;
+    const size = f.type === 'i32' ? 4 : 1;
+    if (cursor + size > recordEnd) break;   // truncated / stale-mask record — stop before the adjacent record
+    sink[f.field] = f.type === 'i32' ? reader.readI32(cursor) : reader.readU8(cursor);
+    cursor += size;
+  }
+}
+
+// SpatialClusterMigrationDetectScan (kind 249) — fence-time scan span. Wire layout:
+// BeginParams (6 bytes): u16 archetypeId, i32 scanSlotCount.
+// Then u8 optMask @ +6; then optional fields in mask-bit order:
+//   0x01: i32 _migrationsQueued
+//   0x02: i32 _hysteresisAbsorbed
+//   0x04: i32 _clustersTouched
+const FENCE_SCAN_FIELDS: readonly OptionalFieldSpec[] = [
+  { bit: 0x01, type: 'i32', field: 'migrationsQueued' },
+  { bit: 0x02, type: 'i32', field: 'hysteresisAbsorbed' },
+  { bit: 0x04, type: 'i32', field: 'clustersTouched' },
+];
+
+function decodeClusterMigrationDetectScan(
+  reader: BinaryReader, kind: TraceEventKind,
+  threadSlot: number, tickNumber: number, timestampUs: number, header: SpanHeader,
+): TraceEvent {
+  const o = header.payloadOffset;
+  const evt: TraceEvent = {
+    ...baseSpanEvent(kind, threadSlot, tickNumber, timestampUs, header),
+    archetypeId: reader.readU16(o),
+    scanSlotCount: reader.readI32(o + 2),
+  };
+  decodeOptionalMaskedFields(reader, evt, o + 6, header.recordEnd, FENCE_SCAN_FIELDS);
+  return evt;
+}
+
+// SpatialClusterAabbRefresh (kind 250) — fence-time AABB refresh span. Wire layout:
+// BeginParams (6 bytes): u16 archetypeId, i32 clusterScanned.
+// Then u8 optMask @ +6; then optional fields in mask-bit order:
+//   0x01: i32 _aabbsChanged
+//   0x02: i32 _slotsScanned
+//   0x04: i32 _outlierGuardFires
+const FENCE_AABB_FIELDS: readonly OptionalFieldSpec[] = [
+  { bit: 0x01, type: 'i32', field: 'aabbsChanged' },
+  { bit: 0x02, type: 'i32', field: 'slotsScanned' },
+  { bit: 0x04, type: 'i32', field: 'outlierGuardFires' },
+];
+
+function decodeClusterAabbRefresh(
+  reader: BinaryReader, kind: TraceEventKind,
+  threadSlot: number, tickNumber: number, timestampUs: number, header: SpanHeader,
+): TraceEvent {
+  const o = header.payloadOffset;
+  const evt: TraceEvent = {
+    ...baseSpanEvent(kind, threadSlot, tickNumber, timestampUs, header),
+    archetypeId: reader.readU16(o),
+    clusterScanned: reader.readI32(o + 2),
+  };
+  decodeOptionalMaskedFields(reader, evt, o + 6, header.recordEnd, FENCE_AABB_FIELDS);
+  return evt;
+}
+
+// WriteTickFenceTable (kind 251) — per-ComponentTable fence body span. Wire layout:
+// BeginParams (6 bytes): u16 componentTypeId, i32 dirtyEntryCount.
+// Then u8 optMask @ +6; then optional fields in mask-bit order:
+//   0x01: u8 _walPublished
+//   0x02: u8 _hasShadow
+//   0x04: u8 _hasSpatial
+const FENCE_TABLE_FIELDS: readonly OptionalFieldSpec[] = [
+  { bit: 0x01, type: 'u8', field: 'walPublished' },
+  { bit: 0x02, type: 'u8', field: 'hasShadow' },
+  { bit: 0x04, type: 'u8', field: 'hasSpatial' },
+];
+
+function decodeWriteTickFenceTable(
+  reader: BinaryReader, kind: TraceEventKind,
+  threadSlot: number, tickNumber: number, timestampUs: number, header: SpanHeader,
+): TraceEvent {
+  const o = header.payloadOffset;
+  const evt: TraceEvent = {
+    ...baseSpanEvent(kind, threadSlot, tickNumber, timestampUs, header),
+    componentTypeId: reader.readU16(o),
+    dirtyEntryCount: reader.readI32(o + 2),
+  };
+  decodeOptionalMaskedFields(reader, evt, o + 6, header.recordEnd, FENCE_TABLE_FIELDS);
+  return evt;
+}
+
+// WriteTickFenceShadow (kind 252) — ProcessShadowEntries span. Wire layout:
+// BeginParams (6 bytes): u16 componentTypeId, i32 indexedFieldCount.
+// Then u8 optMask @ +6; then optional fields:
+//   0x01: i32 _totalShadowEntries
+const FENCE_SHADOW_FIELDS: readonly OptionalFieldSpec[] = [
+  { bit: 0x01, type: 'i32', field: 'totalShadowEntries' },
+];
+
+function decodeWriteTickFenceShadow(
+  reader: BinaryReader, kind: TraceEventKind,
+  threadSlot: number, tickNumber: number, timestampUs: number, header: SpanHeader,
+): TraceEvent {
+  const o = header.payloadOffset;
+  const evt: TraceEvent = {
+    ...baseSpanEvent(kind, threadSlot, tickNumber, timestampUs, header),
+    componentTypeId: reader.readU16(o),
+    indexedFieldCount: reader.readI32(o + 2),
+  };
+  decodeOptionalMaskedFields(reader, evt, o + 6, header.recordEnd, FENCE_SHADOW_FIELDS);
+  return evt;
+}
+
+// WriteTickFenceSpatial (kind 253) — ProcessSpatialEntries span. Wire layout:
+// BeginParams (6 bytes): u16 componentTypeId, i32 dirtyEntryCount.
+// Then u8 optMask @ +6; then optional fields:
+//   0x01: i32 _escapedCount
+const FENCE_SPATIAL_FIELDS: readonly OptionalFieldSpec[] = [
+  { bit: 0x01, type: 'i32', field: 'escapedCount' },
+];
+
+function decodeWriteTickFenceSpatial(
+  reader: BinaryReader, kind: TraceEventKind,
+  threadSlot: number, tickNumber: number, timestampUs: number, header: SpanHeader,
+): TraceEvent {
+  const o = header.payloadOffset;
+  const evt: TraceEvent = {
+    ...baseSpanEvent(kind, threadSlot, tickNumber, timestampUs, header),
+    componentTypeId: reader.readU16(o),
+    dirtyEntryCount: reader.readI32(o + 2),
+  };
+  decodeOptionalMaskedFields(reader, evt, o + 6, header.recordEnd, FENCE_SPATIAL_FIELDS);
+  return evt;
+}
+
+// WriteTickFenceCluster (kind 61) — per-archetype body span inside WriteClusterTickFence.
+// BeginParams (2 bytes): u16 archetypeId.
+// Then u8 optMask @ +2; then optional fields:
+//   0x01: i32 _dirtyClusterCount
+//   0x02: i32 _entryCount
+//   0x04: u8  _hasShadow
+//   0x08: u8  _hasSpatial
+//   0x10: u8  _walPublished
+const FENCE_CLUSTER_FIELDS: readonly OptionalFieldSpec[] = [
+  { bit: 0x01, type: 'i32', field: 'dirtyClusterCount' },
+  { bit: 0x02, type: 'i32', field: 'entryCount' },
+  { bit: 0x04, type: 'u8', field: 'hasShadow' },
+  { bit: 0x08, type: 'u8', field: 'hasSpatial' },
+  { bit: 0x10, type: 'u8', field: 'walPublished' },
+];
+
+function decodeWriteTickFenceCluster(
+  reader: BinaryReader, kind: TraceEventKind,
+  threadSlot: number, tickNumber: number, timestampUs: number, header: SpanHeader,
+): TraceEvent {
+  const o = header.payloadOffset;
+  const evt: TraceEvent = {
+    ...baseSpanEvent(kind, threadSlot, tickNumber, timestampUs, header),
+    archetypeId: reader.readU16(o),
+  };
+  decodeOptionalMaskedFields(reader, evt, o + 2, header.recordEnd, FENCE_CLUSTER_FIELDS);
+  return evt;
+}
+
+// WriteTickFenceClusterShadow (kind 62) — ProcessClusterShadowEntries span.
+// BeginParams (6 bytes): u16 archetypeId, i32 dirtyClusterCount.
+// Then u8 optMask @ +6; then optional fields:
+//   0x01: i32 _totalShadowEntries
+function decodeWriteTickFenceClusterShadow(
+  reader: BinaryReader, kind: TraceEventKind,
+  threadSlot: number, tickNumber: number, timestampUs: number, header: SpanHeader,
+): TraceEvent {
+  const o = header.payloadOffset;
+  const evt: TraceEvent = {
+    ...baseSpanEvent(kind, threadSlot, tickNumber, timestampUs, header),
+    archetypeId: reader.readU16(o),
+    dirtyClusterCount: reader.readI32(o + 2),
+  };
+  decodeOptionalMaskedFields(reader, evt, o + 6, header.recordEnd, FENCE_SHADOW_FIELDS);
+  return evt;
+}
+
+// WriteTickFenceClusterSpatial (kind 63) — cluster spatial-maintenance span.
+// BeginParams (6 bytes): u16 archetypeId, i32 dirtyClusterCount.
+// Then u8 optMask @ +6; then optional fields:
+//   0x01: i32 _migrationsExecuted
+const FENCE_CLUSTER_SPATIAL_FIELDS: readonly OptionalFieldSpec[] = [
+  { bit: 0x01, type: 'i32', field: 'migrationsExecuted' },
+];
+
+function decodeWriteTickFenceClusterSpatial(
+  reader: BinaryReader, kind: TraceEventKind,
+  threadSlot: number, tickNumber: number, timestampUs: number, header: SpanHeader,
+): TraceEvent {
+  const o = header.payloadOffset;
+  const evt: TraceEvent = {
+    ...baseSpanEvent(kind, threadSlot, tickNumber, timestampUs, header),
+    archetypeId: reader.readU16(o),
+    dirtyClusterCount: reader.readI32(o + 2),
+  };
+  decodeOptionalMaskedFields(reader, evt, o + 6, header.recordEnd, FENCE_CLUSTER_SPATIAL_FIELDS);
   return evt;
 }
 
