@@ -2,8 +2,10 @@ import { memo } from 'react';
 import { Handle, Position } from '@xyflow/react';
 import { Hourglass } from 'lucide-react';
 import { useThemeStore } from '@/stores/useThemeStore';
-import { rowIdOf, useQueryCatalogStore } from '@/panels/QueryCatalog/useQueryCatalogStore';
-import { openViewQueryCatalog } from '@/shell/commands/profilerCommands';
+import { useQueryCatalogStore } from '@/panels/QueryAnalyzer/useQueryCatalogStore';
+import { openViewQueryAnalyzer, revealQueryInAnalyzer } from '@/shell/commands/profilerCommands';
+import { categoricalColor } from '@/libs/color/categorical';
+import { rgbCss } from '@/libs/color/contrast';
 import type { DagNodeData } from './dagModel';
 import type { SystemStat } from './useSystemStats';
 
@@ -42,6 +44,14 @@ function SystemDagNodeInner({
 }) {
   const theme = useThemeStore((s) => s.theme);
   const kindClass = kindClasses(data.kind);
+  // DS-2 stable hue-per-object: the system's shared categorical identity colour — the SAME hue the timeline lane,
+  // Access-Matrix header, and Query Analyzer show for this system. Rendered as a clear 6px left band PLUS a faint
+  // title-row tint of the same hue so identity actually reads across views (the original 3px stripe was too thin
+  // to land — drowned by the heat border on hot nodes). Heat stays on the border (intensity) so both channels
+  // coexist: "which system" via the band/tint, "how hot" via the border.
+  const accentRgb = categoricalColor(data.systemName);
+  const accent = rgbCss(accentRgb);
+  const accentTintBg = `rgba(${accentRgb[0]}, ${accentRgb[1]}, ${accentRgb[2]}, 0.12)`;
   const exclusiveBar = data.isExclusivePhase ? 'border-l-4 border-l-amber-500' : '';
   // Selection wins over hover — once you click the node the primary ring locks in; hover only
   // illuminates when no harder selection is active. Hover comes from the cross-panel store, so
@@ -99,8 +109,14 @@ function SystemDagNodeInner({
       title={data.isOnDominantCp ? 'On the critical path of the dominant tick' : undefined}
     >
       <Handle type="target" position={Position.Left} className="!h-2 !w-2 !border-0 !bg-muted-foreground" />
-      <div className="flex items-center justify-between gap-1 px-2 pt-1">
-        <span className="truncate font-mono text-[11px] font-semibold text-foreground" title={data.systemName}>
+      <span
+        aria-hidden
+        className="pointer-events-none absolute inset-y-0 left-0 w-[6px] rounded-l"
+        style={{ backgroundColor: accent }}
+        data-testid={`system-dag-accent-${data.systemName}`}
+      />
+      <div className="flex items-center justify-between gap-1 px-2 pt-1" style={{ backgroundColor: accentTintBg }}>
+        <span className="truncate font-mono text-fs-sm font-semibold text-foreground" title={data.systemName}>
           {data.systemName}
         </span>
         <div className="flex items-center gap-1">
@@ -115,7 +131,7 @@ function SystemDagNodeInner({
           )}
           {cpBadge && (
             <span
-              className={`text-[12px] leading-none ${cpBadge.tone === 'solid'
+              className={`text-fs-base leading-none ${cpBadge.tone === 'solid'
                 ? 'text-amber-700 dark:text-amber-300'
                 : 'text-amber-700/50 dark:text-amber-400/40'}`}
               title={cpBadge.title}
@@ -123,13 +139,13 @@ function SystemDagNodeInner({
               {cpBadge.glyph}
             </span>
           )}
-          <span className={`rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase ${kindClass}`}>{data.kind}</span>
+          <span className={`rounded px-1.5 py-0.5 text-fs-2xs font-semibold uppercase ${kindClass}`}>{data.kind}</span>
         </div>
       </div>
       <div className="flex flex-wrap items-center gap-1 px-2 pb-1 pt-0.5">
         {stat ? (
           <span
-            className="rounded border px-1 py-px font-mono text-[10px]"
+            className="rounded border px-1 py-px font-mono text-fs-xs"
             style={heatChip(stat.heat, theme)}
             title={`${stat.value.toFixed(1)} µs`}
           >
@@ -180,7 +196,7 @@ function Chip({ children, tone = 'default' }: ChipProps) {
         : tone === 'info'
           ? 'border-sky-300 bg-sky-100 text-sky-800 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-200'
           : 'border-slate-300 bg-slate-100 text-slate-800 dark:border-slate-600/50 dark:bg-slate-900/40 dark:text-slate-200';
-  return <span className={`rounded border px-1 py-px text-[9px] font-mono ${cls}`}>{children}</span>;
+  return <span className={`rounded border px-1 py-px text-fs-2xs font-mono ${cls}`}>{children}</span>;
 }
 
 function kindClasses(kind: DagNodeData['kind']): string {
@@ -266,27 +282,28 @@ function QueriesBadge({
   soleOwnedDefId?: { kind: number; localId: number };
 }) {
   const setSystemFilter = useQueryCatalogStore((s) => s.setSystemFilter);
-  const setExpanded = useQueryCatalogStore((s) => s.setExpanded);
 
   function onClick(e: React.MouseEvent): void {
     e.stopPropagation();
     if (numericSystemId >= 0) {
       setSystemFilter(numericSystemId);
     }
-    // When the system owns exactly one query, expand that row so the user lands on the relevant
-    // detail rather than just a filtered-list view. Multi-owner systems keep the filter only — the
-    // user picks which to expand. Clear any prior expansion otherwise so the caller's intent is
-    // unambiguous.
-    setExpanded(soleOwnedDefId ? rowIdOf(soleOwnedDefId.kind, soleOwnedDefId.localId) : null);
-    openViewQueryCatalog();
+    // When the system owns exactly one query, land directly on it in the Query Analyzer; multi-owner
+    // systems just filter the catalog to this system (the user picks which to open). The Analyzer's
+    // master reads the same `useQueryCatalogStore` system filter.
+    if (soleOwnedDefId) {
+      revealQueryInAnalyzer(soleOwnedDefId.kind, soleOwnedDefId.localId);
+    } else {
+      openViewQueryAnalyzer();
+    }
   }
 
   return (
     <button
       type="button"
       onClick={onClick}
-      className="rounded border border-sky-300 bg-sky-100 px-1 py-px font-mono text-[9px] text-sky-800 hover:bg-sky-200 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-200 dark:hover:bg-sky-900/60"
-      title={`${count} distinct quer${count === 1 ? 'y' : 'ies'} — open Catalog filtered to ${systemName}`}
+      className="rounded border border-sky-300 bg-sky-100 px-1 py-px font-mono text-fs-2xs text-sky-800 hover:bg-sky-200 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-200 dark:hover:bg-sky-900/60"
+      title={`${count} distinct quer${count === 1 ? 'y' : 'ies'} — open Query Analyzer filtered to ${systemName}`}
       data-testid={`system-dag-queries-badge-${systemName}`}
     >
       Q {count}

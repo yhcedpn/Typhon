@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import type { CallTreeResponse } from '@/hooks/profiler/useCallTree';
 import { spanKindScope, type CallTreeScope } from '@/stores/useCallTreeScopeStore';
+import { useCallTreePrefsStore } from '@/stores/useCallTreePrefsStore';
 
 /**
  * Component tests for the Call Tree panel. Covers the §8.7 surface (#364) — the view-mode toggle label and the
@@ -71,6 +72,9 @@ beforeEach(() => {
   mockData = null;
   mockScope = null;
   mockOwner = null;
+  // The Call Tree's viewMode/direction/groupByCategory now live in a persisted prefs store (AC3.16); reset to
+  // defaults so a prior test that set the direction to 'sandwich' doesn't leak into the next render.
+  useCallTreePrefsStore.setState({ viewMode: 'wall-clock', direction: 'top-down', groupByCategory: false });
 });
 afterEach(cleanup);
 
@@ -104,6 +108,45 @@ describe('CallTree — §8.7 involuntary-stall aggregate node', () => {
     // The aggregate row carries no chevron button — only the static label cell + the metric cells.
     const row = label.closest('div');
     expect(row?.querySelector('button')).toBeNull();
+  });
+});
+
+describe('CallTree — selected-row focus styling', () => {
+  it('a clicked row gets the wb-tree-selected hook (its colour is focus-dependent via CSS)', () => {
+    mockData = treeWith(true);
+    render(<CallTree />);
+    // The row div wraps the per-row crosshair button; clicking the row selects it.
+    const row = screen.getByRole('button', { name: 'Focus the call tree on #5' }).closest('div');
+    expect(row).toBeTruthy();
+    expect(row!.className).not.toContain('wb-tree-selected');
+    fireEvent.click(row!);
+    // Selection no longer hard-codes bg-primary/30 — it tags the row so `.dv-active-group .wb-tree-selected`
+    // (focused) vs `.wb-tree-selected` (grey, unfocused) can branch on pane focus.
+    expect(row!.className).toContain('wb-tree-selected');
+  });
+});
+
+describe('CallTree — sandwich row context menu', () => {
+  /** Drill into the only real frame (so sandwich has a focus), then switch to the Sandwich direction. */
+  function renderSandwich() {
+    mockData = treeWith(true);
+    render(<CallTree />);
+    // Drill in the top-down view — the crosshair re-roots the tree at frame #5, giving the sandwich a focus.
+    fireEvent.click(screen.getByRole('button', { name: 'Focus the call tree on #5' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Sandwich' }));
+  }
+
+  it('right-clicking a sandwich row opens the same Call Tree context menu', () => {
+    renderSandwich();
+    // Both panes (callers + callees) now render the frame row, so there are two focus crosshairs.
+    const crosshairs = screen.getAllByRole('button', { name: 'Focus the call tree on #5' });
+    expect(crosshairs.length).toBe(2);
+    const row = crosshairs[0].closest('div');
+    expect(row).toBeTruthy();
+    fireEvent.contextMenu(row!);
+    expect(screen.getByTestId('call-tree-context-menu')).toBeTruthy();
+    // The reused menu carries the drill verb — proof it's the full menu, not a stub.
+    expect(screen.getByText('Focus tree on this frame')).toBeTruthy();
   });
 });
 

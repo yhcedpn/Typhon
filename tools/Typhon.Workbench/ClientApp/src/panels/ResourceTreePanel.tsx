@@ -19,6 +19,7 @@ import {
 import { createContext, useCallback, useContext, useDeferredValue, useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Tree, type NodeApi, type NodeRendererProps, type TreeApi } from 'react-arborist';
+import { useDensityRowHeight } from '@/hooks/useDensityRowHeight';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import type { ResourceNodeDto } from '@/api/generated/model';
@@ -201,7 +202,7 @@ function NodeRow({ node, style, dragHandle }: NodeRendererProps<ResourceNode>) {
  // Native title attr — desktop-style hover tooltip with name + kind. Cheaper than a Radix
  // Tooltip per row and doesn't compete with the context menu.
  title={`${node.data.name} — ${node.data.type}`}
- className={`relative isolate flex cursor-pointer items-center gap-1.5 px-1 text-[11px] leading-none hover:bg-primary/20
+ className={`relative isolate flex cursor-pointer items-center gap-1.5 px-1 text-fs-sm leading-none hover:bg-primary/20
  ${isNavSelected
  ? 'text-foreground before:pointer-events-none before:absolute before:inset-x-0 before:-top-px before:-bottom-px before:-z-10 before:border-l-2 before:border-accent before:bg-primary/15'
  : 'text-foreground'}`}
@@ -212,7 +213,7 @@ function NodeRow({ node, style, dragHandle }: NodeRendererProps<ResourceNode>) {
  }}
  >
  {node.isInternal ? (
- <span className="w-3.5 shrink-0 text-[13px] leading-none text-muted-foreground">{node.isOpen ? '▾' : '▸'}</span>
+ <span className="w-3.5 shrink-0 text-fs-lg leading-none text-muted-foreground">{node.isOpen ? '▾' : '▸'}</span>
  ) : (
  <span className="w-3.5 shrink-0" />
  )}
@@ -224,7 +225,7 @@ function NodeRow({ node, style, dragHandle }: NodeRendererProps<ResourceNode>) {
  {node.data.entityCount != null && (
  <Badge
  variant="secondary"
- className="h-4 shrink-0 px-1 text-[10px] leading-none"
+ className="h-4 shrink-0 px-1 text-fs-xs leading-none"
  >
  {node.data.entityCount.toLocaleString()}
  </Badge>
@@ -242,6 +243,7 @@ export default function ResourceTreePanel() {
  const clearRevealRequest = useResourceGraphStore((s) => s.clearRevealRequest);
  const navSelectedId = useSelectedResourceStore((s) => s.selected?.resourceId);
  const sessionId = useSessionStore((s) => s.sessionId);
+ const rowHeight = useDensityRowHeight();
  const containerRef = useRef<HTMLDivElement>(null);
  const treeScrollRef = useRef<HTMLDivElement>(null);
  const filterInputRef = useRef<HTMLInputElement>(null);
@@ -350,13 +352,13 @@ export default function ResourceTreePanel() {
  return (
  <div className="flex h-full flex-col bg-background">
  {/* Filter bar + refresh */}
- <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1">
+ <div className="wb-pane-header flex shrink-0 items-center gap-1 border-b border-border px-2 py-1">
  <Input
  ref={filterInputRef}
  placeholder="Filter resources… ( / )"
  value={filter}
  onChange={(e) => setFilter(e.target.value)}
- className="h-6 flex-1 border-0 bg-transparent text-[11px] shadow-none
+ className="h-6 flex-1 border-0 bg-transparent text-fs-sm shadow-none
  focus-visible:ring-0 focus-visible:ring-offset-0 placeholder:text-muted-foreground"
  />
  <button
@@ -374,10 +376,10 @@ export default function ResourceTreePanel() {
  {/* Tree */}
  <div ref={containerRef} className="min-h-0 flex-1 overflow-hidden" tabIndex={-1}>
  {isLoading && (
- <p className="px-3 py-2 text-[11px] text-muted-foreground">Loading…</p>
+ <p className="px-3 py-2 text-fs-sm text-muted-foreground">Loading…</p>
  )}
  {isError && (
- <p className="px-3 py-2 text-[11px] text-destructive">Failed to load resources</p>
+ <p className="px-3 py-2 text-fs-sm text-destructive">Failed to load resources</p>
  )}
  {rootNode && (
  <NodeExtrasContext.Provider value={{ onReveal, onRefreshSubtree }}>
@@ -385,7 +387,7 @@ export default function ResourceTreePanel() {
  <Tree
  ref={treeRef}
  data={[rootNode]}
- rowHeight={18}
+ rowHeight={rowHeight}
  openByDefault
  selection={navSelectedId}
  onSelect={(nodes) => {
@@ -408,7 +410,7 @@ export default function ResourceTreePanel() {
  </div>
 
  {/* Footer */}
- <div className="shrink-0 border-t border-border px-3 py-0.5 text-[10px] text-muted-foreground">
+ <div className="shrink-0 border-t border-border px-3 py-0.5 text-fs-xs text-muted-foreground">
  {totalNodes} resources
  </div>
  </div>

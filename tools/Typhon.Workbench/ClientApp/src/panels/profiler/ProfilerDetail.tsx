@@ -1,8 +1,7 @@
 import { useState } from 'react';
 import { Activity, Blocks, Clock, Crosshair, ExternalLink, FileCode, Layers, Search, Tag } from 'lucide-react';
-import type { ChunkSpan, MarkerSelection, PhaseMarker, PhaseSpan, SpanData } from '@/libs/profiler/model/traceModel';
+import type { ChunkSpan, MarkerSelection, PhaseMarker, PhaseSpan, ProfilerSelection, SpanData } from '@/libs/profiler/model/traceModel';
 import { TraceEventKind } from '@/libs/profiler/model/types';
-import type { ProfilerSelection } from '@/stores/useProfilerSelectionStore';
 import { useProfilerSessionStore } from '@/stores/useProfilerSessionStore';
 import { useProfilerStatsStore } from '@/stores/useProfilerStatsStore';
 import { useProfilerViewStore } from '@/stores/useProfilerViewStore';
@@ -10,12 +9,11 @@ import { useSourceLocationStore } from '@/stores/useSourceLocationStore';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useOptionsStore } from '@/stores/useOptionsStore';
 import { openSourcePreview } from '@/shell/commands/openSchemaBrowser';
-import { openViewCallTree, openViewExecutionInspector } from '@/shell/commands/profilerCommands';
+import { openViewCallTree, revealQueryExecutionInAnalyzer } from '@/shell/commands/profilerCommands';
 import { spanKindScope, systemScope, useCallTreeScopeStore } from '@/stores/useCallTreeScopeStore';
 import { useCpuFrameStore } from '@/stores/useCpuFrameStore';
 import { resolveFrameRootForSite } from '@/libs/profiler/resolveFrameRoot';
-import { useExecutionInspectorStore } from '@/panels/ExecutionInspector/useExecutionInspectorStore';
-import { useQueryPlanStore } from '@/panels/QueryPlanTree/useQueryPlanStore';
+import { formatBytes } from '@/libs/formatBytes';
 import {
   useGetApiSessionsSessionIdProfilerExecutionsByParentParentSpanId,
   useGetApiSessionsSessionIdProfilerExecutionsBySystemTickSystemIdxTickIndex,
@@ -72,7 +70,7 @@ function useGlobalStartUs(): number {
  * selectable by default — but the detail-pane numeric/textual fields are exactly what users want
  * to copy-paste). One className per `<dl>` keeps the override scoped and easy to remove.
  */
-const DL_CLASS = 'grid grid-cols-[auto,1fr] gap-x-3 gap-y-1 text-[11px] select-text';
+const DL_CLASS = 'grid grid-cols-[auto,1fr] gap-x-3 gap-y-1 text-fs-sm select-text';
 
 // ─── Spans ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -82,10 +80,6 @@ function SpanDetail({ span }: { span: SpanData }): React.JSX.Element {
   const openInEditor = useOptionsStore((s) => s.openInEditor);
   const sessionId = useSessionStore((s) => s.sessionId);
   const sessionKind = useSessionStore((s) => s.kind);
-  const setEiFocus = useExecutionInspectorStore((s) => s.setFocus);
-  const setEiSelected = useExecutionInspectorStore((s) => s.setSelected);
-  const setPlanFocus = useQueryPlanStore((s) => s.setFocus);
-  const setPlanSelectedExecution = useQueryPlanStore((s) => s.setSelectedExecution);
   const setCallTreeScope = useCallTreeScopeStore((s) => s.setScope);
   const [openError, setOpenError] = useState<string | null>(null);
   const loc = resolve(span.rawEvent?.sourceLocationId);
@@ -144,12 +138,7 @@ function SpanDetail({ span }: { span: SpanData }): React.JSX.Element {
     const localId = Number(def.localId);
     const tickIndex = Number(matchedExecution.tickIndex);
     const systemId = Number(matchedExecution.systemId ?? -1);
-    setEiFocus({ kind, localId });
-    setEiSelected({ tickIndex, systemId });
-    // Mirror onto the Plan Tree store so a swap to that panel lands on the same execution view.
-    setPlanFocus({ kind, localId });
-    setPlanSelectedExecution(matchedExecution);
-    openViewExecutionInspector();
+    revealQueryExecutionInAnalyzer(kind, localId, tickIndex, systemId);
   }
 
   function handleScopeCallTree(): void {
@@ -163,7 +152,7 @@ function SpanDetail({ span }: { span: SpanData }): React.JSX.Element {
 
   return (
     <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3">
-      <div className="rounded-md border border-border bg-card p-3 text-[12px]">
+      <div className="rounded-md border border-border bg-card p-3 text-fs-base">
         <Header icon={<Activity className="h-4 w-4 text-muted-foreground" />} title={span.name} suffix="span" />
         <dl className={DL_CLASS}>
           <dt className="text-muted-foreground">Kind</dt>
@@ -535,30 +524,30 @@ function SpanDetail({ span }: { span: SpanData }): React.JSX.Element {
             {loc && (
               <>
                 <button type="button" onClick={() => openSourcePreview(loc.file, loc.line)}
-                  className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent">
+                  className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-fs-sm hover:bg-accent">
                   <FileCode className="h-3 w-3" /> Show inline
                 </button>
                 <button type="button" onClick={handleOpen}
-                  className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent">
+                  className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-fs-sm hover:bg-accent">
                   <ExternalLink className="h-3 w-3" /> Open in editor
                 </button>
               </>
             )}
             {matchedExecution && (
               <button type="button" onClick={handleInspectExecution}
-                title={`Open this tick's execution of EcsQuery #${matchedExecution.definitionId?.localId} in the Execution Inspector`}
-                className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent">
+                title={`Open this tick's execution of EcsQuery #${matchedExecution.definitionId?.localId} in the Query Analyzer`}
+                className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-fs-sm hover:bg-accent">
                 <Search className="h-3 w-3" /> Inspect query execution
               </button>
             )}
             {canScopeCallTree && (
               <button type="button" onClick={handleScopeCallTree}
                 title="Open the CPU Call Tree scoped to this span kind"
-                className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent">
+                className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-fs-sm hover:bg-accent">
                 <Activity className="h-3 w-3" /> Scope Call Tree to this
               </button>
             )}
-            {openError && <span className="w-full truncate text-[11px] text-destructive" title={openError}>{openError.length > 60 ? openError.slice(0, 60) + '…' : openError}</span>}
+            {openError && <span className="w-full truncate text-fs-sm text-destructive" title={openError}>{openError.length > 60 ? openError.slice(0, 60) + '…' : openError}</span>}
           </div>
         )}
       </div>
@@ -574,10 +563,6 @@ function ChunkDetail({ chunk }: { chunk: ChunkSpan }): React.JSX.Element {
   const openInEditor = useOptionsStore((s) => s.openInEditor);
   const sessionId = useSessionStore((s) => s.sessionId);
   const sessionKind = useSessionStore((s) => s.kind);
-  const setEiFocus = useExecutionInspectorStore((s) => s.setFocus);
-  const setEiSelected = useExecutionInspectorStore((s) => s.setSelected);
-  const setPlanFocus = useQueryPlanStore((s) => s.setFocus);
-  const setPlanSelectedExecution = useQueryPlanStore((s) => s.setSelectedExecution);
   const setCallTreeScope = useCallTreeScopeStore((s) => s.setScope);
   // Look up which tick this chunk belongs to by binary-searching tick summaries against the chunk's startUs.
   // Required for the (systemIdx, tickIndex) round-trip key — ChunkSpan doesn't carry the tickNumber directly
@@ -617,11 +602,7 @@ function ChunkDetail({ chunk }: { chunk: ChunkSpan }): React.JSX.Element {
     const localId = Number(def.localId);
     const tickIndex = Number(matchedExecution.tickIndex);
     const systemId = Number(matchedExecution.systemId ?? -1);
-    setEiFocus({ kind, localId });
-    setEiSelected({ tickIndex, systemId });
-    setPlanFocus({ kind, localId });
-    setPlanSelectedExecution(matchedExecution);
-    openViewExecutionInspector();
+    revealQueryExecutionInAnalyzer(kind, localId, tickIndex, systemId);
   }
 
   function handleScopeCallTree(): void {
@@ -634,7 +615,7 @@ function ChunkDetail({ chunk }: { chunk: ChunkSpan }): React.JSX.Element {
 
   return (
     <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3">
-      <div className="rounded-md border border-border bg-card p-3 text-[12px]">
+      <div className="rounded-md border border-border bg-card p-3 text-fs-base">
         <Header icon={<Blocks className="h-4 w-4 text-muted-foreground" />} title={chunk.systemName || `System ${chunk.systemIndex}`} suffix="chunk" />
         <dl className={DL_CLASS}>
           <dt className="text-muted-foreground">System</dt>
@@ -682,30 +663,30 @@ function ChunkDetail({ chunk }: { chunk: ChunkSpan }): React.JSX.Element {
             {loc && (
               <>
                 <button type="button" onClick={() => openSourcePreview(loc.file, loc.line)}
-                  className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent">
+                  className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-fs-sm hover:bg-accent">
                   <FileCode className="h-3 w-3" /> Show inline
                 </button>
                 <button type="button" onClick={handleOpen}
-                  className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent">
+                  className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-fs-sm hover:bg-accent">
                   <ExternalLink className="h-3 w-3" /> Open in editor
                 </button>
               </>
             )}
             {matchedExecution && (
               <button type="button" onClick={handleInspectExecution}
-                title={`Open this tick's execution of EcsQuery #${matchedExecution.definitionId?.localId} in the Execution Inspector`}
-                className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent">
+                title={`Open this tick's execution of EcsQuery #${matchedExecution.definitionId?.localId} in the Query Analyzer`}
+                className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-fs-sm hover:bg-accent">
                 <Search className="h-3 w-3" /> Inspect query execution
               </button>
             )}
             {canScopeCallTree && (
               <button type="button" onClick={handleScopeCallTree}
                 title="Open the CPU Call Tree scoped to this system"
-                className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent">
+                className="flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-fs-sm hover:bg-accent">
                 <Activity className="h-3 w-3" /> Scope Call Tree to this
               </button>
             )}
-            {openError && <span className="w-full truncate text-[11px] text-destructive" title={openError}>{openError.length > 60 ? openError.slice(0, 60) + '…' : openError}</span>}
+            {openError && <span className="w-full truncate text-fs-sm text-destructive" title={openError}>{openError.length > 60 ? openError.slice(0, 60) + '…' : openError}</span>}
           </div>
         )}
       </div>
@@ -731,7 +712,7 @@ function TickDetail({ tickNumber }: { tickNumber: number }): React.JSX.Element {
 
   return (
     <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3">
-      <div className="rounded-md border border-border bg-card p-3 text-[12px]">
+      <div className="rounded-md border border-border bg-card p-3 text-fs-base">
         <Header icon={<Clock className="h-4 w-4 text-muted-foreground" />} title={`Tick ${tickNumber}`} suffix="scheduler tick" />
         {tickSummary ? (
           <dl className={DL_CLASS}>
@@ -748,7 +729,7 @@ function TickDetail({ tickNumber }: { tickNumber: number }): React.JSX.Element {
             <dd className="font-mono tabular-nums text-foreground">{formatDurationUs(Number(tickSummary.maxSystemDurationUs))}</dd>
           </dl>
         ) : (
-          <p className="text-[11px] text-muted-foreground">Summary not loaded.</p>
+          <p className="text-fs-sm text-muted-foreground">Summary not loaded.</p>
         )}
       </div>
 
@@ -769,7 +750,7 @@ function MarkerDetail({ marker }: { marker: MarkerSelection }): React.JSX.Elemen
   const globalStartUs = useGlobalStartUs();
   return (
     <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3">
-      <div className="rounded-md border border-border bg-card p-3 text-[12px]">
+      <div className="rounded-md border border-border bg-card p-3 text-fs-base">
         <Header icon={<Tag className="h-4 w-4 text-muted-foreground" />} title={marker.kind} suffix="marker" />
         {marker.kind === 'memory-alloc' && (
           <dl className={DL_CLASS}>
@@ -832,7 +813,7 @@ function PhaseDetail({ phase, tickNumber }: { phase: PhaseSpan; tickNumber: numb
   const globalStartUs = useGlobalStartUs();
   return (
     <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3">
-      <div className="rounded-md border border-border bg-card p-3 text-[12px]">
+      <div className="rounded-md border border-border bg-card p-3 text-fs-base">
         <Header icon={<Layers className="h-4 w-4 text-muted-foreground" />} title={phase.phaseName} suffix="phase span" />
         <dl className={DL_CLASS}>
           <dt className="text-muted-foreground">Tick</dt>
@@ -868,7 +849,7 @@ function PhaseMarkerDetail({ marker, tickNumber }: { marker: PhaseMarker; tickNu
   const globalStartUs = useGlobalStartUs();
   return (
     <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3">
-      <div className="rounded-md border border-border bg-card p-3 text-[12px]">
+      <div className="rounded-md border border-border bg-card p-3 text-fs-base">
         <Header icon={<Tag className="h-4 w-4 text-muted-foreground" />} title={marker.label} suffix="phase marker" />
         <dl className={DL_CLASS}>
           <dt className="text-muted-foreground">Tick</dt>
@@ -912,7 +893,7 @@ function RangeStatsDetail(): React.JSX.Element {
   if (stats === null) {
     return (
       <div className="flex h-full items-center justify-center bg-background p-3">
-        <p className="text-[11px] text-muted-foreground">
+        <p className="text-fs-sm text-muted-foreground">
           {hasViewRange ? 'Computing range stats…' : 'Drag a range or pan/zoom to see stats.'}
         </p>
       </div>
@@ -927,7 +908,7 @@ function RangeStatsDetail(): React.JSX.Element {
   return (
     <div className="flex h-full flex-col gap-3 overflow-y-auto bg-background p-3">
       {/* Range header */}
-      <div className="rounded-md border border-border bg-card p-3 text-[12px]">
+      <div className="rounded-md border border-border bg-card p-3 text-fs-base">
         <Header icon={<Crosshair className="h-4 w-4 text-muted-foreground" />} title="Selection" suffix="range stats" />
         <dl className={DL_CLASS}>
           <dt className="text-muted-foreground">From</dt>
@@ -992,21 +973,21 @@ function TopSystemsCard(): React.JSX.Element {
   // (no colour, just the raw ratio) when metadata hasn't loaded yet.
   const workerCount = useProfilerSessionStore((s) => Number(s.metadata?.header?.workerCount ?? 0));
   return (
-    <div className="rounded-md border border-border bg-card p-3 text-[12px]">
+    <div className="rounded-md border border-border bg-card p-3 text-fs-base">
       <div className="mb-2 flex items-baseline justify-between border-b border-border pb-1">
-        <h4 className="text-[12px] font-semibold text-foreground">Top systems</h4>
+        <h4 className="text-fs-base font-semibold text-foreground">Top systems</h4>
         {workerCount > 0 && (
-          <span className="font-mono text-[10px] text-muted-foreground" title="Worker pool size — drives the parallel-width colour">
+          <span className="font-mono text-fs-xs text-muted-foreground" title="Worker pool size — drives the parallel-width colour">
             pool: {workerCount}
           </span>
         )}
       </div>
       {stats === null ? (
-        <p className="text-[11px] text-muted-foreground">Computing…</p>
+        <p className="text-fs-sm text-muted-foreground">Computing…</p>
       ) : stats.topSystemsByTotal.length === 0 ? (
-        <p className="text-[11px] text-muted-foreground">No chunks in range.</p>
+        <p className="text-fs-sm text-muted-foreground">No chunks in range.</p>
       ) : (
-        <table className="w-full text-[11px]">
+        <table className="w-full text-fs-sm">
           <thead>
             <tr className="text-left text-muted-foreground">
               <th className="font-normal">System</th>
@@ -1088,8 +1069,8 @@ function Header({ icon, title, suffix }: { icon: React.ReactNode; title: string;
   return (
     <div className="mb-2 flex items-center gap-2 border-b border-border pb-2">
       {icon}
-      <h3 className="min-w-0 truncate text-[13px] font-semibold text-foreground">{title}</h3>
-      <span className="ml-auto font-mono text-[11px] text-muted-foreground">{suffix}</span>
+      <h3 className="min-w-0 truncate text-fs-lg font-semibold text-foreground">{title}</h3>
+      <span className="ml-auto font-mono text-fs-sm text-muted-foreground">{suffix}</span>
     </div>
   );
 }
@@ -1145,9 +1126,3 @@ function findTickNumberForUs(
   return null;
 }
 
-function formatBytes(b: number): string {
-  if (b < 1024) return `${b} B`;
-  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KiB`;
-  if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(2)} MiB`;
-  return `${(b / 1024 / 1024 / 1024).toFixed(2)} GiB`;
-}

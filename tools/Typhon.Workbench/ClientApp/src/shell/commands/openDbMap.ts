@@ -1,8 +1,9 @@
 import type { Camera } from '@/libs/dbmap/camera';
+import { useDagViewStore } from '@/panels/SystemDag/useDagViewStore';
 import { useDbMapStore } from '@/stores/useDbMapStore';
 import { useResourceGraphStore } from '@/stores/useResourceGraphStore';
-import { useSchemaInspectorStore } from '@/stores/useSchemaInspectorStore';
-import { ensureDockPanel, ensureResourceTreeVisible } from './openSchemaBrowser';
+import { useSelectionStore } from '@/stores/useSelectionStore';
+import { ensureDockPanel, ensureResourceTreeVisible, openArchetypeInspector, openComponentInspector } from './openSchemaBrowser';
 
 // Cross-links between the Database File Map and the rest of the Workbench (Module 15, §7.3 / §13 A4 AC1).
 // Every link identifies a component by its type name — the common handle Resource Explorer, Schema Inspector
@@ -15,10 +16,35 @@ export function openDbMapForComponent(typeName: string): void {
   ensureDockPanel('dbmap', 'DbMap', 'Database File Map');
 }
 
-/** Map → Schema Inspector: open the Component Layout panel focused on a component type. */
+/**
+ * Inspector System card → System DAG: highlight the system on the bus, request the canvas to centre + fit its node
+ * (the `pendingFocusSystem` reveal signal, distinct from the plain bus highlight so only an explicit reveal recentres),
+ * and surface the DAG panel. The panel auto-enables "show engine tracks" if the target is an engine-internal system
+ * that would otherwise be hidden (3D, AC3.14 handoff).
+ */
+export function revealSystemInDag(name: string): void {
+  useSelectionStore.getState().setSystem(name);
+  useDagViewStore.getState().requestFocusSystem(name);
+  ensureDockPanel('system-dag', 'SystemDag', 'System DAG');
+}
+
+/**
+ * Map → Schema: select the component on the bus and open the Component Inspector (Stage 2 consolidation —
+ * the old SchemaLayout panel was removed in GAP-02). The Inspector reads the bus leaf, so it re-targets.
+ */
 export function openComponentInSchema(typeName: string): void {
-  useSchemaInspectorStore.getState().selectComponent(typeName);
-  ensureDockPanel('schema-layout', 'SchemaLayout', 'Component Layout');
+  useSelectionStore.getState().select('component', typeName);
+  openComponentInspector();
+}
+
+/**
+ * Query Analyzer → Archetype Inspector: select an archetype on the bus and open its inspector. The
+ * archetype-target sibling of {@link openComponentInSchema} (a pull-mode query's `TargetComponentType`
+ * is an ArchetypeId rather than a ComponentType id). The Inspector reads the bus leaf, so it re-targets.
+ */
+export function revealArchetypeInInspector(archetypeId: string): void {
+  useSelectionStore.getState().select('archetype', archetypeId);
+  openArchetypeInspector();
 }
 
 /**

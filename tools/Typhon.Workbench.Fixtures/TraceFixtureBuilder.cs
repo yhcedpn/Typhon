@@ -2,6 +2,7 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
+using Typhon.Engine.Internals; // QueryPlanEvent / phase span ref structs (internal `[TraceEvent]` encoders — #376 Stage-3 4A)
 using Typhon.Engine.Profiler;
 using Typhon.Profiler;
 
@@ -608,6 +609,164 @@ public static class TraceFixtureBuilder
     }
 
     /// <summary>
+    /// Build a trace carrying query definitions + executions (#376 Stage-3 Phase 4A — the Query Analyzer prerequisite).
+    /// Records two View query definitions over the seeded components, each with multiple executions of varying wall
+    /// time and a Parse → Iterate → Filter → Count phase tree, plus a <c>QuerySourceStringTable</c> so <c>UserSource</c>
+    /// resolves and an <c>OwnerSystemIdx</c> so the owning system resolves. Drives the catalog (ranked by
+    /// <c>TotalWallNs</c> — definition #1 heavier than #2), the Executions tab, and the per-phase breakdown.
+    ///
+    /// <para>The execution/phase span tree is emitted via the engine's own <c>[TraceEvent]</c> encoders
+    /// (<see cref="QueryPlanEvent"/> et al.) — faithful by construction, no hand-packed wire format. Each QueryPlan span
+    /// is timestamped <b>before</b> its phase children so the time-sorted decode keeps the parent-before-child order
+    /// <c>QueryCatalogBuilder</c> requires (a phase only attaches once its parent execution is mapped).</para>
+    /// </summary>
+    public static string BuildTraceWithQueries(string directory)
+    {
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, $"fixture-queries-{Guid.NewGuid():N}.typhon-trace");
+
+        using var fs = File.Create(path);
+        using var writer = new TraceFileWriter(fs);
+        var header = DefaultHeader;
+        writer.WriteHeader(in header);
+        // Seed a system (OwnerSystemIdx → name) + two components (TargetComponentType → name).
+        writer.WriteSystemDefinitions(
+        [
+            new SystemDefinitionRecord
+            {
+                Index = 0, Name = "Movement", Type = 0, Priority = 0, IsParallel = false, TierFilter = 0x0F,
+                Predecessors = [], Successors = [], PhaseName = "Simulation", IsExclusivePhase = false, DagId = 0,
+            },
+        ]);
+        writer.WriteArchetypes([]);
+        writer.WriteComponentTypes(
+        [
+            new ComponentTypeRecord { ComponentTypeId = 1, Name = "Position" },
+            new ComponentTypeRecord { ComponentTypeId = 2, Name = "AABB" },
+        ]);
+        writer.WriteTracks([]);
+        writer.WriteDags([]);
+        writer.WriteEmptyStaticStructures();
+
+        // Source string table (sentinel @ 0). Definition source file/method ids reference these → UserSource = File:Line:Method.
+        string[] queryStrings = [string.Empty, "src/Game/Queries.cs", "FindByPosition", "RangeAabb"];
+        const ushort srcFileId = 1, methodAId = 2, methodBId = 3;
+
+        // One evaluator each (fieldIdx, op, reserved) — op 4 = ">=", op 3 = ">". Packed 4 B/entry.
+        static byte[] OneEvaluator(ushort fieldIdx, byte op) => [(byte)(fieldIdx & 0xFF), (byte)(fieldIdx >> 8), op, 0];
+
+        var block = new byte[64 * 1024];
+        var offset = 0;
+        var recordCount = 0;
+        long ts = 100;
+        ulong nextSpanId = 1;
+
+        void TickStart()
+        {
+            WriteRecordHeader(block.AsSpan(offset), CommonHeaderSize, TraceEventKind.TickStart, ts);
+            offset += CommonHeaderSize; ts += 1; recordCount++;
+        }
+        void TickEnd()
+        {
+            WriteRecordHeader(block.AsSpan(offset), CommonHeaderSize + 2, TraceEventKind.TickEnd, ts);
+            block[offset + CommonHeaderSize] = 0;     // overloadLevel
+            block[offset + CommonHeaderSize + 1] = 1; // tickMultiplier
+            offset += CommonHeaderSize + 2; ts += 1; recordCount++;
+        }
+        void Describe(byte kind, uint localId, ushort target, ushort methodId, ReadOnlySpan<byte> evaluators)
+        {
+            QueryDefinitionDescribeEventCodec.Write(block.AsSpan(offset), threadSlot: 0, timestamp: ts, kind: kind, localId: localId,
+                targetComponentType: target, primaryIndexFieldIdx: -1, sortFieldIdx: -1, sortDescending: 0,
+                definitionSourceFileId: srcFileId, definitionSourceLine: 42, definitionSourceMethodId: methodId,
+                evaluators: evaluators, fieldDependencies: ReadOnlySpan<byte>.Empty, out var w);
+            offset += w; ts += 1; recordCount++;
+        }
+        // Emit one execution = QueryPlan span (earliest ts) + QueryArgs + Parse/Iterate/Filter/Count phase children.
+        void Execution(byte kind, uint localId, long durTicks, int rowsScanned, int rowsReturned, int rejected)
+        {
+            var planTs = ts;
+            var planSpanId = nextSpanId++;
+            var plan = new QueryPlanEvent
+            {
+                Header = new TraceSpanHeader { ThreadSlot = 0, StartTimestamp = planTs, SpanId = planSpanId, ParentSpanId = 0 },
+                EvaluatorCount = 1, IndexFieldIdx = 0, RangeMin = 0, RangeMax = 100,
+                QueryInstanceKind = kind, QueryInstanceLocalId = localId,
+                ExecutionSourceFileId = 0, ExecutionSourceLine = 0, ExecutionSourceMethodId = 0,
+                OwnerSystemIdx = 0, // the seeded "Movement" system
+            };
+            plan.EncodeTo(block.AsSpan(offset), planTs + durTicks, out var pw);
+            offset += pw; recordCount++;
+
+            // QueryArgs (1 threshold) — attaches to the latest execution on this thread.
+            Span<byte> thresholds = stackalloc byte[8];
+            BinaryPrimitives.WriteInt64LittleEndian(thresholds, 5L);
+            QueryArgsEventCodec.Write(block.AsSpan(offset), threadSlot: 0, timestamp: planTs + 1, thresholds: thresholds, out var aw);
+            offset += aw; recordCount++;
+
+            // Phase children (parentSpanId = the QueryPlan span) — each timestamped after the plan, inside its window,
+            // so the time-sorted decode keeps parent-before-child. Inlined (the events are ref structs → can't be
+            // passed through a generic helper without `allows ref struct`).
+            const long phaseDur = 10;
+            var parse = new QueryParseEvent
+            {
+                Header = new TraceSpanHeader { ThreadSlot = 0, StartTimestamp = planTs + 2, SpanId = nextSpanId++, ParentSpanId = planSpanId },
+                PredicateCount = 1, BranchCount = 1,
+            };
+            parse.EncodeTo(block.AsSpan(offset), planTs + 2 + phaseDur, out var w1); offset += w1; recordCount++;
+
+            var iterate = new QueryExecuteIterateEvent
+            {
+                Header = new TraceSpanHeader { ThreadSlot = 0, StartTimestamp = planTs + 3, SpanId = nextSpanId++, ParentSpanId = planSpanId },
+                ChunkCount = 1, EntryCount = rowsScanned,
+            };
+            iterate.EncodeTo(block.AsSpan(offset), planTs + 3 + phaseDur, out var w2); offset += w2; recordCount++;
+
+            var filter = new QueryExecuteFilterEvent
+            {
+                Header = new TraceSpanHeader { ThreadSlot = 0, StartTimestamp = planTs + 4, SpanId = nextSpanId++, ParentSpanId = planSpanId },
+                FilterCount = 1, RejectedCount = rejected,
+            };
+            filter.EncodeTo(block.AsSpan(offset), planTs + 4 + phaseDur, out var w3); offset += w3; recordCount++;
+
+            var count = new QueryCountEvent
+            {
+                Header = new TraceSpanHeader { ThreadSlot = 0, StartTimestamp = planTs + 5, SpanId = nextSpanId++, ParentSpanId = planSpanId },
+                ResultCount = rowsReturned,
+            };
+            count.EncodeTo(block.AsSpan(offset), planTs + 5 + phaseDur, out var w4); offset += w4; recordCount++;
+
+            ts = planTs + durTicks + 50; // advance past this execution's window (+ gap) for the next one
+        }
+
+        // Tick 1 — both definitions + their first execution. (freq 10 MHz → 1 µs = 10 ticks.)
+        TickStart();
+        Describe(0, 1, target: 1, methodId: methodAId, OneEvaluator(0, 4)); // View #1 on Position, X >= ?
+        Describe(0, 2, target: 2, methodId: methodBId, OneEvaluator(1, 3)); // View #2 on AABB, Y > ?
+        Execution(0, 1, durTicks: 500, rowsScanned: 100, rowsReturned: 20, rejected: 80); // #1 exec a = 50 µs
+        Execution(0, 2, durTicks: 200, rowsScanned: 40, rowsReturned: 30, rejected: 10);  // #2 exec a = 20 µs
+        TickEnd();
+
+        // Tick 2 — second execution of each, longer, so percentiles/totals differ and #1 outranks #2.
+        TickStart();
+        Execution(0, 1, durTicks: 900, rowsScanned: 200, rowsReturned: 25, rejected: 175); // #1 exec b = 90 µs → total 140 µs
+        Execution(0, 2, durTicks: 400, rowsScanned: 60, rowsReturned: 35, rejected: 25);    // #2 exec b = 40 µs → total 60 µs
+        TickEnd();
+
+        // Tick 3 — empty trailer tick (matches the other fixtures' 3-tick shape).
+        TickStart();
+        TickEnd();
+
+        writer.WriteRecords(block.AsSpan(0, offset), recordCount);
+        writer.WriteSpanNames(new Dictionary<int, string>());
+
+        var qsstOffset = writer.WriteQuerySourceStringTable(queryStrings);
+        header.QuerySourceStringTableOffset = qsstOffset;
+        writer.RewriteHeader(in header);
+        writer.Flush();
+        return path;
+    }
+
+    /// <summary>
     /// Build a trace for #351 Phase 5 span-kind scoping: the record body carries two <see cref="TraceEventKind.SchedulerSystemArchetype"/>
     /// span records (kind 245) at QPC windows <c>[1000, 1500)</c> and <c>[3000, 3500)</c>, and the <c>CpuSampleSection</c>
     /// carries three samples — two inside those windows (qpc 1200, 3200) and one between them (qpc 2000). A
@@ -756,8 +915,131 @@ public static class TraceFixtureBuilder
     }
 
     /// <summary>
-    /// Build a truncated trace that has a valid header but no blocks. Exercises the decoder's
-    /// "unexpected EOF" path.
+    /// Build a deterministic trace with two kinds of anomalies wired in at known tick numbers, for
+    /// #377 Stage 4 Phase 3 (GAP-21 anomaly stream + jump). Used by the J3 E2E and by the
+    /// Workbench client's anomaly-detection unit tests so the detector can be exercised against a
+    /// fixed-shape input.
+    ///
+    /// Layout: 30 ticks at a 1 ms baseline duration (10_000 ts units each, since timestamp frequency
+    /// is 10 MHz). Anomalies are placed at:
+    ///   <list type="bullet">
+    ///     <item>tick 10 — duration 10 ms (10× baseline → tick-duration outlier).</item>
+    ///     <item>tick 15 — embedded <see cref="TraceEventKind.GcSuspension"/> span lasting 20 ms (GC-pause anomaly).</item>
+    ///     <item>tick 20 — duration 8 ms (8× baseline → tick-duration outlier).</item>
+    ///     <item>tick 25 — embedded GC suspension lasting 30 ms (larger GC-pause anomaly).</item>
+    ///   </list>
+    /// Every other tick is a clean 1 ms baseline so the client-side p95 baseline has a meaningful
+    /// floor (≥ 10 samples per the detector's <c>minSampleSize</c> guard).
+    /// </summary>
+    public static string BuildTraceWithAnomalies(string directory)
+    {
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, $"fixture-anomalies-{Guid.NewGuid():N}.typhon-trace");
+
+        using var fs = File.Create(path);
+        using var writer = new TraceFileWriter(fs);
+        writer.WriteHeader(in DefaultHeader);
+        writer.WriteSystemDefinitions([]);
+        writer.WriteArchetypes([]);
+        writer.WriteComponentTypes([]);
+        writer.WriteTracks([]);
+        writer.WriteDags([]);
+        writer.WriteEmptyStaticStructures();
+
+        // ── Anomaly schedule (tickNumber → desiredDurationUs, gcPauseDurationUs) ─────────────
+        // Baseline 1 ms per tick = 10_000 ts units (10 MHz frequency). Convert µs to ts by ×10.
+        const long BaselineDurationTs = 10_000;       // 1 ms
+        const long TickOutlier10msTs = 100_000;        // 10 ms
+        const long TickOutlier8msTs = 80_000;          // 8 ms
+        const long Gc20msTs = 200_000;                 // 20 ms
+        const long Gc30msTs = 300_000;                 // 30 ms
+
+        const int tickStartSize = CommonHeaderSize;
+        const int tickEndSize = CommonHeaderSize + 2;
+        // GcSuspension is a span record: 12 B header + 25 B span extension + 2 B payload (reason, optMask) = 39 B.
+        const int gcSpanSize = CommonHeaderSize + 25 + 2;
+        const int tickCount = 30;
+
+        // Per-tick record count: TickStart + (optional GC) + TickEnd. Anomaly ticks may emit one GC span; tick-duration
+        // outliers do not need extra records — the inflated end timestamp produces a longer tick wall-clock duration.
+        var totalRecords = 0;
+        var blockSize = 0;
+        for (var t = 0; t < tickCount; t++)
+        {
+            totalRecords += 2; // TickStart + TickEnd
+            blockSize += tickStartSize + tickEndSize;
+            if (t == 15 || t == 25)
+            {
+                totalRecords += 1;
+                blockSize += gcSpanSize;
+            }
+        }
+
+        var block = new byte[blockSize];
+        long ts = 100; // start at non-zero so anomalies are visible after the first tick
+        var offset = 0;
+        ulong spanId = 1;
+        for (var t = 0; t < tickCount; t++)
+        {
+            // TickStart at `ts`.
+            WriteRecordHeader(block.AsSpan(offset), tickStartSize, TraceEventKind.TickStart, ts);
+            offset += tickStartSize;
+
+            long durationTs = t switch
+            {
+                10 => TickOutlier10msTs,
+                20 => TickOutlier8msTs,
+                _ => BaselineDurationTs,
+            };
+
+            // GC suspensions land inside their host tick (start a small offset into the tick, duration as scheduled).
+            if (t == 15 || t == 25)
+            {
+                long gcDurationTs = t == 15 ? Gc20msTs : Gc30msTs;
+                WriteGcSuspensionEvent(block.AsSpan(offset, gcSpanSize), startTs: ts + 10, durationTicks: gcDurationTs, spanId: spanId++);
+                offset += gcSpanSize;
+                // Extend the tick so the GC pause fits comfortably inside it (host tick ≥ GC duration).
+                if (durationTs < gcDurationTs + 1_000) durationTs = gcDurationTs + 1_000;
+            }
+
+            // TickEnd at `ts + durationTs`.
+            var endTs = ts + durationTs;
+            WriteRecordHeader(block.AsSpan(offset), tickEndSize, TraceEventKind.TickEnd, endTs);
+            block[offset + CommonHeaderSize] = 0;     // overloadLevel — engine-overload byte (kept at 0, not exercised in P3)
+            block[offset + CommonHeaderSize + 1] = 1; // tickMultiplier — 1 unit = BaseTickRate (1 ms)
+            offset += tickEndSize;
+
+            // Next tick starts immediately after the previous one ended.
+            ts = endTs;
+        }
+
+        writer.WriteRecords(block, totalRecords);
+        writer.WriteSpanNames(new Dictionary<int, string>());
+        writer.Flush();
+        return path;
+    }
+
+    /// <summary>
+    /// Encode a single <see cref="TraceEventKind.GcSuspension"/> span record. Layout: 12 B common
+    /// header + 25 B span extension (durationTicks, spanId, parentSpanId, spanFlags) + 2 B payload
+    /// (u8 reason, u8 optMask). Mirrors the engine's <c>GcSuspensionEvent</c> codec.
+    /// </summary>
+    private static void WriteGcSuspensionEvent(Span<byte> dest, long startTs, long durationTicks, ulong spanId)
+    {
+        WriteRecordHeader(dest, dest.Length, TraceEventKind.GcSuspension, startTs);
+        BinaryPrimitives.WriteInt64LittleEndian(dest.Slice(CommonHeaderSize, 8), durationTicks);
+        BinaryPrimitives.WriteUInt64LittleEndian(dest.Slice(CommonHeaderSize + 8, 8), spanId);
+        BinaryPrimitives.WriteUInt64LittleEndian(dest.Slice(CommonHeaderSize + 16, 8), 0UL); // parentSpanId — process-level event, always 0
+        dest[CommonHeaderSize + 24] = 0;                                                     // spanFlags — no trace context, no source location
+        var payload = dest[(CommonHeaderSize + 25)..];
+        payload[0] = 1; // u8 reason — GcSuspendReason.Gc (arbitrary non-zero for the fixture)
+        payload[1] = 0; // u8 optMask — reserved
+    }
+
+    /// <summary>
+    /// Build a trace whose record body is intentionally truncated mid-way — used by the error-path
+    /// tests for <c>TraceSessionRuntime</c> to confirm we surface a graceful "incomplete trace" error
+    /// rather than crashing.
     /// </summary>
     public static string BuildTruncated(string directory)
     {

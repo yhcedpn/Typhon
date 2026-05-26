@@ -1,8 +1,7 @@
-import type { ChunkSpan, OffCpuStore, SpanData, TickData } from '@/libs/profiler/model/traceModel';
+import type { ChunkSpan, OffCpuStore, ProfilerSelection, SpanData, TickData } from '@/libs/profiler/model/traceModel';
 import type { TimeRange, TrackLayout, Viewport } from '@/libs/profiler/model/uiTypes';
-import type { ProfilerSelection } from '@/stores/useProfilerSelectionStore';
 import type { TimeAreaHover } from './timeAreaHitTest';
-import { relativeLuminance } from '@/libs/colors';
+import { relativeLuminanceHex } from '@/libs/color/contrast';
 import {
   colorForChunk,
   colorForSpan,
@@ -11,7 +10,7 @@ import {
   formatRulerLabel,
   setupCanvas,
 } from './canvasUtils';
-import type { SpanColorMode } from '@/stores/useProfilerViewStore';
+import type { SpanColorMode, SpanPalette } from '@/stores/useProfilerViewStore';
 import { drawGaugeSummaryStrip, GROUP_RENDERERS, type GaugeData } from './gauges/renderers';
 import { GAUGE_TRACK_ID_SET, getGaugeGroupSpec } from './gauges/region';
 import type { StudioTheme } from './theme';
@@ -84,6 +83,62 @@ let _offCpuRunCat = new Uint8Array(0);
 // Per-category off-CPU hatch CanvasPattern cache, indexed by OffCpuCategory. Built lazily on first paint from a small
 // offscreen tile; a CanvasPattern is reusable across contexts, so a single module-lifetime cache is safe.
 const _offCpuHatch: (CanvasPattern | null)[] = [];
+
+// ─── Monospace truncation cache ─────────────────────────────────────────────────────────────────
+// `12px monospace` char width is system-dependent (the OS picks the actual mono font) but stable
+// across the page lifetime. Measure once at first draw, cache for the rest of the session.
+// Used to truncate chunk + span labels client-side instead of paying per-span `save/beginPath/rect/
+// clip/restore` — the latter was the dominant ~5% main-thread cost in drawOneTickSpans (#377 perf
+// follow-up, 2026-05-26). Truncation cuts at a full-char boundary, marginally different from the
+// prior mid-glyph clip — visually indistinguishable at 12px on real workloads.
+let _mono12pxCharWidth: number | null = null;
+
+/**
+ * Lazy-measure + cache the `12px monospace` glyph width on first call. Uses 'M' as a representative
+ * character — for true monospace this matches every other glyph. Exported for tests; production
+ * callers go through {@link fillTextTruncatedMono12px}.
+ */
+export function _getMono12pxCharWidthForTest(ctx: CanvasRenderingContext2D): number {
+  return getMono12pxCharWidth(ctx);
+}
+
+/** Test-only — reset the cached char width so each test starts from a clean measurement. */
+export function _resetMono12pxCharWidthCacheForTest(): void {
+  _mono12pxCharWidth = null;
+}
+
+function getMono12pxCharWidth(ctx: CanvasRenderingContext2D): number {
+  if (_mono12pxCharWidth === null) {
+    const prev = ctx.font;
+    ctx.font = '12px monospace';
+    _mono12pxCharWidth = ctx.measureText('M').width;
+    ctx.font = prev;
+  }
+  return _mono12pxCharWidth;
+}
+
+/**
+ * Draw <paramref name="text"/> at (<paramref name="x"/>, <paramref name="y"/>), truncated to fit
+ * within <paramref name="availWidth"/> pixels at the **caller-established 12px monospace font**.
+ * Skips drawing entirely when no character fits. Replaces the `ctx.save() + ctx.clip() + fillText()
+ * + ctx.restore()` pattern that was the #1 hotspot inside the span/chunk render loop — each saved
+ * canvas state-machine transition is ~µs cost, and the loop fires 1000s of times per frame.
+ *
+ * Exported for tests; production callers are in this file's `drawTrack`.
+ */
+export function fillTextTruncatedMono12px(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  availWidth: number,
+): void {
+  if (availWidth <= 0) return;
+  const charW = getMono12pxCharWidth(ctx);
+  const maxChars = Math.floor(availWidth / charW);
+  if (maxChars <= 0) return;
+  ctx.fillText(maxChars >= text.length ? text : text.slice(0, maxChars), x, y);
+}
 
 /**
  * Lazily build + cache the diagonal-hatch fill pattern for one off-CPU category. The tile is a small transparent canvas
@@ -204,14 +259,34 @@ export function buildOffCpuRuns(
  * to `#FFFCEE` where white text would vanish. Per-bar contrast is the only correct fix.
  */
 const _textOnBarCache = new Map<string, 'light' | 'dark'>();
+// Categorical palettes hash into ≤ 8 colours (huge hit rate), but DURATION colour mode paints a continuous heat
+// gradient — near-unique hex per bar, ~zero hits, and the module-level map would grow without bound across frames.
+// Cap it: once it fills, drop it and start fresh. The categorical modes never reach the cap, so they never churn.
+const TEXT_ON_BAR_CACHE_MAX = 512;
 
 function readableOnBar(barHex: string, theme: StudioTheme): string {
   let pick = _textOnBarCache.get(barHex);
   if (pick === undefined) {
-    pick = relativeLuminance(barHex) > 0.5 ? 'dark' : 'light';
+    pick = relativeLuminanceHex(barHex) > 0.5 ? 'dark' : 'light';
+    if (_textOnBarCache.size >= TEXT_ON_BAR_CACHE_MAX) {
+      _textOnBarCache.clear();
+    }
     _textOnBarCache.set(barHex, pick);
   }
   return pick === 'dark' ? theme.textOnLightBar : theme.textOnDarkBar;
+}
+
+// A per-frame cache of `new Set(visibleTicks)`: every lane needs the membership set to skip ticks already drawn in the
+// foreground pass, and they all receive the same `visibleTicks` array within one render — so build it once (first lane)
+// and reuse it, keyed by array identity so a new viewport (new array) rebuilds it. Both call sites read it read-only.
+let _visTickSetKey: readonly TickData[] | null = null;
+let _visTickSet = new Set<TickData>();
+function visibleTickSet(visibleTicks: TickData[]): Set<TickData> {
+  if (visibleTicks !== _visTickSetKey) {
+    _visTickSet = new Set(visibleTicks);
+    _visTickSetKey = visibleTicks;
+  }
+  return _visTickSet;
 }
 
 // Diagonal-stripe pattern painted over tick ranges whose chunk data hasn't arrived yet. Gives the
@@ -331,6 +406,11 @@ export interface TimeAreaInputs {
    */
   spanColorMode: SpanColorMode;
   /**
+   * Which palette the categorical span modes draw from. Sourced from `useProfilerViewStore.spanPalette`.
+   * Threaded alongside {@link spanColorMode} so the renderer's hot loop has a stable lookup.
+   */
+  spanPalette: SpanPalette;
+  /**
    * Whether the off-CPU overlay is shown on slot lanes. Sourced from the TimeArea filter toggle
    * (`useProfilerViewStore.showOffCpu`). When false the off-CPU pass is skipped entirely.
    */
@@ -351,7 +431,7 @@ export function drawTimeArea(
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
 
-  const { tracks, viewRange, vp, gutterWidth, legendsVisible, visibleTicks, ticks, selection, hover, dragSelection, crosshairX, gaugeData, helpHover, pendingRangesUs, spanColorMode, showOffCpu } = inputs;
+  const { tracks, viewRange, vp, gutterWidth, legendsVisible, visibleTicks, ticks, selection, hover, dragSelection, crosshairX, gaugeData, helpHover, pendingRangesUs, spanColorMode, spanPalette, showOffCpu } = inputs;
   const contentWidth = width - gutterWidth;
   // Height of the pinned ruler band (ruler + gap below it). Everything above this line is always
   // visible regardless of vertical scroll; tracks below are clipped to this boundary.
@@ -526,7 +606,7 @@ export function drawTimeArea(
     if (track.id.startsWith('slot-')) {
       const threadSlot = Number.parseInt(track.id.slice(5), 10);
       drawSlotLane(ctx, track, threadSlot, ticks, visibleTicks, visStartUs, visEndUs, gutterWidth, width, pxOfUs, ty, selection, hover, theme,
-        spanColorMode, gaugeData.offCpuBySlot.get(threadSlot), showOffCpu);
+        spanColorMode, spanPalette, gaugeData.offCpuBySlot.get(threadSlot), showOffCpu);
       continue;
     }
 
@@ -534,7 +614,7 @@ export function drawTimeArea(
     // the slot-lane chunk row.
     if (track.id.startsWith('system-')) {
       const systemIdx = Number.parseInt(track.id.slice(7), 10);
-      drawSystemLane(ctx, systemIdx, visibleTicks, gutterWidth, width, pxOfUs, ty, selection, hover, theme, spanColorMode);
+      drawSystemLane(ctx, systemIdx, visibleTicks, gutterWidth, width, pxOfUs, ty, selection, hover, theme, spanColorMode, spanPalette);
       continue;
     }
 
@@ -855,6 +935,7 @@ function drawSlotLane(
   hover: TimeAreaHover | null,
   theme: StudioTheme,
   spanColorMode: SpanColorMode,
+  spanPalette: SpanPalette,
   offCpuStore: OffCpuStore | undefined,
   showOffCpu: boolean,
 ): void {
@@ -871,7 +952,8 @@ function drawSlotLane(
         const x2 = pxOfUs(chunk.endUs);
         if (x2 < gutterWidth || x1 > width) continue;
         const w = Math.max(x2 - x1, MIN_RECT_WIDTH);
-        ctx.fillStyle = colorForChunk(chunk, spanColorMode, theme.spans);
+        const chunkColor = colorForChunk(chunk, spanColorMode, theme.spans, spanPalette, theme.isDark);
+        ctx.fillStyle = chunkColor;
         ctx.fillRect(x1, ty + SPAN_BAR_MARGIN, w, SPAN_BAR_HEIGHT);
         if (selection && selection.kind === 'chunk' && isSameChunk(selection.chunk, chunk)) {
           ctx.strokeStyle = theme.selectedOutline;
@@ -881,18 +963,19 @@ function drawSlotLane(
           strokeHoverContour(ctx, x1, ty + SPAN_BAR_MARGIN, w, SPAN_BAR_HEIGHT, theme);
         }
         if (x2 - x1 > 10) {
-          ctx.save();
-          ctx.beginPath();
-          ctx.rect(x1, ty + SPAN_BAR_MARGIN, w, SPAN_BAR_HEIGHT);
-          ctx.clip();
-          ctx.fillStyle = readableOnBar(colorForChunk(chunk, spanColorMode, theme.spans), theme);
+          // Manual truncation instead of save/clip/restore — the font is fixed (12px monospace),
+          // so we can compute how many chars fit and slice. Saves three canvas state-machine
+          // transitions per chunk bar; chunks render once per frame × dozens-to-hundreds of bars.
+          ctx.fillStyle = readableOnBar(chunkColor, theme);
           ctx.font = '12px monospace';
           ctx.textAlign = 'left';
           const chunkName = chunk.isParallel ? `${chunk.systemName}[${chunk.chunkIndex}]` : chunk.systemName;
           const label = `${chunkName} (${formatDuration(chunk.endUs - chunk.startUs)})`;
           const textX = Math.max(x1 + 3, gutterWidth + 3);
-          ctx.fillText(label, textX, ty + SPAN_BAR_MARGIN + SPAN_BAR_HEIGHT -  SPAN_BAR_TEXT_OFFSET);
-          ctx.restore();
+          // `availWidth` is the visible portion of the bar starting at `textX` — when the bar is
+          // clamped left to the gutter, that's narrower than `w`.
+          const availWidth = (x1 + w) - textX;
+          fillTextTruncatedMono12px(ctx, label, textX, ty + SPAN_BAR_MARGIN + SPAN_BAR_HEIGHT - SPAN_BAR_TEXT_OFFSET, availWidth);
         }
       }
     }
@@ -913,6 +996,17 @@ function drawSlotLane(
   // Checkpoint.Cycle bar from tick 200 would overdraw all spans visible at tick 80.
   ctx.font = '12px monospace';
   ctx.textAlign = 'left';
+
+  // Hoist selection/hover-kind discrimination outside the per-span loop (#377 perf follow-up,
+  // 2026-05-26). Most frames have neither a selected nor a hovered span; checking three terms
+  // (`selection && selection.kind === 'span' && isSameSpan(...)`) per span × 1000s of spans was
+  // measurable in the bottom-up flame. Stash the kind-narrowed reference (or null) once per
+  // drawTrack invocation and the inner loop reduces to one null-compare + the `isSameSpan` only
+  // when a candidate exists.
+  const selectedSpan: SpanData | null =
+    selection !== null && selection.kind === 'span' ? selection.span : null;
+  const hoveredSpan: SpanData | null =
+    hover !== null && hover.kind === 'span' ? hover.span : null;
 
   const drawOneTickSpans = (tick: TickData, nativeOnly: boolean): void => {
     const slotSpans = tick.spansByThreadSlot.get(threadSlot);
@@ -990,7 +1084,7 @@ function drawSlotLane(
         flushDepth(d);
         // Idle / BetweenTick bars (pinChunkRow) draw with a deliberately muted theme.idleBar so
         // they're spotted by being LESS visible than real work — light grey on light, dark grey on dark.
-        const c = pinChunkRow ? theme.idleBar : colorForSpan(span, spanColorMode, theme.spans);
+        const c = pinChunkRow ? theme.idleBar : colorForSpan(span, spanColorMode, theme.spans, spanPalette, theme.isDark);
         if (c !== prevFill) { ctx.fillStyle = c; prevFill = c; }
         ctx.fillRect(x1, sy + SPAN_BAR_MARGIN, w, SPAN_BAR_HEIGHT);
         coalX1[d] = x1;
@@ -1002,30 +1096,31 @@ function drawSlotLane(
 
       // Wide bar
       flushDepth(d);
-      const c = pinChunkRow ? theme.idleBar : colorForSpan(span, spanColorMode, theme.spans);
+      const c = pinChunkRow ? theme.idleBar : colorForSpan(span, spanColorMode, theme.spans, spanPalette, theme.isDark);
       if (c !== prevFill) { ctx.fillStyle = c; prevFill = c; }
       ctx.fillRect(x1, sy + SPAN_BAR_MARGIN, w, SPAN_BAR_HEIGHT);
 
-      if (selection && selection.kind === 'span' && isSameSpan(selection.span, span)) {
+      if (selectedSpan !== null && isSameSpan(selectedSpan, span)) {
         ctx.strokeStyle = theme.selectedOutline;
         ctx.lineWidth = 1.5;
         ctx.strokeRect(x1 + 0.5, sy + SPAN_BAR_MARGIN + 0.5, w - 1, SPAN_BAR_HEIGHT - 1);
-      } else if (hover && hover.kind === 'span' && isSameSpan(hover.span, span)) {
+      } else if (hoveredSpan !== null && isSameSpan(hoveredSpan, span)) {
         strokeHoverContour(ctx, x1, sy + SPAN_BAR_MARGIN, w, SPAN_BAR_HEIGHT, theme);
       }
 
       if (actualWidth > 10) {
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(x1, sy + SPAN_BAR_MARGIN, actualWidth, SPAN_BAR_HEIGHT);
-        ctx.clip();
-        ctx.fillStyle = readableOnBar(pinChunkRow ? theme.idleBar : colorForSpan(span, spanColorMode, theme.spans), theme);
+        // Manual truncation in lieu of save/clip/restore — see `fillTextTruncatedMono12px` for
+        // the rationale (#377 perf follow-up, 2026-05-26). Per-span, this was the #1 hotspot in
+        // the entire Workbench main thread (~21% self in prod recordings); removing the three
+        // canvas state transitions and the clip-path eval drops it to a single `fillText`.
+        const textColor = readableOnBar(c, theme);
+        ctx.fillStyle = textColor;
         ctx.font = '12px monospace';
         ctx.textAlign = 'left';
         // Clamp the text's X to the visible-left edge so the label stays readable when the bar's
-        // left edge is off-screen. The clip rect above still trims anything that runs past the
-        // bar's actual right edge, so a long label on a wide bar with most of its body off-screen
-        // left now slides in from the gutter and cuts at the bar's right edge naturally.
+        // left edge is off-screen. The truncation now caps anything that would run past the bar's
+        // right edge — a long label on a wide bar with most of its body off-screen left slides in
+        // from the gutter and cuts at a full-char boundary near the bar's right edge.
         //
         // Intentionally NOT `Math.round(...)`: the bar's left edge is at a fractional canvas X
         // (from `pxOfUs`) and its anti-aliased border blends across pixels. Keeping the text's X
@@ -1033,9 +1128,15 @@ function drawSlotLane(
         // when the bar is off-screen left the text anchors to the gutter at a stable integer
         // offset anyway — readability wins on both sides.
         const textX = Math.max(x1 + 3, gutterWidth + 3);
-        ctx.fillText(`${span.name} (${formatDuration(span.durationUs)})`, textX, sy + SPAN_BAR_MARGIN + SPAN_BAR_HEIGHT - SPAN_BAR_TEXT_OFFSET);
-        ctx.restore();
-        prevFill = ''; // clip/restore may invalidate cached fill
+        const availWidth = (x1 + actualWidth) - textX;
+        fillTextTruncatedMono12px(
+          ctx,
+          `${span.name} (${formatDuration(span.durationUs)})`,
+          textX,
+          sy + SPAN_BAR_MARGIN + SPAN_BAR_HEIGHT - SPAN_BAR_TEXT_OFFSET,
+          availWidth,
+        );
+        prevFill = textColor; // keep the fillStyle cache in sync with the assignment above.
       }
     }
 
@@ -1045,7 +1146,7 @@ function drawSlotLane(
   // Pass 1: non-visible ticks, native spans only (background). Native spans may overflow past
   // their tick's endUs and still overlap the viewport — they draw correctly here. Cross-tick spans
   // are excluded: they start before the tick and can produce full-width bars in a gap.
-  const visSpanSet = new Set<TickData>(visibleTicks);
+  const visSpanSet = visibleTickSet(visibleTicks);
   for (const tick of ticks) {
     if (!visSpanSet.has(tick)) drawOneTickSpans(tick, true);
   }
@@ -1065,7 +1166,7 @@ function drawSlotLane(
 
 /**
  * Per-system chunk lane — one row, filters chunks by `systemIndex`. Same bar colouring as the
- * slot-lane chunk row (`getSystemColor(systemIndex, theme.spans)`). No label text on the bar —
+ * slot-lane chunk row (`colorForChunk(chunk, spanColorMode, …)`). No label text on the bar —
  * the gutter already shows the system name.
  */
 function drawSystemLane(
@@ -1080,6 +1181,7 @@ function drawSystemLane(
   hover: TimeAreaHover | null,
   theme: StudioTheme,
   spanColorMode: SpanColorMode,
+  spanPalette: SpanPalette,
 ): void {
   for (const tick of visibleTicks) {
     for (const chunk of tick.chunks) {
@@ -1088,7 +1190,7 @@ function drawSystemLane(
       const x2 = pxOfUs(chunk.endUs);
       if (x2 < gutterWidth || x1 > width) continue;
       const w = Math.max(x2 - x1, MIN_RECT_WIDTH);
-      ctx.fillStyle = colorForChunk(chunk, spanColorMode, theme.spans);
+      ctx.fillStyle = colorForChunk(chunk, spanColorMode, theme.spans, spanPalette, theme.isDark);
       ctx.fillRect(x1, ty + SPAN_BAR_MARGIN, w, SPAN_BAR_HEIGHT);
       if (selection && selection.kind === 'chunk' && isSameChunk(selection.chunk, chunk)) {
         ctx.strokeStyle = theme.selectedOutline;
@@ -1393,7 +1495,7 @@ function drawMiniRowBars(
     }
   };
 
-  const visMiniSet = new Set<TickData>(visibleTicks);
+  const visMiniSet = visibleTickSet(visibleTicks);
   for (const tick of ticks) {
     if (!visMiniSet.has(tick)) drawOneTick(tick, true);
   }

@@ -18,7 +18,7 @@ namespace Typhon.Workbench.Controllers;
 [Tags("StorageMap")]
 [RequireBootstrapToken]
 [RequireSession]
-public sealed class StorageMapController : ControllerBase
+public sealed class StorageMapController : WorkbenchControllerBase
 {
     private readonly StorageMapService _service;
 
@@ -30,6 +30,10 @@ public sealed class StorageMapController : ControllerBase
     /// <summary>Data file + WAL metadata and the segment table.</summary>
     [HttpGet("regions")]
     public ActionResult<StorageRegionsDto> GetRegions(Guid sessionId) => Invoke(_service.GetRegions);
+
+    /// <summary>Aggregate storage health rollup — whole-DB summary + per-segment table (GAP-16).</summary>
+    [HttpGet("health")]
+    public ActionResult<StorageHealthDto> GetHealth(Guid sessionId) => Invoke(_service.GetHealth);
 
     /// <summary>The top levels of the Hilbert aggregate pyramid.</summary>
     [HttpGet("overview")]
@@ -95,12 +99,7 @@ public sealed class StorageMapController : ControllerBase
             return session;
         }
 
-        conflict = Conflict(new ProblemDetails
-        {
-            Title = "session_kind_mismatch",
-            Detail = "The Database File Map is only available for Open (file) sessions.",
-            Status = StatusCodes.Status409Conflict,
-        });
+        conflict = ConflictKindMismatch("The Database File Map is only available for Open (file) sessions.");
         return null;
     }
 }

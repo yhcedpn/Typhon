@@ -6,14 +6,52 @@ import {
   SELECTED_COLOR,
   SPAN_PALETTE,
   SPAN_PALETTE_LIGHT,
-  SYSTEM_PALETTE,
   TIMELINE_PALETTE,
   TIMELINE_PALETTE_LIGHT,
   UNPHASED_COLOR,
+  colorForSystem,
   type PaletteColor,
 } from '@/libs/palettes';
 import { OFF_CPU_PALETTE } from '@/libs/profiler/canvas/theme';
 import { ACCESS_COLOR } from '@/panels/DataFlow/barBuilding';
+
+/**
+ * Chrome semantic tokens (DS-2a) — the theme-aware CSS variables in globals.css that all UI chrome draws
+ * from (background/foreground/primary/accent/border/ring/…). Distinct from the data-viz palettes below: these
+ * are resolved live via `var(--token)`, so the swatches reflect the *current* light/dark theme. The focus ring
+ * (`--ring`) and the active-pane tint (`--panel-active-border`) live here — they are NOT data-viz colours.
+ */
+const CHROME_TOKENS: readonly { name: string; note?: string }[] = [
+  { name: '--ring', note: 'focus-visible ring (= --primary in light theme)' },
+  { name: '--panel-active-border', note: 'active-pane header tint (= --ring)' },
+  { name: '--sidebar-ring' },
+  { name: '--primary' },
+  { name: '--primary-foreground' },
+  { name: '--secondary' },
+  { name: '--secondary-foreground' },
+  { name: '--accent', note: 'selection fill (selected row/tab)' },
+  { name: '--accent-foreground' },
+  { name: '--background' },
+  { name: '--foreground' },
+  { name: '--card' },
+  { name: '--card-foreground' },
+  { name: '--popover' },
+  { name: '--popover-foreground' },
+  { name: '--muted' },
+  { name: '--muted-foreground' },
+  { name: '--border' },
+  { name: '--input' },
+  { name: '--destructive' },
+  { name: '--destructive-foreground' },
+  { name: '--chart-1' },
+  { name: '--chart-2' },
+  { name: '--chart-3' },
+  { name: '--chart-4' },
+  { name: '--chart-5' },
+];
+
+/** Illustrative system names for the DS-2 system-identity demo — colorForSystem hashes the name, so any set shows the hue spread. */
+const SAMPLE_SYSTEM_NAMES: readonly string[] = ['Physics', 'AI', 'Render', 'Network', 'Audio', 'Animation', 'Pathfinding', 'Damage', 'Spawning', 'Cleanup'];
 
 /**
  * Debug panel — renders every colour palette the Workbench draws with as labelled swatches. A
@@ -22,11 +60,20 @@ import { ACCESS_COLOR } from '@/panels/DataFlow/barBuilding';
  */
 export default function PaletteDebug() {
   return (
-    <div className="h-full w-full overflow-auto bg-background p-3 text-[11px]">
-      <h2 className="text-[13px] font-semibold text-foreground">Color Palettes</h2>
+    <div className="h-full w-full overflow-auto bg-background p-3 text-fs-sm">
+      <h2 className="text-fs-lg font-semibold text-foreground">Color Palettes</h2>
       <p className="mb-3 text-muted-foreground">
         Every palette the Workbench renders with. Debug view — opened via the command palette.
       </p>
+
+      <Section
+        name="Chrome tokens (semantic — DS-2a)"
+        note="Theme-aware CSS variables (globals.css) — resolved live, so these reflect the current light/dark theme. The focus ring is --ring."
+      >
+        {CHROME_TOKENS.map((t) => (
+          <Swatch key={t.name} label={t.name} value={t.note ?? `var(${t.name})`} fill={`var(${t.name})`} />
+        ))}
+      </Section>
 
       <PairSection
         name="PHASE_PALETTE"
@@ -34,11 +81,15 @@ export default function PaletteDebug() {
         colors={[...PHASE_PALETTE, UNPHASED_COLOR]}
         lastLabel="unphased"
       />
-      <PairSection
-        name="SYSTEM_PALETTE"
-        note="System-identity bars — colorForSystem(name). The phase palette minus the alarm-red hue. @/libs/palettes"
-        colors={SYSTEM_PALETTE}
-      />
+      <Section
+        name="System identity (DS-2)"
+        note="colorForSystem(name) = categoricalColor(name) — stable hue-per-object: a system reads the same hue across timeline / DAG / matrix / Query Analyzer. @/libs/palettes"
+      >
+        {SAMPLE_SYSTEM_NAMES.map((n) => {
+          const c = colorForSystem(n);
+          return <Swatch key={n} label={n} value={`fill ${c.fill}`} subValue={`stroke ${c.stroke}`} fill={c.fill} stroke={c.stroke} />;
+        })}
+      </Section>
       <HexSection
         name="TIMELINE_PALETTE"
         note="13-colour Turbo ramp — phase / operation bands (dark theme). @/libs/profiler/canvas/canvasUtils"

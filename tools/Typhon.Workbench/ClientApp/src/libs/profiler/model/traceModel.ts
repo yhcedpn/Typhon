@@ -267,6 +267,29 @@ export interface SpanData {
   rawEvent?: TraceEvent;
 }
 
+/**
+ * Discriminated union of profiler-panel selections. The profiler can select six kinds of things, each mapped to its
+ * own kind tag so DetailPanel's render branches know exactly what they're looking at:
+ *
+ *  - **span**: a nested span inside a scheduler chunk (Transaction.Commit, BTree.Insert, etc.)
+ *  - **chunk**: a top-level scheduler chunk (a system's execution slot inside a tick)
+ *  - **tick**: a whole tick on the overview strip
+ *  - **marker**: a discrete event instant (GC, memory alloc event)
+ *  - **phase**: a tick lifecycle phase span (RuntimePhaseSpan — WriteTickFence, UoW Flush, OutputPhase, etc.)
+ *  - **phase-marker**: a single-point lifecycle landmark (UoW Create / UoW Flush glyph in the phase track)
+ *
+ * Off-CPU overlay bars are deliberately NOT selectable — they're a hover-only visual (the hover tooltip surfaces
+ * wait reason / duration); see routeSelection in TimeArea.tsx. Carried on the unified selection bus as the `span` /
+ * `tick` leaf `ref` (the legacy `useProfilerSelectionStore` silo was retired in Stage-3 Phase 3E, #376 AC3.15).
+ */
+export type ProfilerSelection =
+  | { kind: 'span'; span: SpanData }
+  | { kind: 'chunk'; chunk: ChunkSpan }
+  | { kind: 'tick'; tickNumber: number }
+  | { kind: 'marker'; marker: MarkerSelection }
+  | { kind: 'phase'; phase: PhaseSpan; tickNumber: number }
+  | { kind: 'phase-marker'; marker: PhaseMarker; tickNumber: number };
+
 /** All data for a single tick */
 export interface TickData {
   tickNumber: number;
@@ -413,8 +436,6 @@ export interface ProcessedTrace {
   maxTickDurationUs: number;
   /** P95 tick duration for timeline bar height scaling */
   p95TickDurationUs: number;
-  /** System color palette */
-  systemColors: string[];
   /**
    * Per-tick summary from the sidecar cache, one entry per tick in the whole file. Always-resident across the full timeline so the overview can
    * render immediately on open without loading any detail events. Present when a `/api/trace/open` response has been consumed; undefined for
@@ -471,27 +492,9 @@ const SKIP_REASON_NAMES: Record<number, string> = {
   7: 'Dependency Failed'
 };
 
-/** Color palette for systems — visually distinct, dark-theme friendly */
-const SYSTEM_PALETTE = [
-  '#e94560', '#4ecdc4', '#ffe66d', '#95e1d3', '#f38181',
-  '#aa96da', '#a8d8ea', '#fcbad3', '#c3aed6', '#b8de6f',
-  '#ff9a76', '#679b9b', '#ffc4a3', '#e8a87c', '#41b3a3',
-  '#d63447', '#f57b51', '#f6efa6', '#5ee7df', '#b490ca',
-];
-
-/** Generate system color based on index */
-function generateSystemColors(count: number): string[] {
-  const colors: string[] = [];
-  for (let i = 0; i < count; i++) {
-    colors.push(SYSTEM_PALETTE[i % SYSTEM_PALETTE.length]);
-  }
-  return colors;
-}
-
 /** Process raw records into renderable tick structures */
 export function processTrace(metadata: TraceMetadata, events: TraceEvent[]): ProcessedTrace {
   const systems = metadata.systems;
-  const systemColors = generateSystemColors(systems.length);
 
   // Group records by derived tick number (the server already assigns tickNumber on every record).
   const tickMap = new Map<number, TraceEvent[]>();
@@ -562,7 +565,6 @@ export function processTrace(metadata: TraceMetadata, events: TraceEvent[]): Pro
     maxSystemDurationUs,
     maxTickDurationUs,
     p95TickDurationUs,
-    systemColors,
     gaugeSeries,
     gaugeCapacities,
     memoryAllocEvents,
@@ -1411,7 +1413,6 @@ export function createEmptyTrace(metadata: TraceMetadata): ProcessedTrace {
     maxSystemDurationUs: 0,
     maxTickDurationUs: 0,
     p95TickDurationUs: 0,
-    systemColors: generateSystemColors(metadata.systems.length),
     gaugeSeries: new Map(),
     gaugeCapacities: new Map(),
     memoryAllocEvents: [],

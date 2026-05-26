@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import { createJSONStorage, persist } from 'zustand/middleware';
+import { persist } from 'zustand/middleware';
+import { safeStorage } from './safeStorage';
 import type { SessionKind } from '@/stores/useSessionStore';
 
 interface DockLayoutState {
@@ -11,17 +12,6 @@ interface DockLayoutState {
   clear: () => void;
 }
 
-const safeStorage = createJSONStorage(() => ({
-  getItem: (name: string) => {
-    try { return localStorage.getItem(name); } catch { return null; }
-  },
-  setItem: (name: string, value: string) => {
-    try { localStorage.setItem(name, value); } catch { /* noop */ }
-  },
-  removeItem: (name: string) => {
-    try { localStorage.removeItem(name); } catch { /* noop */ }
-  },
-}));
 
 export const useDockLayoutStore = create<DockLayoutState>()(
   persist(
@@ -35,6 +25,10 @@ export const useDockLayoutStore = create<DockLayoutState>()(
       getTemplate: (kind) => get().layouts[`__template__:${kind}`] ?? null,
       clear: () => set({ layouts: {} }),
     }),
-    { name: 'typhon-dock-layouts-v4', storage: safeStorage },
+    // v8: Stage 3 Phase 1 made the Profiler timeline the trace/attach default center (a no-position addPanel
+    // had docked it into the left edge once the view was un-gated). Bumping the key discards v7 trace/attach
+    // layouts that captured the buggy left placement, so the centered timeline loads on first open rather than
+    // only after Reset Layout. (v7 = Stage 2 Schema Explorer center; v6 = Stage 1 navigator; v5 = Stage 0.)
+    { name: 'typhon-dock-layouts-v8', storage: safeStorage },
   ),
 );

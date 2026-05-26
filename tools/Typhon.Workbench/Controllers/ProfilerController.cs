@@ -19,7 +19,7 @@ namespace Typhon.Workbench.Controllers;
 [Tags("Profiler")]
 [RequireBootstrapToken]
 [RequireSession]
-public sealed class ProfilerController : ControllerBase
+public sealed class ProfilerController : WorkbenchControllerBase
 {
     /// <summary>
     /// Returns the full metadata DTO once the session is ready. For Trace sessions this means the sidecar cache build
@@ -42,15 +42,11 @@ public sealed class ProfilerController : ControllerBase
                 {
                     return Ok(runtime.Metadata);
                 }
-                return Problem(
-                    title: "trace_build_failed",
-                    detail: "Trace cache build failed. See server logs for details.",
-                    statusCode: StatusCodes.Status500InternalServerError);
+                return TraceBuildFailed(runtime.BuildError);
             }
 
             // Build in flight — client should retry (TanStack Query handles this via refetchInterval).
-            Response.Headers["Retry-After"] = "1";
-            return StatusCode(StatusCodes.Status202Accepted);
+            return NotReady();
         }
 
         if (session is AttachSession attach)
@@ -60,16 +56,10 @@ public sealed class ProfilerController : ControllerBase
                 return Ok(attach.Runtime.Metadata);
             }
             // Init frame hasn't arrived yet — client retries.
-            Response.Headers["Retry-After"] = "1";
-            return StatusCode(StatusCodes.Status202Accepted);
+            return NotReady();
         }
 
-        return Conflict(new ProblemDetails
-        {
-            Title = "session_kind_mismatch",
-            Detail = "Profiler metadata is only available for Trace and Attach sessions.",
-            Status = StatusCodes.Status409Conflict,
-        });
+        return ConflictKindMismatch("Profiler metadata is only available for Trace and Attach sessions.");
     }
 
     /// <summary>
@@ -88,12 +78,7 @@ public sealed class ProfilerController : ControllerBase
             return Ok(new TraceStatusDto(trace.Runtime.NewVersionAvailable));
         }
 
-        return Conflict(new ProblemDetails
-        {
-            Title = "session_kind_mismatch",
-            Detail = "Trace status is only available for Trace sessions.",
-            Status = StatusCodes.Status409Conflict,
-        });
+        return ConflictKindMismatch("Trace status is only available for Trace sessions.");
     }
 
     /// <summary>
@@ -119,12 +104,7 @@ public sealed class ProfilerController : ControllerBase
             return Ok(trace.Runtime.SourceLocationManifest);
         }
 
-        return Conflict(new ProblemDetails
-        {
-            Title = "session_kind_mismatch",
-            Detail = "Source-location manifest is only available for Trace and Attach sessions.",
-            Status = StatusCodes.Status409Conflict,
-        });
+        return ConflictKindMismatch("Source-location manifest is only available for Trace and Attach sessions.");
     }
 
     /// <summary>
@@ -143,8 +123,7 @@ public sealed class ProfilerController : ControllerBase
             var runtime = trace.Runtime;
             if (!runtime.IsBuildComplete)
             {
-                Response.Headers["Retry-After"] = "1";
-                return StatusCode(StatusCodes.Status202Accepted);
+                return NotReady();
             }
             return Ok(runtime.CpuSampleData.Manifest);
         }
@@ -155,12 +134,7 @@ public sealed class ProfilerController : ControllerBase
             return Ok(CpuFrameManifestDto.Empty);
         }
 
-        return Conflict(new ProblemDetails
-        {
-            Title = "session_kind_mismatch",
-            Detail = "CPU-sample frames are only available for Trace and Attach sessions.",
-            Status = StatusCodes.Status409Conflict,
-        });
+        return ConflictKindMismatch("CPU-sample frames are only available for Trace and Attach sessions.");
     }
 
     /// <summary>
@@ -180,15 +154,11 @@ public sealed class ProfilerController : ControllerBase
             var runtime = trace.Runtime;
             if (!runtime.IsBuildComplete)
             {
-                Response.Headers["Retry-After"] = "1";
-                return StatusCode(StatusCodes.Status202Accepted);
+                return NotReady();
             }
             if (runtime.Metadata == null)
             {
-                return Problem(
-                    title: "trace_build_failed",
-                    detail: "Trace cache build failed. See server logs for details.",
-                    statusCode: StatusCodes.Status500InternalServerError);
+                return TraceBuildFailed(runtime.BuildError);
             }
             var cpu = runtime.CpuSampleData;
             var meta = runtime.Metadata;
@@ -199,8 +169,11 @@ public sealed class ProfilerController : ControllerBase
             }
             var windows = ScopeResolver.Resolve(
                 request, meta.Systems, meta.TickSummaries, meta.SystemTickSummaries, () => runtime.SpanInstanceIndex, runtime.TimestampFrequency);
-            var tree = CallTreeFolder.Fold(
-                cpu.Samples, cpu.Stacks, cpu.CategoryByFrameId, windows, request, cpu.ThreadRuns, runtime.SampleClassifier);
+            var tree = string.Equals(request.Direction, "bottom-up", StringComparison.OrdinalIgnoreCase)
+                ? CallTreeFolder.FoldBottomUp(
+                    cpu.Samples, cpu.Stacks, cpu.CategoryByFrameId, windows, request, cpu.ThreadRuns, runtime.SampleClassifier)
+                : CallTreeFolder.Fold(
+                    cpu.Samples, cpu.Stacks, cpu.CategoryByFrameId, windows, request, cpu.ThreadRuns, runtime.SampleClassifier);
             runtime.CallTreeCache.Put(cacheKey, tree);
             return Ok(tree);
         }
@@ -210,12 +183,7 @@ public sealed class ProfilerController : ControllerBase
             return Ok(CallTreeResponseDto.Empty);
         }
 
-        return Conflict(new ProblemDetails
-        {
-            Title = "session_kind_mismatch",
-            Detail = "The CPU call tree is only available for Trace and Attach sessions.",
-            Status = StatusCodes.Status409Conflict,
-        });
+        return ConflictKindMismatch("The CPU call tree is only available for Trace and Attach sessions.");
     }
 
     /// <summary>
@@ -236,15 +204,11 @@ public sealed class ProfilerController : ControllerBase
             var runtime = trace.Runtime;
             if (!runtime.IsBuildComplete)
             {
-                Response.Headers["Retry-After"] = "1";
-                return StatusCode(StatusCodes.Status202Accepted);
+                return NotReady();
             }
             if (runtime.Metadata == null)
             {
-                return Problem(
-                    title: "trace_build_failed",
-                    detail: "Trace cache build failed. See server logs for details.",
-                    statusCode: StatusCodes.Status500InternalServerError);
+                return TraceBuildFailed(runtime.BuildError);
             }
             var cpu = runtime.CpuSampleData;
             var meta = runtime.Metadata;
@@ -259,12 +223,7 @@ public sealed class ProfilerController : ControllerBase
             return Ok(SampleDensityDto.Empty);
         }
 
-        return Conflict(new ProblemDetails
-        {
-            Title = "session_kind_mismatch",
-            Detail = "Sample density is only available for Trace and Attach sessions.",
-            Status = StatusCodes.Status409Conflict,
-        });
+        return ConflictKindMismatch("Sample density is only available for Trace and Attach sessions.");
     }
 
     /// <summary>
@@ -279,12 +238,7 @@ public sealed class ProfilerController : ControllerBase
         var session = HttpContext.Items["Session"];
         if (session is not AttachSession attach)
         {
-            return Conflict(new ProblemDetails
-            {
-                Title = "session_kind_mismatch",
-                Detail = "Disconnect is only valid on Attach sessions.",
-                Status = StatusCodes.Status409Conflict,
-            });
+            return ConflictKindMismatch("Disconnect is only valid on Attach sessions.");
         }
 
         attach.Runtime.RequestDisconnect();
@@ -310,34 +264,31 @@ public sealed class ProfilerController : ControllerBase
         var session = HttpContext.Items["Session"];
         if (session is not AttachSession attach)
         {
-            return Conflict(new ProblemDetails
-            {
-                Title = "session_kind_mismatch",
-                Detail = "Save Replay is only valid on Attach sessions.",
-                Status = StatusCodes.Status409Conflict,
-            });
+            return ConflictKindMismatch("Save Replay is only valid on Attach sessions.");
         }
 
+        // #377 Stage 4 P4 "Capture & Analyse" — empty path means the client wants the one-gesture flow:
+        // server picks a default under %LOCALAPPDATA%/Typhon/Workbench/captures/ (or the XDG equivalent on
+        // POSIX), guarantees the directory exists, and returns the resolved path. Existing callers passing
+        // an explicit path retain the original validation semantics.
+        string resolved;
         if (string.IsNullOrWhiteSpace(request?.Path))
         {
-            return BadRequest(new ProblemDetails
-            {
-                Title = "invalid_path",
-                Detail = "path is required.",
-                Status = StatusCodes.Status400BadRequest,
-            });
+            resolved = ResolveDefaultCapturePath();
         }
-
-        var resolved = System.IO.Path.GetFullPath(request.Path);
-        var parent = System.IO.Path.GetDirectoryName(resolved);
-        if (string.IsNullOrEmpty(parent) || !System.IO.Directory.Exists(parent))
+        else
         {
-            return BadRequest(new ProblemDetails
+            resolved = System.IO.Path.GetFullPath(request.Path);
+            var parent = System.IO.Path.GetDirectoryName(resolved);
+            if (string.IsNullOrEmpty(parent) || !System.IO.Directory.Exists(parent))
             {
-                Title = "parent_directory_missing",
-                Detail = $"Parent directory does not exist: {parent}",
-                Status = StatusCodes.Status400BadRequest,
-            });
+                return BadRequest(new ProblemDetails
+                {
+                    Title = "parent_directory_missing",
+                    Detail = $"Parent directory does not exist: {parent}",
+                    Status = StatusCodes.Status400BadRequest,
+                });
+            }
         }
 
         try
@@ -585,6 +536,33 @@ public sealed class ProfilerController : ControllerBase
         return set;
     }
 
+    /// <summary>
+    /// Resolve the default capture directory used by the one-gesture "Capture &amp; Analyse" flow (#377 Stage 4
+    /// Phase 4). Anchors under <c>%LOCALAPPDATA%/Typhon/Workbench/captures/</c> on Windows (or the XDG-equivalent
+    /// <c>$XDG_DATA_HOME/typhon/workbench/captures/</c> on POSIX), guarantees the directory exists, and stamps a
+    /// monotone filename so repeated captures don't collide. Returns the resolved absolute path.
+    /// </summary>
+    private static string ResolveDefaultCapturePath()
+    {
+        string root;
+        if (OperatingSystem.IsWindows())
+        {
+            root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        }
+        else
+        {
+            // XDG-equivalent on POSIX — defaults to ~/.local/share if XDG_DATA_HOME is unset.
+            var xdg = Environment.GetEnvironmentVariable("XDG_DATA_HOME");
+            root = !string.IsNullOrWhiteSpace(xdg)
+                ? xdg
+                : System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share");
+        }
+        var capturesDir = System.IO.Path.Combine(root, "Typhon", "Workbench", "captures");
+        System.IO.Directory.CreateDirectory(capturesDir);
+        var stamp = DateTime.UtcNow.ToString("yyyyMMddTHHmmssZ", System.Globalization.CultureInfo.InvariantCulture);
+        return System.IO.Path.Combine(capturesDir, $"typhon-capture-{stamp}.typhon-replay");
+    }
+
     private static List<TraceEventDto> ApplyFilters(List<TraceEventDto> source, HashSet<int> kinds, int? tick)
     {
         var result = new List<TraceEventDto>();
@@ -742,8 +720,7 @@ public sealed class ProfilerController : ControllerBase
         var session = (Sessions.ISession)HttpContext.Items["Session"]!;
         if (session.IsSchemaBuilding)
         {
-            Response.Headers["Retry-After"] = "1";
-            return StatusCode(StatusCodes.Status202Accepted);
+            return NotReady();
         }
         return Conflict(new ProblemDetails
         {

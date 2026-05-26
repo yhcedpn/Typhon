@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import { createJSONStorage, persist } from 'zustand/middleware';
+import { persist } from 'zustand/middleware';
+import { safeStorage } from './safeStorage';
 import type { TimeRange, TrackState } from '@/libs/profiler/model/uiTypes';
 import { useOptionsStore } from '@/stores/useOptionsStore';
 
@@ -11,6 +12,14 @@ import { useOptionsStore } from '@/stores/useOptionsStore';
  *   - `duration` → log-scale heat-map (blue → green → orange → red); makes outliers pop.
  */
 export type SpanColorMode = 'name' | 'thread' | 'depth' | 'duration';
+
+/**
+ * Which palette the categorical span/chunk modes (name / thread / depth) draw from:
+ *   - `categorical` → the shared DS-2 `categoricalColor` scale (stable hue-per-object across views) — default.
+ *   - `curated`     → the hand-tuned 8-colour `SPAN_PALETTE` warm ramp (the pre-DS-2 flame aesthetic).
+ * The `duration` heat mode is a sequential ramp and is unaffected by this choice.
+ */
+export type SpanPalette = 'categorical' | 'curated';
 
 /**
  * View-state slice for the Profiler panel — viewport + toggle states + per-gauge-group collapse states.
@@ -35,6 +44,15 @@ interface ProfilerViewState {
    * Session-scoped — not persisted.
    */
   transientViewRange: TimeRange;
+  /**
+   * Linked/unlink scope flag (GAP-11, stage-3 Phase 3). When `true` (default), the scheduling-cluster panels
+   * (System DAG / Critical Path / Data Flow) follow {@link viewRange}; when `false` they freeze on
+   * {@link pinnedRange} — the window captured at unlink time — and ignore further `viewRange` changes. Consumers
+   * read the resolved window via {@link selectEffectiveScope}. Session-scoped (reset on each open; not persisted).
+   */
+  scopeLinked: boolean;
+  /** The frozen time window while unlinked (captured at the unlink toggle); `null` while linked. */
+  pinnedRange: TimeRange | null;
   /** Toggled by the `g` key. Hides the full gauge region. */
   gaugeRegionVisible: boolean;
   /** Per-system chunk-lanes section visibility. */
@@ -64,6 +82,9 @@ interface ProfilerViewState {
   /** How spans are coloured on slot lanes. See {@link SpanColorMode}. Persisted UX preference. */
   spanColorMode: SpanColorMode;
 
+  /** Which palette the categorical span modes draw from. See {@link SpanPalette}. Persisted UX preference. */
+  spanPalette: SpanPalette;
+
   /** When true, each slot track height is sized to the deepest span visible in the current viewport
    *  rather than the session-wide maximum. Tracks shrink/grow as the user pans. No scroll
    *  stabilisation — heights change immediately. Persisted UX preference. */
@@ -86,12 +107,15 @@ interface ProfilerViewState {
    * should see the change immediately rather than after the debounce window.
    */
   commitViewRange: (r: TimeRange) => void;
+  /** Toggle scope linking. Unlink freezes the current {@link viewRange} into {@link pinnedRange}; relink clears it. */
+  setScopeLinked: (linked: boolean) => void;
   toggleGaugeRegion: () => void;
   togglePerSystemLanes: () => void;
   setGaugeCollapse: (groupId: string, state: TrackState) => void;
   setManyGaugeCollapse: (updates: Record<string, TrackState>) => void;
 
   setSpanColorMode: (mode: SpanColorMode) => void;
+  setSpanPalette: (p: SpanPalette) => void;
   toggleDynamicTrackHeight: () => void;
   toggleShowOffCpu: () => void;
 
@@ -103,18 +127,6 @@ interface ProfilerViewState {
   clearEngineOpVisibility: () => void;
 }
 
-// Safe localStorage wrapper — falls back silently in non-browser environments (tests, SSR).
-const safeStorage = createJSONStorage(() => ({
-  getItem: (name: string) => {
-    try { return localStorage.getItem(name); } catch { return null; }
-  },
-  setItem: (name: string, value: string) => {
-    try { localStorage.setItem(name, value); } catch { /* noop */ }
-  },
-  removeItem: (name: string) => {
-    try { localStorage.removeItem(name); } catch { /* noop */ }
-  },
-}));
 
 // Initial state = the "no selection" sentinel. The rest of the system treats `endUs <= startUs`
 // as "nothing selected" (TickOverview hides the overlay, SystemDag/CriticalPath skip aggregations,
@@ -143,12 +155,15 @@ export const useProfilerViewStore = create<ProfilerViewState>()(
     (set, get) => ({
       viewRange: INITIAL_VIEW_RANGE,
       transientViewRange: INITIAL_VIEW_RANGE,
+      scopeLinked: true,
+      pinnedRange: null,
       gaugeRegionVisible: true,
       perSystemLanesVisible: true,
       gaugeCollapse: {},
       gaugeVisibility: {},
       engineOpVisibility: {},
       spanColorMode: 'name',
+      spanPalette: 'categorical',
       dynamicTrackHeight: true,
       showOffCpu: true,
 
@@ -179,6 +194,10 @@ export const useProfilerViewStore = create<ProfilerViewState>()(
         }
         set({ transientViewRange: r, viewRange: r });
       },
+      setScopeLinked: (linked) =>
+        set((s) => (linked
+          ? { scopeLinked: true, pinnedRange: null }
+          : { scopeLinked: false, pinnedRange: s.viewRange })),
       toggleGaugeRegion: () => set((s) => ({ gaugeRegionVisible: !s.gaugeRegionVisible })),
       togglePerSystemLanes: () => set((s) => ({ perSystemLanesVisible: !s.perSystemLanesVisible })),
       setGaugeCollapse: (groupId, state) =>
@@ -193,6 +212,7 @@ export const useProfilerViewStore = create<ProfilerViewState>()(
         }),
 
       setSpanColorMode: (mode) => set({ spanColorMode: mode }),
+      setSpanPalette: (p) => set({ spanPalette: p }),
       toggleDynamicTrackHeight: () => set((s) => ({ dynamicTrackHeight: !s.dynamicTrackHeight })),
       toggleShowOffCpu: () => set((s) => ({ showOffCpu: !s.showOffCpu })),
 
@@ -242,7 +262,7 @@ export const useProfilerViewStore = create<ProfilerViewState>()(
     {
       name: 'workbench-profiler-view',
       storage: safeStorage,
-      version: 4,
+      version: 5,
       // Only persist UX preferences; viewRange / transientViewRange are session-scoped and reset
       // on each open (never appear in `partialize`).
       partialize: (s) => ({
@@ -252,6 +272,7 @@ export const useProfilerViewStore = create<ProfilerViewState>()(
         gaugeVisibility: s.gaugeVisibility,
         engineOpVisibility: s.engineOpVisibility,
         spanColorMode: s.spanColorMode,
+        spanPalette: s.spanPalette,
         dynamicTrackHeight: s.dynamicTrackHeight,
         showOffCpu: s.showOffCpu,
       }),
@@ -263,6 +284,7 @@ export const useProfilerViewStore = create<ProfilerViewState>()(
       // v3 → v4 (#345 Step 8): dropped `liveFollowWindowUs` — live-follow mode is gone. The spread
       //   initialiser would already filter the field out of runtime state, but we delete it from
       //   the persisted blob explicitly so localStorage doesn't carry an orphan key forever.
+      // v4 → v5 (#376 Phase 5): added `spanPalette` (default 'categorical'). Missing field defaults to categorical.
       migrate: (persisted: unknown, fromVersion: number): Partial<ProfilerViewState> | undefined => {
         if (!persisted || typeof persisted !== 'object') return undefined;
         const p = persisted as Partial<ProfilerViewState> & {
@@ -291,8 +313,20 @@ export const useProfilerViewStore = create<ProfilerViewState>()(
         if (fromVersion < 4) {
           delete p.liveFollowWindowUs;
         }
+        if (fromVersion < 5) {
+          p.spanPalette = p.spanPalette ?? 'categorical';
+        }
         return p;
       },
     },
   ),
 );
+
+/**
+ * The time window the scheduling-cluster panels (System DAG / Critical Path / Data Flow) should bind to: the live
+ * {@link ProfilerViewState.viewRange} while linked, or the frozen {@link ProfilerViewState.pinnedRange} while
+ * unlinked (GAP-11). Returns an existing object reference (never a fresh allocation), so it is safe to pass
+ * directly as a zustand selector under the default `Object.is` equality — no extra `useShallow` needed.
+ */
+export const selectEffectiveScope = (s: ProfilerViewState): TimeRange =>
+  s.scopeLinked ? s.viewRange : (s.pinnedRange ?? s.viewRange);

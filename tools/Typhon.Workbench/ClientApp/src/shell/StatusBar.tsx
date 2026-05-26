@@ -1,5 +1,6 @@
 import { useHeartbeat } from '@/hooks/streams/useHeartbeat';
 import { useSessionStore } from '@/stores/useSessionStore';
+import { useKeyChordStore } from '@/stores/useKeyChordStore';
 import { useResourceIndex } from '@/hooks/useResourceIndex';
 import { activateResource } from './commands/activateResource';
 
@@ -20,6 +21,7 @@ export default function StatusBar() {
  const filePath = useSessionStore((s) => s.filePath);
  const { status, payload } = useHeartbeat();
  const { index } = useResourceIndex();
+ const chordArmed = useKeyChordStore((s) => s.armed);
  const connected = kind !== 'none';
  const dotColor = connected && status === 'green' ? 'bg-green-500' : 'bg-muted-foreground';
 
@@ -45,7 +47,7 @@ export default function StatusBar() {
  return (
  <footer
  className="flex h-[22px] shrink-0 items-center gap-3 border-t border-border
- bg-card px-3 text-[14px] text-muted-foreground"
+ bg-card px-3 text-fs-xl text-muted-foreground"
  >
  <span className={`h-2 w-2 rounded-full ${dotColor}`} aria-hidden="true" />
  <span>{fileLabel}</span>
@@ -75,6 +77,13 @@ export default function StatusBar() {
  tx {payload.activeTransactionCount ?? '—'}
  </span>
  </>
+ )}
+ {/* Focus-chord hint (AC2.3): shown the instant `g` arms the chord, hidden when the second key lands or the
+ window elapses (driven by useKeyChordStore ← createChordHandler.onArmedChange). */}
+ {chordArmed && (
+ <span className="text-foreground" data-testid="chord-hint">
+ waiting for a second key chord… <span className="text-muted-foreground">(c / a / s / d / m)</span>
+ </span>
  )}
  </footer>
  );

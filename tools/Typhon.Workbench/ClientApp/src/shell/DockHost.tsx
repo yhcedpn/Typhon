@@ -1,38 +1,25 @@
-import { useEffect, useRef } from 'react';
+import { lazy, Suspense, useEffect, useRef } from 'react';
 import { useThemeStore } from '@/stores/useThemeStore';
 import { useLogStore, selectUnseenLevel, selectUnseenCount, type LogLevel } from '@/stores/useLogStore';
 import { DockviewDefaultTab, DockviewReact, themeDark, themeLight, type DockviewApi, type DockviewReadyEvent, type IDockviewDefaultTabProps, type IDockviewPanelHeaderProps, type IDockviewPanelProps } from 'dockview-react';
 import { useDockLayoutStore } from '@/stores/useDockLayoutStore';
 import { useSessionStore } from '@/stores/useSessionStore';
+// Eagerly imported: the shell + default-layout panels that are always mounted at session open (so lazy-loading
+// them would only add a Suspense flash, not save the cold bundle anything). Everything else is lazy (below).
 import DetailPanel from '@/panels/DetailPanel';
 import LogsPanel from '@/panels/LogsPanel';
 import ResourceTreePanel from '@/panels/ResourceTreePanel';
-import PlaceholderStartHere from '@/panels/PlaceholderStartHere';
-import SchemaBrowserPanel from '@/panels/SchemaBrowser/SchemaBrowserPanel';
-import ArchetypeBrowserPanel from '@/panels/SchemaBrowser/ArchetypeBrowserPanel';
-import SchemaLayoutPanel from '@/panels/SchemaInspector/SchemaLayoutPanel';
-import SchemaArchetypePanel from '@/panels/SchemaInspector/SchemaArchetypePanel';
-import SchemaIndexPanel from '@/panels/SchemaInspector/SchemaIndexPanel';
-import SchemaRelationshipsPanel from '@/panels/SchemaInspector/SchemaRelationshipsPanel';
-import SystemDagPanel from '@/panels/SystemDag/SystemDagPanel';
-import DataFlowPanel from '@/panels/DataFlow/DataFlowPanel';
-import AccessMatrixPanel from '@/panels/AccessMatrix/AccessMatrixPanel';
-import CriticalPathPanel from '@/panels/CriticalPath/CriticalPathPanel';
+import SchemaExplorerPanel from '@/panels/SchemaExplorer/SchemaExplorerPanel';
 import ProfilerPanel from '@/panels/profiler/ProfilerPanel';
 import TopSpansPanel from '@/panels/profiler/TopSpansPanel';
-import CallTreePanel from '@/panels/profiler/CallTree';
-import OptionsPanel from '@/panels/options/OptionsPanel';
-import SourcePreviewPanel from '@/panels/profiler/SourcePreviewPanel';
-import QueryCatalogPanel from '@/panels/QueryCatalog/QueryCatalogPanel';
-import QueryPlanTreePanel from '@/panels/QueryPlanTree/QueryPlanTreePanel';
-import ExecutionInspectorPanel from '@/panels/ExecutionInspector/ExecutionInspectorPanel';
-import PaletteDebugPanel from '@/panels/PaletteDebug';
-import DbMapPanel from '@/panels/DbMap/DbMapPanel';
-import EntityListPanel from '@/panels/DataBrowser/EntityListPanel';
-import { registerDockApi, registerResetLayout } from './commands/openSchemaBrowser';
+import EngineLiveHealthPanel from '@/panels/EngineLiveHealth/EngineLiveHealthPanel';
+import SystemsQueriesNavigatorPanel from '@/panels/SystemsQueriesNavigator/SystemsQueriesNavigatorPanel';
+import { registerDockApi, registerResetLayout, focusPanelBody } from './commands/openSchemaBrowser';
 import { registerProfilerDockApi } from './commands/profilerCommands';
+import { isViewActive } from './viewRegistry';
 import MigrationRequiredBanner from './banners/MigrationRequiredBanner';
 import IncompatibleBanner from './banners/IncompatibleBanner';
+import ReconnectBanner from './banners/ReconnectBanner';
 
 // Tab component without a close button — applied to structural panels that should not be closable.
 const PlainLockedTab: React.FC<IDockviewPanelHeaderProps> = (props) => (
@@ -83,7 +70,7 @@ const LogsTab: React.FC<IDockviewPanelHeaderProps> = (props) => {
         <span
           className={
             'pointer-events-none flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full ' +
-            `px-1 text-[10px] font-medium tabular-nums ${LOG_BADGE_CLASS[unseenLevel ?? 'info']}`
+            `px-1 text-fs-xs font-medium tabular-nums ${LOG_BADGE_CLASS[unseenLevel ?? 'info']}`
           }
           title={`${unseenCount} new log entr${unseenCount === 1 ? 'y' : 'ies'} since last viewed`}
         >
@@ -109,40 +96,88 @@ const EDGE_LEFT_ID = 'edge-left';
 const EDGE_RIGHT_ID = 'edge-right';
 const EDGE_BOTTOM_ID = 'edge-bottom';
 
+// A panel body shown while a lazily-loaded panel's chunk is in flight (usually a few ms on first open).
+const PanelLoading: React.FC = () => (
+  <div className="flex h-full w-full items-center justify-center text-fs-sm text-muted-foreground">Loading…</div>
+);
+
+// Wraps a dynamically-imported panel in a Suspense boundary so dockview can mount it directly. Heavy / on-demand
+// panels are code-split this way — most importantly the React-Flow + dagre graph panels (System DAG, Data Flow,
+// Query Analyzer) — so those libraries stay out of the cold bundle until a view that needs them is first opened.
+function lazyPanel(loader: () => Promise<{ default: React.ComponentType<IDockviewPanelProps> }>): React.FC<IDockviewPanelProps> {
+  const Lazy = lazy(loader);
+  const Wrapped: React.FC<IDockviewPanelProps> = (props) => (
+    <Suspense fallback={<PanelLoading />}>
+      <Lazy {...props} />
+    </Suspense>
+  );
+  Wrapped.displayName = 'LazyPanel';
+  return Wrapped;
+}
+
+// The full component registry. Shell + default-layout panels are imported eagerly (above); every on-demand panel is
+// lazy so its chunk — and any heavy library it pulls — is fetched only when its view is first opened. Every id stays
+// listed here so deactivated views remain compilable (Stage 0 gates, never deletes); `activeComponents` below is what
+// dockview actually mounts — gated zone-D ids are filtered out so a stale saved layout referencing one fails fromJSON
+// cleanly and hits the rebuildDefault() recovery (see shell-and-dockview.md §5).
 const components: Record<string, React.FC<IDockviewPanelProps>> = {
   ResourceTree: ResourceTreePanel,
-  StartHere: PlaceholderStartHere,
   Detail: DetailPanel,
   Logs: LogsPanel,
-  SchemaBrowser: SchemaBrowserPanel,
-  ArchetypeBrowser: ArchetypeBrowserPanel,
-  SchemaLayout: SchemaLayoutPanel,
-  SchemaArchetypes: SchemaArchetypePanel,
-  SchemaIndexes: SchemaIndexPanel,
-  SchemaRelationships: SchemaRelationshipsPanel,
-  SystemDag: SystemDagPanel,
-  DataFlow: DataFlowPanel,
-  AccessMatrix: AccessMatrixPanel,
-  CriticalPath: CriticalPathPanel,
+  SchemaExplorer: SchemaExplorerPanel,
   Profiler: ProfilerPanel,
   TopSpans: TopSpansPanel,
-  CallTree: CallTreePanel,
-  Options: OptionsPanel,
-  SourcePreview: SourcePreviewPanel,
-  QueryCatalog: QueryCatalogPanel,
-  QueryPlanTree: QueryPlanTreePanel,
-  ExecutionInspector: ExecutionInspectorPanel,
-  PaletteDebug: PaletteDebugPanel,
-  DbMap: DbMapPanel,
-  DataBrowserEntities: EntityListPanel,
+  // Stage 4 Phase 1 — the Engine Live Health panel is the attach default surface (per its design); eager
+  // (not lazy) so it mounts immediately on attach without a Suspense flash.
+  EngineLiveHealth: EngineLiveHealthPanel,
+  // Shell navigator (zone C, Trace/Attach) — not a zone-D deep view, so it is never gated.
+  SystemsQueriesNavigator: SystemsQueriesNavigatorPanel,
+  // Lazy (on-demand) — code-split out of the cold bundle.
+  ArchetypeInspector: lazyPanel(() => import('@/panels/ArchetypeInspector/ArchetypeInspectorPanel')),
+  ComponentInspector: lazyPanel(() => import('@/panels/ComponentInspector/ComponentInspectorPanel')),
+  SystemDag: lazyPanel(() => import('@/panels/SystemDag/SystemDagPanel')),
+  DataFlow: lazyPanel(() => import('@/panels/DataFlow/DataFlowPanel')),
+  CriticalPath: lazyPanel(() => import('@/panels/CriticalPath/CriticalPathPanel')),
+  CallTree: lazyPanel(() => import('@/panels/profiler/CallTree')),
+  Options: lazyPanel(() => import('@/panels/options/OptionsPanel')),
+  SourcePreview: lazyPanel(() => import('@/panels/profiler/SourcePreviewPanel')),
+  QueryAnalyzer: lazyPanel(() => import('@/panels/QueryAnalyzer/QueryAnalyzerPanel')),
+  PaletteDebug: lazyPanel(() => import('@/panels/PaletteDebug')),
+  DbMap: lazyPanel(() => import('@/panels/DbMap/DbMapPanel')),
+  StorageHealth: lazyPanel(() => import('@/panels/StorageHealth/StorageHealthPanel')),
+  DataBrowserEntities: lazyPanel(() => import('@/panels/DataBrowser/EntityListPanel')),
 };
 
+// Only the active (shell + ungated) components are handed to dockview. Gated zone-D ids drop out here.
+const activeComponents: Record<string, React.FC<IDockviewPanelProps>> = Object.fromEntries(
+  Object.entries(components).filter(([id]) => isViewActive(id)),
+);
+
+// Stage 0 default layouts are the shell frame only: edge groups (navigator / inspector / drawer) around a
+// neutral, empty center. Every center/zone-D panel is added only when its view is active (`isViewActive`),
+// so the deep panels stay out today and re-appear automatically as Stages 2-4 flip them back on.
 function buildDefaultLayout(api: DockviewReadyEvent['api'], kind: 'none' | 'open' | 'attach' | 'trace') {
   if (kind === 'trace' || kind === 'attach') {
+    // The Profiler timeline is the center workspace — add it FIRST (no position) so it establishes the main
+    // grid; the edge groups then wrap around it. A no-position addPanel joins the *active* group, so adding it
+    // AFTER an edge panel docks it into that edge instead — the bug that put the timeline in the left edge once
+    // Stage 3 Phase 1 un-gated the view. This mirrors the open-mode Schema Explorer ordering below.
+    if (isViewActive('Profiler')) {
+      api.addPanel({ id: 'profiler', component: 'Profiler', title: 'Profiler', tabComponent: 'locked' });
+    }
+
+    api.addEdgeGroup('left', { id: EDGE_LEFT_ID, initialSize: 260, minimumSize: 150 });
     api.addEdgeGroup('right', { id: EDGE_RIGHT_ID, initialSize: 320, minimumSize: 200 });
     api.addEdgeGroup('bottom', { id: EDGE_BOTTOM_ID, initialSize: 200, minimumSize: 100 });
 
-    api.addPanel({ id: 'profiler', component: 'Profiler', title: 'Profiler', tabComponent: 'locked' });
+    // Zone C navigator for a profiler session — the trace/attach analogue of the open-mode Resource Tree.
+    api.addPanel({
+      id: 'systems-queries-nav',
+      component: 'SystemsQueriesNavigator',
+      title: 'Systems & Queries',
+      tabComponent: 'locked',
+      position: { referenceGroup: EDGE_LEFT_ID },
+    });
 
     api.addPanel({
       id: 'detail',
@@ -160,49 +195,49 @@ function buildDefaultLayout(api: DockviewReadyEvent['api'], kind: 'none' | 'open
       position: { referenceGroup: EDGE_BOTTOM_ID },
     });
 
-    api.addPanel({
-      id: 'top-spans',
-      component: 'TopSpans',
-      title: 'Top spans',
-      tabComponent: 'locked',
-      position: { referenceGroup: EDGE_BOTTOM_ID },
-    });
-
-    // Trace-mode schema panels (v7+ static-data tables in the trace file feed these). Stacked behind the Detail
-    // panel in the right edge group so they're discoverable without dominating the layout. Attach mode keeps them
-    // available because the wire layout exists today (empty placeholders) — when the engine starts pushing schema
-    // over the live socket the same panels light up automatically. Each panel handles the "no schema data" empty
-    // state on its own, so showing them costs nothing when the data isn't there.
-    if (kind === 'trace') {
+    if (isViewActive('TopSpans')) {
       api.addPanel({
-        id: 'schema-browser',
-        component: 'SchemaBrowser',
-        title: 'Components',
-        position: { referenceGroup: EDGE_RIGHT_ID },
+        id: 'top-spans',
+        component: 'TopSpans',
+        title: 'Top spans',
+        tabComponent: 'locked',
+        position: { referenceGroup: EDGE_BOTTOM_ID },
       });
-      api.addPanel({
-        id: 'archetype-browser',
-        component: 'ArchetypeBrowser',
-        title: 'Archetypes',
-        position: { referenceGroup: EDGE_RIGHT_ID },
-      });
-      // Workbench Data Flow module (#327): both panels are reachable via View → Data Flow / Access Matrix and the
-      // command palette (Toggle View Data Flow / Toggle View Access Matrix). They stay out of the trace-mode default
-      // layout because piling them into the right edge group with Detail+Components+Archetypes collapses every panel
-      // there into a thin vertical-label tab strip — bars and matrix cells render at sub-pixel widths, invisible. The
-      // toggle commands open them in the center group at a usable width when the user actually wants them.
     }
+
+    // Engine Live Health — attach default surface (#377 Stage 4 Phase 1). Mounted as a tab in the right edge
+    // group alongside Detail; the panel itself shows a cold message in trace sessions, but the design only
+    // promotes it onto the default layout for attach (where the live SSE stream is meaningful).
+    if (kind === 'attach' && isViewActive('EngineLiveHealth')) {
+      api.addPanel({
+        id: 'engine-live-health',
+        component: 'EngineLiveHealth',
+        title: 'Engine Health',
+        tabComponent: 'locked',
+        position: { referenceGroup: EDGE_RIGHT_ID },
+      });
+    }
+
+    // (Trace-mode schema browsing returns via the Schema Explorer when it is wired for trace sessions — the
+    // old SchemaBrowser/ArchetypeBrowser panels were removed in the GAP-02 consolidation, Stage 2.)
     return;
   }
 
-  // Open / none layout.
+  // Open / none layout — navigator + inspector + drawer around the Schema Explorer workspace.
+  // The Schema Explorer is the Open-session default center (J1 lands here) — always-on shell-structural,
+  // like the navigators (not a gateable zone-D deep view), so Open never dead-ends on an empty center.
+  // It is added FIRST (no position) so it establishes the main grid; the edge groups then wrap around it.
+  // (A no-position addPanel joins the active group, so adding it after an edge panel would dock it there.)
+  api.addPanel({
+    id: 'schema-explorer',
+    component: 'SchemaExplorer',
+    title: 'Schema',
+    tabComponent: 'locked',
+  });
+
   api.addEdgeGroup('left', { id: EDGE_LEFT_ID, initialSize: 260, minimumSize: 150 });
   api.addEdgeGroup('right', { id: EDGE_RIGHT_ID, initialSize: 320, minimumSize: 200 });
   api.addEdgeGroup('bottom', { id: EDGE_BOTTOM_ID, initialSize: 200, minimumSize: 100 });
-
-  // Add start-here before any edge-group panel so it creates the center group while no
-  // edge group is active — otherwise dockview inherits the most-recently-touched group.
-  api.addPanel({ id: 'start-here', component: 'StartHere', title: 'Start Here' });
 
   api.addPanel({
     id: 'resource-tree',
@@ -243,6 +278,12 @@ export default function DockHost() {
     apiRef.current = event.api;
     registerDockApi(event.api);
     registerProfilerDockApi(event.api);
+
+    // Focus-follows-navigation (PC-8): when the active panel changes (F6, a bus handoff, a click),
+    // move DOM focus into its body so a keyboard user lands where they navigated — never orphaned on
+    // <body>. `panel.focus()` alone only activates the group/tab; focusPanelBody also moves DOM focus
+    // into the content container (shell-and-dockview §2), which is what makes the focus visible.
+    event.api.onDidActivePanelChange((panel) => { if (panel) focusPanelBody(panel); });
     // Tear down every panel/group and rebuild this session kind's built-in default. The recovery path for both the
     // reset-layout command and a failed restore. api.clear() empties the edge groups but keeps the now-empty group shells,
     // and buildDefaultLayout's addEdgeGroup() throws on a position that still exists — so a partially-applied fromJSON (e.g.
@@ -279,8 +320,9 @@ export default function DockHost() {
       }
     }
 
-    // Trace-session safety net: profiler lives in the center area and must always be present.
-    if (kind === 'trace' && !event.api.getPanel('profiler')) {
+    // Trace-session safety net: profiler lives in the center area and must always be present — but only while
+    // the Profiler view is active (gated off in Stage 0, restored in Stage 3).
+    if (kind === 'trace' && isViewActive('Profiler') && !event.api.getPanel('profiler')) {
       event.api.addPanel({ id: 'profiler', component: 'Profiler', title: 'Profiler', tabComponent: 'locked' });
     }
 
@@ -289,7 +331,8 @@ export default function DockHost() {
     // nothing to surface. Re-create whatever is missing; the edge group is added only when a panel
     // actually needs it, so a layout that kept the panels elsewhere isn't given a spurious empty group.
     const needLogs = !event.api.getPanel('logs');
-    const needTopSpans = (kind === 'trace' || kind === 'attach') && !event.api.getPanel('top-spans');
+    const needTopSpans =
+      (kind === 'trace' || kind === 'attach') && isViewActive('TopSpans') && !event.api.getPanel('top-spans');
     if ((needLogs || needTopSpans) && !event.api.getEdgeGroup('bottom')) {
       event.api.addEdgeGroup('bottom', { id: EDGE_BOTTOM_ID, initialSize: 200, minimumSize: 100 });
     }
@@ -328,11 +371,14 @@ export default function DockHost() {
     <div className="flex h-full flex-col">
       {showMigration && <MigrationRequiredBanner />}
       {showIncompatible && <IncompatibleBanner />}
+      {/* Stage 4 P4 (#377) — reconnect / shutdown banner; self-gates on sessionKind === 'attach' &&
+          connectionStatus === 'disconnected', so the conditional here is just "let it decide." */}
+      <ReconnectBanner />
       <div className="relative min-h-0 flex-1">
         <DockviewReact
           theme={theme === 'dark' ? themeDark : themeLight}
           className="h-full w-full"
-          components={components}
+          components={activeComponents}
           tabComponents={tabComponents}
           onReady={onReady}
           // Floating groups can be dragged off-screen or behind the window and become unreachable,

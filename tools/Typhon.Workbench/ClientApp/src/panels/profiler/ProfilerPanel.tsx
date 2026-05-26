@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import type { IDockviewPanelProps } from 'dockview-react';
 import { Activity, AlertCircle, Loader2, Radio, RefreshCw, Unplug } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { usePanelHotkeys } from '@/hooks/usePanelHotkeys';
 import { usePostApiSessionsTrace } from '@/api/generated/sessions/sessions';
 import { logError, logInfo } from '@/stores/useLogStore';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useNavHistoryStore } from '@/stores/useNavHistoryStore';
-import { useProfilerSelectionStore } from '@/stores/useProfilerSelectionStore';
+import { useSelectionStore } from '@/stores/useSelectionStore';
 import { useProfilerSessionStore, type ConnectionStatus } from '@/stores/useProfilerSessionStore';
 import { useProfilerViewStore } from '@/stores/useProfilerViewStore';
+import { useUiPrefsStore } from '@/stores/useUiPrefsStore';
 import { useProfilerMetadata } from '@/hooks/profiler/useProfilerMetadata';
 import { useProfilerBuildProgress } from '@/hooks/profiler/useProfilerBuildProgress';
 import { useProfilerLiveStream } from '@/hooks/profiler/useProfilerLiveStream';
@@ -18,6 +21,7 @@ import { useProfilerTraceStatus } from '@/hooks/profiler/useProfilerTraceStatus'
 import { useProfilerStatsStore } from '@/stores/useProfilerStatsStore';
 import { useRecentFilesStore } from '@/stores/useRecentFilesStore';
 import { resolveInitialViewport } from '@/libs/profiler/initialViewport';
+import { formatBytes } from '@/libs/formatBytes';
 import { buildTickRows, computeSelectionIdxRange } from '@/libs/profiler/canvas/tickOverview';
 import TickOverview from './sections/TickOverview';
 import TimeArea from './sections/TimeArea';
@@ -31,11 +35,19 @@ import OverloadStrip from './sections/OverloadStrip';
  * Phase 1b proves the live-data pipeline end-to-end (TCP connect → Init frame → metadata DTO → tick SSE);
  * Phase 2 lifts the Canvas 2D renderers on top.
  */
-export default function ProfilerPanel() {
+export default function ProfilerPanel(props: IDockviewPanelProps) {
   const sessionId = useSessionStore((s) => s.sessionId);
   const token = useSessionStore((s) => s.token);
   const filePath = useSessionStore((s) => s.filePath);
   const kind = useSessionStore((s) => s.kind);
+
+  // Panel-scoped `g` (gauge region) / `l` (legends) toggles — formerly global single-key shortcuts, re-homed
+  // here so they only fire while a profiler view is focused (PC-8). Capture-phase, so `g` here takes
+  // precedence over the global `g` focus-chord leader while the profiler is active.
+  usePanelHotkeys(props.api, {
+    g: () => useProfilerViewStore.getState().toggleGaugeRegion(),
+    l: () => useUiPrefsStore.getState().toggleLegends(),
+  });
 
   const metadata = useProfilerSessionStore((s) => s.metadata);
   const buildProgress = useProfilerSessionStore((s) => s.buildProgress);
@@ -173,10 +185,13 @@ export default function ProfilerPanel() {
     setIsLive(isAttach);
     return () => {
       useProfilerSessionStore.getState().reset();
-      useProfilerSelectionStore.getState().clear();
+      useSelectionStore.getState().clearLeaf(); // 3E: clear the profiler selection on the unified bus (silo retired)
       useProfilerStatsStore.getState().clear();
       useNavHistoryStore.getState().clear();
       useProfilerViewStore.getState().commitViewRange({ startUs: 0, endUs: 0 });
+      // Scope-link is session-scoped (stage-3 Phase 3): a prior trace's frozen window is meaningless on the
+      // next one, so each new session starts linked (panels follow the timeline again).
+      useProfilerViewStore.getState().setScopeLinked(true);
     };
   }, [sessionId, isAttach, setIsLive]);
 
@@ -214,7 +229,7 @@ export default function ProfilerPanel() {
   return (
     <div className="flex h-full w-full flex-col overflow-hidden bg-background">
       {/* Header */}
-      <div className="flex flex-shrink-0 items-center gap-3 border-b border-border bg-card px-3 py-2 text-[12px]">
+      <div className="wb-pane-header flex flex-shrink-0 items-center gap-3 border-b border-border bg-card px-3 py-2 text-fs-base">
         {isAttach
           ? <Radio className="h-4 w-4 text-muted-foreground" aria-label="Live profiler session" />
           : <Activity className="h-4 w-4 text-muted-foreground" aria-label="Trace profiler session" />}
@@ -231,7 +246,7 @@ export default function ProfilerPanel() {
                 size="sm"
                 onClick={handleDisconnect}
                 disabled={disconnecting}
-                className="h-6 px-2 text-[11px]"
+                className="h-6 px-2 text-fs-sm"
                 aria-label="Disconnect from the engine"
                 title="Drop the TCP link to the engine. Captured ticks remain visible for inspection; close the tab to discard them."
               >
@@ -286,7 +301,7 @@ export default function ProfilerPanel() {
                 size="sm"
                 onClick={handleReloadTrace}
                 disabled={postTrace.isPending}
-                className="ml-auto h-6 border-amber-500/50 px-2 text-[11px] text-amber-600 hover:bg-amber-500/10 dark:text-amber-400"
+                className="ml-auto h-6 border-amber-500/50 px-2 text-fs-sm text-amber-600 hover:bg-amber-500/10 dark:text-amber-400"
                 aria-label="Reload trace with the newer on-disk version"
                 title="The source .typhon-trace file was overwritten on disk (a profiling re-run regenerated it). Reload to rebuild the cache from the new version — the current view resets."
               >
@@ -338,7 +353,7 @@ function StatusPill({ status }: { status: ConnectionStatus | null }) {
           ? 'Connecting…'
           : 'Engine offline';
   return (
-    <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted px-2 py-0.5 text-[10px] font-medium text-foreground">
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted px-2 py-0.5 text-fs-xs font-medium text-foreground">
       <span className={`h-2 w-2 rounded-full ${dotClass}`} />
       {label}
     </span>
@@ -350,8 +365,8 @@ function LiveWaitingOverlay({ status }: { status: ConnectionStatus | null }) {
     <div className="flex h-full w-full items-center justify-center">
       <div className="w-full max-w-md px-8 text-center">
         <Loader2 className="mx-auto mb-3 h-5 w-5 animate-spin text-muted-foreground" aria-hidden="true" />
-        <div className="text-[13px] font-semibold text-foreground">Waiting for the engine's Init frame…</div>
-        <div className="mt-1 text-[11px] text-muted-foreground">
+        <div className="text-fs-lg font-semibold text-foreground">Waiting for the engine's Init frame…</div>
+        <div className="mt-1 text-fs-sm text-muted-foreground">
           {status === 'connected'
             ? 'TCP link is up; engine hasn\u2019t published its metadata yet.'
             : status === 'reconnecting'
@@ -376,7 +391,7 @@ function BuildProgressOverlay({
   return (
     <div className="flex h-full w-full items-center justify-center">
       <div className="w-full max-w-md px-8">
-        <div className="mb-4 flex items-center gap-2 text-[13px] font-semibold text-foreground">
+        <div className="mb-4 flex items-center gap-2 text-fs-lg font-semibold text-foreground">
           <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
           Building trace cache…
         </div>
@@ -386,7 +401,7 @@ function BuildProgressOverlay({
             style={{ width: `${pct}%` }}
           />
         </div>
-        <dl className="grid grid-cols-[auto,1fr] gap-x-3 gap-y-1 text-[11px]">
+        <dl className="grid grid-cols-[auto,1fr] gap-x-3 gap-y-1 text-fs-sm">
           <dt className="text-muted-foreground">Progress</dt>
           <dd className="font-mono tabular-nums text-foreground">{pct.toFixed(1)}%</dd>
           <dt className="text-muted-foreground">Bytes</dt>
@@ -412,10 +427,10 @@ function ErrorState({ message }: { message: string }) {
     <div className="flex h-full w-full items-center justify-center">
       <div className="max-w-md px-8 text-center">
         <AlertCircle className="mx-auto mb-3 h-6 w-6 text-destructive" aria-hidden="true" />
-        <div className="mb-1 text-[13px] font-semibold text-foreground">
+        <div className="mb-1 text-fs-lg font-semibold text-foreground">
           Trace cache build failed
         </div>
-        <div className="font-mono text-[11px] text-muted-foreground">{message}</div>
+        <div className="font-mono text-fs-sm text-muted-foreground">{message}</div>
       </div>
     </div>
   );
@@ -426,11 +441,4 @@ function formatDurationUs(us: number): string {
   if (us < 1_000_000) return `${(us / 1000).toFixed(1)} ms`;
   if (us < 60_000_000) return `${(us / 1_000_000).toFixed(2)} s`;
   return `${(us / 60_000_000).toFixed(1)} min`;
-}
-
-function formatBytes(b: number): string {
-  if (b < 1024) return `${b} B`;
-  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
-  if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(2)} MB`;
-  return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
