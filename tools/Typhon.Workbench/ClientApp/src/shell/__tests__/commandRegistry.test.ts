@@ -44,6 +44,12 @@ const SHELL_COMMAND_IDS = [
   'open-file',
   'close-session',
   'refresh-graph',
+  // Schema Explorer + Systems & Queries Navigator are session-kind defaults (open-mode and trace/attach-mode
+  // respectively), but at the registry level they are shell-structural (not in ZONE_D_VIEW_ACTIVE) — so their
+  // toggle commands always surface. Session-kind gating is enforced by the menu's `disabled` attribute and
+  // by the toggle functions' guards, not by the palette filter.
+  'toggle-view-schema-explorer',
+  'toggle-view-systems-queries-nav',
   'toggle-view-resource-tree',
   'toggle-view-detail',
   'toggle-view-logs',

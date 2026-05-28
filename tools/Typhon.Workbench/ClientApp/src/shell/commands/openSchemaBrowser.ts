@@ -330,6 +330,50 @@ export function toggleViewStorageHealth(): void {
 }
 
 /**
+ * Toggle the Schema Explorer — the open-session default workspace panel (the center tab DockHost auto-builds
+ * when a `.typhon` file is opened). Without this entry, closing the tab leaves no recovery path other than
+ * "Reset Layout to Default", which discards every other panel arrangement the user has made. Simple center-group
+ * toggle: {@link toggleDockPanel} drops the new instance next to whichever workspace anchor exists (profiler /
+ * start-here fallback chain) since by definition `schema-explorer` itself is absent when we're re-adding it.
+ */
+export function toggleViewSchemaExplorer(): void {
+  toggleDockPanel('schema-explorer', 'SchemaExplorer', 'Schema');
+}
+
+/**
+ * Toggle the Systems & Queries Navigator — the trace/attach-mode default left-edge navigator (the counterpart
+ * of Resource Tree for profiler sessions). Mirrors {@link toggleViewResourceTree}: when the panel lives in its
+ * usual left edge group, the toggle collapses/expands that group + focuses the panel; when it has been entirely
+ * removed (dockview close button), the toggle re-adds it. This keeps the "active-tab+visible" → "hidden" path
+ * symmetric across both modes while still covering the full-removal recovery case.
+ */
+export function toggleViewSystemsQueriesNav(): void {
+  const api = registeredApi;
+  if (!api) return;
+  const panel = api.getPanel('systems-queries-nav');
+  if (panel) {
+    const eg = api.getEdgeGroup('left');
+    // Panel lives in its usual left edge group and is the visible tab — second invocation hides the group.
+    if (eg && !eg.isCollapsed() && panel.api.isActive) {
+      eg.collapse();
+      return;
+    }
+    if (eg?.isCollapsed()) {
+      eg.expand();
+    }
+    panel.focus();
+    return;
+  }
+  // Panel was entirely removed (close button) — re-add. Without a left edge group present we let dockview
+  // pick the landing position; a subsequent "Reset Layout to Default" restores the canonical placement.
+  api.addPanel({
+    id: 'systems-queries-nav',
+    component: 'SystemsQueriesNavigator',
+    title: 'Systems & Queries',
+  });
+}
+
+/**
  * Dev Fixture: open / close the standalone fixture-creation surface. Dual-mode:
  * <list type="bullet">
  *   <item><b>With dockview registered</b> (session open) — toggle the docked panel; its body shows the

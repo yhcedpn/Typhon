@@ -437,7 +437,13 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
                             InitHeader(endPage.Address, PageClearMode.Header, PageBlockFlags.IsLogicalSegment, type, 1);
                             changeSet?.AddByMemPageIndex(endMemIdx);
                             endPage.RawData<int>(0, 1)[0] = 0;
-                            _store.EnsureDirtyAtLeast(endMemIdx, 1);  // durability: see comments below in main map-page block
+                            // Durability: AddByMemPageIndex already bumps DC to 1 via tracked IncrementDirty. Without a
+                            // ChangeSet, fall back to untracked EnsureDirtyAtLeast(1) — same DC outcome, just untracked.
+                            if (changeSet == null)
+                            {
+                                _store.EnsureDirtyAtLeast(endMemIdx, 1);
+                            }
+
                             _store.UnlatchPageExclusive(endMemIdx);
                         }
                     }
@@ -460,11 +466,21 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
 
                 if (isPageDirty)
                 {
-                    changeSet?.AddByMemPageIndex(memPageIdx);
-                    // Durability: directory map-page write (root or extension) must survive a checkpoint regardless of whether the caller provided a
-                    // ChangeSet. Same rationale as the data-page-init loop above. Without this the directory entries get evicted as clean and the next Load
-                    // sees a truncated page list.
-                    _store.EnsureDirtyAtLeast(memPageIdx, 2);
+                    // Durability: directory map-page write (root or extension) must survive a checkpoint regardless of
+                    // whether the caller provided a ChangeSet. CP-04 race defence needs DC ≥ 2 BEFORE the checkpoint
+                    // snapshot fires, so even one DecrementDirty leaves DC ≥ 1 and the page stays dirty for the next
+                    // cycle. With a ChangeSet, two tracked IncrementDirty calls (Add + RegisterReDirty) take DC to 2 —
+                    // ReleaseExcessDirtyMarks then drains the excess via the same primitive the checkpoint uses, no
+                    // race (issue #385). Without a ChangeSet, fall back to untracked EnsureDirtyAtLeast(2).
+                    if (changeSet != null)
+                    {
+                        changeSet.AddByMemPageIndex(memPageIdx);
+                        changeSet.RegisterReDirty(memPageIdx);
+                    }
+                    else
+                    {
+                        _store.EnsureDirtyAtLeast(memPageIdx, 2);
+                    }
                 }
 
                 if (hasPage)
@@ -490,11 +506,17 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
             var oldTailPage = _store.GetPage(oldTailMemIdx);
             ref var oldTailLsh = ref oldTailPage.StructAt<LogicalSegmentHeader>(LogicalSegmentHeader.Offset);
             oldTailLsh.LogicalSegmentNextRawDataPBID = filePageIndices[growFrom];
-            changeSet?.AddByMemPageIndex(oldTailMemIdx);
-            // Durability: EnsureDirtyAtLeast guarantees the page survives one checkpoint cycle so the write reaches disk regardless of whether the caller
-            // provided a ChangeSet. UnlatchPageExclusive only releases the latch (it doesn't mark dirty), and many CreateOrGrow callers pass `null` for
-            // changeSet — so without this call the chain-pointer write can be evicted as clean and lost on reopen.
-            _store.EnsureDirtyAtLeast(oldTailMemIdx, 1);
+            // Durability: AddByMemPageIndex already bumps DC to 1 via tracked IncrementDirty. Without a ChangeSet, fall
+            // back to untracked EnsureDirtyAtLeast(1) for the same DC outcome — see comment block in the data-page-init
+            // loop below for the full CP-04 rationale.
+            if (changeSet != null)
+            {
+                changeSet.AddByMemPageIndex(oldTailMemIdx);
+            }
+            else
+            {
+                _store.EnsureDirtyAtLeast(oldTailMemIdx, 1);
+            }
             _store.UnlatchPageExclusive(oldTailMemIdx);
         }
 
@@ -509,8 +531,6 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
             var latched = _store.TryLatchPageExclusive(memPageIdx);
             Debug.Assert(latched, "TryLatchPageExclusive failed after RequestPageEpochUnchecked");
             var page = _store.GetPage(memPageIdx);
-
-            changeSet?.AddByMemPageIndex(memPageIdx);
 
             if (clear)
             {
@@ -529,11 +549,19 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
                 lsh.Kind = _kind;
             }
 
-            // Durability: same rationale as the old-tail patch above — UnlatchPageExclusive doesn't mark the page dirty and ChangeSet may be null
-            // (DatabaseEngine.InitializeArchetypes allocates segments with null ChangeSet for EntityMap / Cluster / per-archetype-index — see lines 4242,
-            // 4263, 4312, 4344). Without EnsureDirtyAtLeast the chain-pointer + KIND + clear-data writes are evicted as clean and the next reopen sees
-            // zeros, producing the chain↔directory mismatches the integrity check catches.
-            _store.EnsureDirtyAtLeast(memPageIdx, 2);
+            // Durability: see comment in the map-page-update block above — CP-04 race defence needs DC ≥ 2 BEFORE the
+            // checkpoint snapshot. With ChangeSet, two tracked IncrementDirty calls (Add + RegisterReDirty) take DC to 2
+            // and ReleaseExcessDirtyMarks drains the excess via the same primitive as the checkpoint — no race.
+            // Without ChangeSet, fall back to untracked EnsureDirtyAtLeast(2).
+            if (changeSet != null)
+            {
+                changeSet.AddByMemPageIndex(memPageIdx);
+                changeSet.RegisterReDirty(memPageIdx);
+            }
+            else
+            {
+                _store.EnsureDirtyAtLeast(memPageIdx, 2);
+            }
 
             _store.UnlatchPageExclusive(memPageIdx);
         }
@@ -550,9 +578,11 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
                 $"— bug is in CreateOrGrow's pointer writes, not persistence.");
         }
 
-        // Post-condition #2: walk the directory section in memory by reading the root + extension map pages RIGHT NOW (same code-path Load uses). Mismatch
-        // here ⇒ bug in CreateOrGrow's directory writes (not persistence).
-        var memDirCount = WalkDirectoryPageCount(epoch);
+        // Post-condition #2: walk the directory section in memory by reading the root + extension map pages RIGHT NOW and
+        // verify each entry matches the in-memory _pages array position-by-position. Mismatch here ⇒ bug in CreateOrGrow's
+        // directory writes (not persistence). Positional verification is store-agnostic — works for both PersistentStore
+        // (where page index 0 is reserved by the MMF bootstrap) and TransientStore (where page index 0 is a valid entry).
+        var memDirCount = VerifyDirectoryAgainst(epoch, _pages);
         if (memDirCount != _pages.Length)
         {
             throw new InvalidOperationException(
@@ -565,39 +595,62 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
     }
 
     /// <summary>
-    /// Walks the on-page directory section (root + extension map pages reached via <c>LogicalSegmentNextMapPBID</c>) and counts non-zero entries, terminating
-    /// at the first zero — mirroring exactly what <see cref="Load"/> does. Used by the post-condition assertion at the end of <see cref="CreateOrGrow"/> to
-    /// isolate whether the in-memory directory after a write matches <c>_pages.Length</c>, which discriminates "CreateOrGrow logic bug" from "persistence bug".
+    /// Walks the in-memory directory section (root + extension map pages reached via <c>LogicalSegmentNextMapPBID</c>) and
+    /// verifies it matches <paramref name="expected"/> position-by-position. Returns the number of entries that matched in
+    /// order before either: (a) the expected list ran out (full match — caller asserts equal to <c>expected.Length</c>),
+    /// (b) the persisted directory entry diverged from <paramref name="expected"/>, or (c) the map-page chain was truncated
+    /// before reaching <c>expected.Length</c> entries. Used by the post-condition assertion at the end of
+    /// <see cref="CreateOrGrow"/> to isolate "CreateOrGrow logic bug" from "persistence bug" (#385).
     /// </summary>
-    internal int WalkDirectoryPageCount(long epoch)
+    /// <remarks>
+    /// Replaces the original zero-terminator walker — that one assumed page index 0 could never appear as a real directory
+    /// entry, an assumption that holds for <see cref="PersistentStore"/> (MMF reserve carves out page 0 for the bootstrap)
+    /// but NOT for <see cref="TransientStore"/> (in-memory allocator can hand out page 0 as the first segment page).
+    /// Positional comparison is store-agnostic AND strictly more thorough — it catches not just count mismatches but also
+    /// "right count, wrong content" bugs that the original walker silently passed.
+    /// </remarks>
+    internal int VerifyDirectoryAgainst(long epoch, ReadOnlySpan<int> expected)
     {
+        if (expected.Length == 0)
+        {
+            return 0;
+        }
+
         var rootIndex = RootPageIndex;
         _store.RequestPageEpoch(rootIndex, epoch, out var memPageIndex);
         var page = _store.GetPage(memPageIndex);
 
-        var count = 0;
+        var matched = 0;
         var rd = page.RawDataReadOnly<int>(0, RootHeaderIndexSectionCount);
         var maxIndicesForPage = RootHeaderIndexSectionCount;
         var i = 0;
-        while (rd[i] != 0)
+        while (matched < expected.Length)
         {
-            count++;
-            if (++i != maxIndicesForPage)
+            if (i == maxIndicesForPage)
             {
-                continue;
+                ref var lsh = ref page.StructAt<LogicalSegmentHeader>(LogicalSegmentHeader.Offset);
+                if (lsh.LogicalSegmentNextMapPBID == 0)
+                {
+                    // Map-page chain truncated before the expected entry count — caller's assertion will fire.
+                    return matched;
+                }
+                _store.RequestPageEpoch(lsh.LogicalSegmentNextMapPBID, epoch, out memPageIndex);
+                page = _store.GetPage(memPageIndex);
+                rd = page.RawDataReadOnly<int>(0, NextHeadersIndexSectionCount);
+                i = 0;
+                maxIndicesForPage = NextHeadersIndexSectionCount;
             }
-            ref var lsh = ref page.StructAt<LogicalSegmentHeader>(LogicalSegmentHeader.Offset);
-            if (lsh.LogicalSegmentNextMapPBID == 0)
+
+            if (rd[i] != expected[matched])
             {
-                break;
+                // Persisted directory entry diverged from in-memory page list — caller's assertion will fire with the
+                // diff. Stop here so we return the count of consecutive matching entries (useful for diagnosis).
+                return matched;
             }
-            _store.RequestPageEpoch(lsh.LogicalSegmentNextMapPBID, epoch, out memPageIndex);
-            page = _store.GetPage(memPageIndex);
-            rd = page.RawDataReadOnly<int>(0, NextHeadersIndexSectionCount);
-            i = 0;
-            maxIndicesForPage = NextHeadersIndexSectionCount;
+            matched++;
+            i++;
         }
-        return count;
+        return matched;
     }
 
     /// <summary>

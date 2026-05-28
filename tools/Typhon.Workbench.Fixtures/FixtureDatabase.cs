@@ -562,12 +562,13 @@ internal static class FixtureDatabase
             {
                 opts.DatabaseName = databaseName;
                 opts.DatabaseDirectory = directory;
-                // 65536 pages × 8 KB = 512 MiB page cache — matches the Workbench's own open path
-                // (EngineLifecycle.cs:116). The 64 MB the fixture started with worked for the Stress preset (420k)
-                // but was too small for million-entity scales: the EntityMap (paged hash) alone needs hundreds of
-                // pages hot at that count, and adding the component clusters + BTree index pages saturates the
-                // cache during Commit (RawValuePagedHashMap.InsertNew → ChunkAccessor.EvictSlot back-pressure).
-                opts.DatabaseCacheSize = 65536UL * 8192;
+                // 131072 pages × 8 KB = 1 GiB page cache — matches the Workbench's own open path
+                // (EngineLifecycle.cs:116). The 512 MiB the fixture previously ran with worked for the Stress preset
+                // (420k) but was too small for multi-million-entity scales: the EntityMap (paged hash) alone needs
+                // thousands of pages hot at that count, and adding the component clusters + BTree index pages
+                // saturates the cache during Commit (RawValuePagedHashMap.InsertNew → ChunkAccessor.EvictSlot
+                // back-pressure). 1 GiB gives multi-million-entity fixtures comfortable headroom on a dev box.
+                opts.DatabaseCacheSize = 131072UL * 8192;
                 opts.PagesDebugPattern = false;
             })
             .AddScopedDatabaseEngine(opts =>

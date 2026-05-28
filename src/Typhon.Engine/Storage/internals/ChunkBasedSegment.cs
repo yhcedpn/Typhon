@@ -553,7 +553,10 @@ public class ChunkBasedSegment<TStore> : LogicalSegment<TStore> where TStore : s
                     {
                         if (!changeSet.AddByMemPageIndex(memPageIdx))
                         {
-                            _store.IncrementDirty(memPageIdx);
+                            // Re-dirty path — routed through ChangeSet.RegisterReDirty (was: direct _store.IncrementDirty) so the
+                            // per-page mark count is tracked accurately and ReleaseExcessDirtyMarks can drain the exact excess
+                            // via DecrementDirty (matching the checkpoint's own ack primitive). See #385.
+                            changeSet.RegisterReDirty(memPageIdx);
                         }
                     }
                     else

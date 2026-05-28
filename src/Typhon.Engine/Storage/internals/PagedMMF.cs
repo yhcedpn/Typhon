@@ -1661,6 +1661,49 @@ public partial class PagedMMF : ResourceNode, IMemoryResource
     }
 
     /// <summary>
+    /// Atomically decrements <see cref="PageInfo.DirtyCounter"/> by up to <paramref name="delta"/>, clamping at 0. Used by
+    /// <see cref="ChangeSet.ReleaseExcessDirtyMarks"/> and <see cref="ChangeSet.Reset"/> to drain an exact, known number of
+    /// previously-tracked dirty marks in a single CAS operation — O(1) regardless of <paramref name="delta"/> size, whereas
+    /// looping <see cref="DecrementDirty"/> calls is O(<paramref name="delta"/>) and dominates at scale (caller's tracked
+    /// count can reach thousands on hot pages in a long-running UoW).
+    /// </summary>
+    /// <remarks>
+    /// Conservation-respecting in concert with <see cref="DecrementDirty"/>: both are CAS-retry primitives reading
+    /// <c>current</c> and computing a known target. A concurrent <c>DecrementDirty(-1)</c> simply causes one extra retry of
+    /// this call (or vice versa); the final DC equals <c>original - sum-of-deltas</c>, never below 0.
+    /// </remarks>
+    internal void DecrementDirtyByDelta(int memPageIndex, int delta)
+    {
+        if (delta <= 0)
+        {
+            return;
+        }
+
+        var pi = _memPagesInfo[memPageIndex];
+        SpinWait sw = default;
+        while (true)
+        {
+            var current = pi.DirtyCounter;
+            if (current == 0)
+            {
+                return;
+            }
+
+            var newVal = current > delta ? current - delta : 0;
+            if (Interlocked.CompareExchange(ref pi.DirtyCounter, newVal, current) == current)
+            {
+                if (newVal == 0)
+                {
+                    _backpressureStrategy.SignalPageAvailable();
+                }
+                return;
+            }
+
+            sw.SpinOnce();
+        }
+    }
+
+    /// <summary>
     /// Flushes all pending writes to the underlying data file. Calls <c>RandomAccess.FlushToDisk</c> which issues an OS-level fsync.
     /// </summary>
     internal void FlushToDisk()

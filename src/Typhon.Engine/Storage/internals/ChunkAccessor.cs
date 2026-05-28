@@ -163,12 +163,11 @@ public unsafe struct ChunkAccessor<TStore> : IDisposable where TStore : struct, 
                     //   and this re-dirty, the snapshot is stale. IncrementDirty pushes DC to ≥2,
                     //   so the pending DecrementDirty (Step 5) leaves DC≥1, keeping the page dirty
                     //   for the next checkpoint cycle which will capture our new modifications.
-                    // EnsureDirtyAtLeast(1) is wrong: it's a no-op when DC=1, leaving DC=1 for
-                    //   checkpoint to decrement to 0 — making the page evictable with stale disk data.
-                    // EnsureDirtyAtLeast(2) is wrong: it creates a livelock — checkpoint decrements
-                    //   2→1, next re-dirty bumps 1→2, DC never reaches 0.
-                    // ReleaseExcessDirtyMarks caps DC at 1 on UoW dispose, preventing inflation.
-                    _store.IncrementDirty(memPageIndex);
+                    // Routed through ChangeSet.RegisterReDirty (was: direct _store.IncrementDirty) so the
+                    // per-page mark count stays accurate — ReleaseExcessDirtyMarks then decrements the
+                    // exact excess via the same conservation-respecting primitive as the checkpoint's
+                    // own DecrementDirty, eliminating the cap-vs-decrement race captured in #385.
+                    _changeSet.RegisterReDirty(memPageIndex);
                 }
             }
         }

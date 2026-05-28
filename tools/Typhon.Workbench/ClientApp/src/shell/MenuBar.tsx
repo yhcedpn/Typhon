@@ -33,8 +33,11 @@ import {
   toggleViewLogs,
   toggleViewOptions,
   toggleViewResourceTree,
+  toggleViewSchemaExplorer,
   toggleViewSourcePreview,
+  toggleViewStorageHealth,
   toggleViewSystemDag,
+  toggleViewSystemsQueriesNav,
   saveLayoutAsDefault,
   resetLayout,
 } from './commands/openSchemaBrowser';
@@ -119,6 +122,16 @@ export default function MenuBar() {
  <MenubarContent>
  {/* Deep/workspace (zone-D) views — gated off in Stage 0 (reversible per view via the view registry).
      Stage 1 replaces this flat list with a session-kind-partitioned View menu (IA §5.1). */}
+ {/* Schema Explorer is the open-session default workspace; without an entry here the only recovery path
+     after closing the tab is "Reset Layout to Default" (which nukes other customisations). Always-on at the
+     registry level (shell-structural per viewRegistry.ts), session-kind gated for usefulness. */}
+ <MenubarItem
+ disabled={kind !== 'open'}
+ onClick={toggleViewSchemaExplorer}
+ title={kind === 'open' ? undefined : 'Available only for an open .typhon file'}
+ >
+ Schema
+ </MenubarItem>
  {isViewActive('DataBrowserEntities') && <MenubarItem onClick={() => toggleViewDataBrowser()}>Data Browser</MenubarItem>}
  {isViewActive('DbMap') && (
  <MenubarItem
@@ -127,6 +140,16 @@ export default function MenuBar() {
  title={kind === 'open' ? undefined : 'Available only for an open .typhon file'}
  >
  Database File Map
+ </MenubarItem>
+ )}
+ {/* Storage Health — aggregate dashboard sibling of DbMap (both surface storage facts of the loaded file). */}
+ {isViewActive('StorageHealth') && (
+ <MenubarItem
+ disabled={kind !== 'open'}
+ onClick={toggleViewStorageHealth}
+ title={kind === 'open' ? undefined : 'Available only for an open .typhon file'}
+ >
+ Storage Health
  </MenubarItem>
  )}
  {/* (Stage 2 / GAP-02: the Component Layout/Archetypes/Indexes/Relationships items were removed —
@@ -212,6 +235,16 @@ export default function MenuBar() {
  Engine Health
  </MenubarItem>
  )}
+ {/* Systems & Queries Navigator — the trace/attach-mode default left-edge navigator (the profiler-mode
+     counterpart of Resource Tree). Without an entry here, closing the panel leaves the user without a
+     navigator and no recovery path other than Reset Layout. Profiler-session gated like the rest. */}
+ <MenubarItem
+ disabled={!isProfilerSession}
+ onClick={toggleViewSystemsQueriesNav}
+ title={isProfilerSession ? undefined : 'Open a profiler trace or attach a session first'}
+ >
+ Systems &amp; Queries
+ </MenubarItem>
  {/* Dev Fixture (DEBUG-only on the server). Not session-kind gated — the user generates a fixture
      independently of any open session; opening the result establishes a new session. The panel itself
      shows a "not available in this build" cold state if `/api/fixtures/capability` returns 404. */}

@@ -9,7 +9,12 @@ namespace Typhon.Engine.Internals;
 public class ChangeSet
 {
     private readonly PagedMMF _owner;
-    private readonly HashSet<int> _changedMemoryPageIndices;
+    // Per-page count of IncrementDirty calls registered THROUGH this ChangeSet. Each call to AddByMemPageIndex (first-time per
+    // page) or RegisterReDirty (subsequent re-dirty) bumps this counter AND calls PagedMMF.IncrementDirty. The exact count is the
+    // source of truth for ReleaseExcessDirtyMarks and Reset, so both can decrement using the same conservation-respecting
+    // primitive (PagedMMF.DecrementDirty) — NOT the racing cap-to-1 primitive (DecrementDirtyToMin) that used to live here.
+    // See claude/research/Durability/DCManagementRace.md (#385) and ADR-NNN for the full rationale.
+    private readonly Dictionary<int, int> _marksByPage;
     private Task _saveTask;
 
     // Deferred eviction queue: when a ChunkAccessor<PersistentStore> slot is evicted, SlotRefCount and ACW
@@ -21,7 +26,7 @@ public class ChangeSet
     public ChangeSet(PagedMMF owner)
     {
         _owner = owner;
-        _changedMemoryPageIndices = [];
+        _marksByPage = new Dictionary<int, int>();
     }
 
     /// <summary>
@@ -36,7 +41,7 @@ public class ChangeSet
 
     /// <summary>
     /// Flush all deferred eviction decrements (SlotRefCount + ACW for dirty slots).
-    /// Called by <see cref="ChunkAccessor<PersistentStore>.CommitChanges"/> and <see cref="ChunkAccessor<PersistentStore>.Dispose"/>.
+    /// Called by <see cref="ChunkAccessor{PersistentStore}.CommitChanges"/> and <see cref="ChunkAccessor{PersistentStore}.Dispose"/>.
     /// </summary>
     internal void FlushDeferredEvictions()
     {
@@ -58,13 +63,14 @@ public class ChangeSet
     }
 
     /// <summary>
-    /// Mark a page as dirty by its memory page index.
-    /// Idempotent: only calls <see cref="PagedMMF.IncrementDirty"/> on the first add per page per ChangeSet lifetime.
+    /// Mark a page as dirty by its memory page index (first registration). Calls <see cref="PagedMMF.IncrementDirty"/> exactly
+    /// once and tracks the page with a per-page mark count of 1. Subsequent calls for the same page are no-ops; callers that
+    /// need to register an additional dirty mark (CP-04 re-dirty defence) must call <see cref="RegisterReDirty"/> instead.
     /// </summary>
     /// <returns><c>true</c> if this was the first registration for this page in this ChangeSet; <c>false</c> if already tracked.</returns>
     public bool AddByMemPageIndex(int memPageIndex)
     {
-        if (!_changedMemoryPageIndices.Add(memPageIndex))
+        if (!_marksByPage.TryAdd(memPageIndex, 1))
         {
             return false;
         }
@@ -73,63 +79,102 @@ public class ChangeSet
         return true;
     }
 
+    /// <summary>
+    /// Register an additional IncrementDirty for a page already tracked by this ChangeSet — the CP-04 "re-dirty" pattern.
+    /// Bumps the per-page mark count and calls <see cref="PagedMMF.IncrementDirty"/>, both as one logical step from the
+    /// ChangeSet's accounting perspective. Used by <see cref="ChunkAccessor{T}.MarkSlotDirty"/> and
+    /// <see cref="ChunkBasedSegment{T}.AllocateChunk"/> when an already-tracked page is re-dirtied within the same UoW —
+    /// previously these sites called <c>_store.IncrementDirty</c> directly, which left the increment "untracked" and forced
+    /// <see cref="ReleaseExcessDirtyMarks"/> to use a non-conservation cap-to-1 (the source of the #385 race).
+    /// </summary>
+    /// <remarks>
+    /// If the page is NOT already tracked (caller forgot to call <see cref="AddByMemPageIndex"/> first), this method treats
+    /// the call as a fresh registration — defensive behaviour so that an out-of-order call still produces a balanced mark.
+    /// </remarks>
+    internal void RegisterReDirty(int memPageIndex)
+    {
+        if (_marksByPage.TryGetValue(memPageIndex, out var n))
+        {
+            _marksByPage[memPageIndex] = n + 1;
+        }
+        else
+        {
+            _marksByPage[memPageIndex] = 1;
+        }
+        _owner.IncrementDirty(memPageIndex);
+    }
+
     public void SaveChanges() => SaveChangesAsync().ConfigureAwait(false).GetAwaiter().GetResult();
 
     public Task SaveChangesAsync()
     {
-        if (_changedMemoryPageIndices.Count == 0)
+        if (_marksByPage.Count == 0)
         {
             return Task.CompletedTask;
         }
 
-        var pages = _changedMemoryPageIndices.ToArray();
-        _changedMemoryPageIndices.Clear();
+        // SavePages writes each page once and decrements DC once per page in its continuation. That preserves the WAL-less
+        // SaveChanges path's prior conservation behaviour: AddByMemPageIndex's first-add was already balanced by SavePages's
+        // single decrement, and any additional marks from RegisterReDirty were always "extra" (pre-existing DC inflation that
+        // ReleaseExcessDirtyMarks would normally cap in WAL mode). WAL-less mode doesn't run ReleaseExcessDirtyMarks today,
+        // so behaviour here is intentionally unchanged.
+        var pages = _marksByPage.Keys.ToArray();
+        _marksByPage.Clear();
         _saveTask = _owner.SavePages(pages);
         return _saveTask;
     }
 
     /// <summary>
-    /// Caps the <c>DirtyCounter</c> of every page tracked by this ChangeSet at 1 (never decrementing to 0).
+    /// Drains the excess <c>DirtyCounter</c> marks tracked by this ChangeSet, leaving exactly one mark per page for the next
+    /// checkpoint cycle to ack. Replaces the previous cap-to-1 implementation (<c>DecrementDirtyToMin(p, 1)</c>) which raced
+    /// with the background checkpoint's <see cref="PagedMMF.DecrementDirty"/> and caused the lost-write durability bug
+    /// captured in issue #385.
     /// <para>
-    /// In WAL mode, <see cref="SaveChangesAsync"/> is never called because WAL records replace the need for dirty page writeback.
-    /// However, <see cref="AddByMemPageIndex"/> still calls <c>IncrementDirty</c> for every page touched. Without this release, hot pages accumulate a
-    /// DirtyCounter equal to the number of UoWs that touched them, making them permanently unevictable by the page cache clock-sweep.
+    /// In WAL mode, <see cref="SaveChangesAsync"/> is never called because WAL records replace the need for per-UoW dirty page
+    /// writeback. However, <see cref="AddByMemPageIndex"/> and <see cref="RegisterReDirty"/> still call <c>IncrementDirty</c>
+    /// for every mark, so without this release hot pages would accumulate a DirtyCounter equal to the number of UoWs (and
+    /// re-dirty events) that touched them — permanently unevictable by the page cache clock-sweep.
     /// </para>
     /// <para>
-    /// Capping at 1 (not 0) ensures pages remain marked as dirty for the next checkpoint cycle, which is the only path that writes WAL-protected pages to
-    /// the data file and calls <see cref="PagedMMF.DecrementDirty"/>.
+    /// Conservation property (this is the FIX): for a page with tracked mark count <c>N</c>, we issue exactly
+    /// <c>(N - 1)</c> <see cref="PagedMMF.DecrementDirty"/> calls. After this method runs, the page contributes exactly
+    /// one outstanding mark from this UoW. The next checkpoint cycle's single <c>DecrementDirty</c> brings DC back to its
+    /// pre-UoW baseline. Both decrement operations are now the same primitive, so they cannot over-decrement under any
+    /// thread interleaving.
     /// </para>
     /// </summary>
     public void ReleaseExcessDirtyMarks()
     {
-        if (_changedMemoryPageIndices.Count == 0)
+        if (_marksByPage.Count == 0)
         {
             return;
         }
 
-        foreach (var memPageIndex in _changedMemoryPageIndices)
+        foreach (var kv in _marksByPage)
         {
-            _owner.DecrementDirtyToMin(memPageIndex, 1);
+            var excess = kv.Value - 1;
+            if (excess > 0)
+            {
+                _owner.DecrementDirtyByDelta(kv.Key, excess);
+            }
         }
-        _changedMemoryPageIndices.Clear();
+        _marksByPage.Clear();
     }
 
     /// <summary>
-    /// Undo all dirty marks tracked by this ChangeSet (used on transaction rollback).
-    /// <para>
-    /// Note: pages re-dirtied via <see cref="ChunkAccessor<PersistentStore>.MarkSlotDirty"/> (IncrementDirty on re-registration)
-    /// may have DC &gt; 1. This method only decrements once per page. The remaining DC is cleaned up by checkpoint
-    /// or by <see cref="ReleaseExcessDirtyMarks"/> in subsequent UoW disposal.
-    /// </para>
+    /// Undo all dirty marks tracked by this ChangeSet (used on transaction rollback). For each tracked page, calls
+    /// <see cref="PagedMMF.DecrementDirty"/> exactly <c>N</c> times where <c>N</c> is the tracked mark count — fully reverses
+    /// every <see cref="AddByMemPageIndex"/> + <see cref="RegisterReDirty"/> the UoW issued. Unlike the prior implementation
+    /// (which decremented once per page and intentionally left excess marks behind for "next checkpoint" cleanup), this is now
+    /// fully conservation-respecting.
     /// </summary>
     public void Reset()
     {
-        var memPageIndices = _changedMemoryPageIndices.ToArray();
-        foreach (var memPageIndex in memPageIndices)
+        foreach (var kv in _marksByPage)
         {
-            _owner.DecrementDirty(memPageIndex);
+            _owner.DecrementDirtyByDelta(kv.Key, kv.Value);
         }
-        _changedMemoryPageIndices.Clear();
+        _marksByPage.Clear();
         _saveTask = null;
     }
 
@@ -141,7 +186,7 @@ public class ChangeSet
     /// </summary>
     internal void ClearForReuse()
     {
-        _changedMemoryPageIndices.Clear();
+        _marksByPage.Clear();
         _deferredEvictions?.Clear();
         _saveTask = null;
     }

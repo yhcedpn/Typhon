@@ -112,8 +112,12 @@ public sealed class EngineLifecycle : IDisposable
                 {
                     opts.DatabaseName = databaseName;
                     opts.DatabaseDirectory = directory;
-                    // 65536 pages × 8KB = 512 MiB page cache.
-                    opts.DatabaseCacheSize = 65536UL * 8192;
+                    // 131072 pages × 8KB = 1 GiB page cache. Sized for multi-million-entity databases: at that
+                    // scale the EntityMap (paged hash) + component clusters + BTree index pages alone need
+                    // thousands of pages resident or eviction back-pressure dominates on Commit. 1 GiB gives
+                    // comfortable headroom on a dev workstation; matches the fixture-generation engine
+                    // (FixtureDatabase.cs:570) so opening a freshly-generated fixture behaves identically.
+                    opts.DatabaseCacheSize = 131072UL * 8192;
                 })
                 .AddDatabaseEngine(engineOpts =>
                 {
