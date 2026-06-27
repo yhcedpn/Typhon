@@ -194,6 +194,7 @@ class DatabaseFileLockingTests
     }
 
     [Test]
+    [Category("Sensitive")] // file-lock/IO timing — flaky under parallel CPU load; runs in the gate's serial quiet pass
     public void CorruptLockFile_Removed()
     {
         var dbName = "lock_corrupt";
@@ -231,6 +232,11 @@ class DatabaseFileLockingTests
     }
 
     [Test]
+    // Windows-only: the OS enforces mandatory file-share locking, so a second ReadWrite open of the held .bin throws.
+    // POSIX file sharing is advisory (the open succeeds), so this OS-level guard does not exist on Linux/macOS. Typhon's
+    // cross-platform single-writer protection is the .lock file (see LiveLock_Throws / CrossMachineLock_Throws); this
+    // test covers only the extra Windows mandatory-lock layer.
+    [Platform("Win")]
     public void FileShare_PreventsWrite()
     {
         var dbName = "lock_share_w";
