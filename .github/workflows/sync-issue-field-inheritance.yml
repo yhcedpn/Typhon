@@ -1,0 +1,53 @@
+# Sync Issue Field Inheritance
+#
+# Copies issue-level custom fields (default: Product) from a parent issue
+# down to its sub-issues, e.g. Feature #437 inherits Product from Epic #436.
+#
+# WHY POLLING, NOT AN EVENT TRIGGER: GitHub fires a dedicated `sub_issues`
+# webhook event (action: parent_issue_added) when a sub-issue is linked, but
+# GitHub Actions' `on:` trigger does not support that event yet - only the
+# `issues` event is available, and linking a sub-issue does not fire any of
+# its supported activity types. Reacting in real time would require an
+# external webhook relay (repo webhook -> hosted endpoint -> repository_dispatch).
+# Polling every 15 minutes avoids standing up that extra hosted component;
+# reconsider if near-instant sync becomes a real requirement.
+#
+# IMPORTANT: Reuses the PROJECT_TOKEN secret (see project-sync.yml) since the
+# default GITHUB_TOKEN cannot write org-level issue custom fields. If
+# PROJECT_TOKEN's scopes turn out not to cover the issue-fields GraphQL API,
+# add a dedicated fine-grained PAT with "Issues" write permission instead.
+
+name: Sync Issue Field Inheritance
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (report only, no writes)'
+        type: boolean
+        default: false
+      overwrite_existing:
+        description: 'Overwrite a child value that differs from the parent (default: only fill unset fields)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Sync inherited fields
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync fields from parent issues
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          INHERIT_FIELDS: Product
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          OVERWRITE_EXISTING: ${{ github.event.inputs.overwrite_existing || 'false' }}
+        run: python3 .github/scripts/sync_issue_field_inheritance.py

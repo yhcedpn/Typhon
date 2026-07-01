@@ -10,6 +10,8 @@ Create a GitHub issue in **`log2n-io/Typhon`** and add it to the **Typhon** org 
 
 > **Migration note (2026-06-29):** the repo moved to `log2n-io/Typhon` and the board to the org project `orgs/Log2n-io/projects/1`. Native **Issue Types** (Task / Bug / Feature / Epic) are live, and **Area / Product are issue-level fields** (the ones Epics carry), not project single-selects. Release maturity is expressed as a **Milestone** on Features. Use owner `log2n-io` for repo/API ops and `Log2n-io` for `gh project` ops (both resolve to the same org; GitHub owner matching is case-insensitive).
 
+> **🔴 Hierarchy rule — Epic → Feature → Task, no skipping.** The development cycle revolves around Features, so an Epic's direct children must be typed **Feature**, never **Task**. A **Task** may only be a child of a **Feature** (further breakdown of one feature's implementation), never a direct child of an Epic. Concretely: `parent_issue_url` = an Epic ⟹ child type = `Feature`; `parent_issue_url` = a Feature ⟹ child type = `Task`. Verified pattern: #146 (Epic) → #147 (Feature) is a direct child; #435 (Feature, child of #146) → #427 (Task, child of #435). If a piece of epic-level work doesn't need further breakdown, it's still typed **Feature** as the Epic's direct child — don't downgrade it to Task just because it has no children of its own yet.
+
 ## Input provided by user
 
 $ARGUMENTS
@@ -117,7 +119,9 @@ gh project item-edit --project-id PVT_kwDOEcGj5M4Bb-8P --id <ITEM_ID> \
 - **Milestone** (release maturity): `gh issue edit <number> --repo log2n-io/Typhon --milestone "alpha-1"`
 - **Area / Product** are **issue-level fields** (the same ones Epics carry — e.g. #146 = Area:Execution, Product:Engine), **not** the now-empty project single-selects. `gh` has no dedicated flag yet; set them via the GitHub web UI, or via GraphQL if scripting. Match the parent Epic's values when linking under one.
 
-### Step 7 (optional): Link under a parent Epic (native sub-issue)
+### Step 7 (optional): Link under a parent Epic or Feature (native sub-issue)
+
+**Before linking, check the parent's Issue Type** and set the child's type to match the Epic → Feature → Task rule above: linking under an **Epic** ⟹ child type `Feature`; linking under a **Feature** ⟹ child type `Task`. Never link a `Task` directly under an `Epic`.
 
 Use the issue's **database `id`** (big integer from Step 1), and `-F` so it serializes as a JSON integer. On Git Bash, prefix `MSYS_NO_PATHCONV=1` because the API path starts with `/`.
 
