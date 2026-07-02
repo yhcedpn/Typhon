@@ -8,8 +8,6 @@
 
 Typhon is in **active development, targeting an alpha release** — not a finished 1.0. There's no NuGet package yet, no stable API, no support contract. What there is: a ~3,500-test NUnit suite, a durability model backed by TLA+ proofs and a crash-simulation sweep (not just tests), and a measured performance story (see [Measured, Not Just Claimed](#measured-not-just-claimed) below) that already beats or matches purpose-built rivals on their own turf.
 
-It's **source-available**, not open source: every version before 1.0 — which is all of them, right now — is free for any use, any organization size, any purpose. Read it, fork it, ship it. From 1.0 onward it stays free for organizations under $2M annual revenue and 50 people; past that threshold, or if you want to build a competing database product or service on top of it, you need a commercial license. Full terms in [LICENSE.md](LICENSE.md).
-
 If you're building a game server, simulation, or real-time stateful system and want to shape the engine while it's still soft — this is the moment.
 
 ---
@@ -405,7 +403,9 @@ Game servers shouldn't have to choose between "fast" and "correct." Trading engi
 
 **Typhon is a microsecond-latency ACID database with a parallel tick-based runtime and client-state sync built in — running in your process, speaking your data model, never making you choose between performance and correctness.**
 
-It's pre-alpha. It's source-available, not open source — though free for effectively everyone reading this, today. It's not finished. But the parts that are built are measured, proven against TLA+ models where it matters most, and already beating purpose-built rivals on their own turf.
+It's pre-alpha and not finished. But the parts that are built are measured, proven against TLA+ models where it matters most, and already beating purpose-built rivals on their own turf.
+
+It's also **source-available**, not open source: every version before 1.0 — which is all of them, right now — is free for any use, any organization size, any purpose. Read it, fork it, ship it. From 1.0 onward it stays free for organizations under $2M annual revenue and 50 people; past that threshold, or if you want to build a competing database product or service on top of it, you need a commercial license. Full terms in [LICENSE.md](LICENSE.md).
 
 *What would a database look like if it were designed for real-time systems, ECS data models, and the runtime that drives them — all from the ground up, together? This is our answer.*
 
