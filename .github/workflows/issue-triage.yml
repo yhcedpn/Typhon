@@ -33,6 +33,12 @@ concurrency:
 
 jobs:
   triage:
+    # Only auto-triage issues from OUTSIDE the team. Maintainer/collaborator-authored issues
+    # (Features, Tasks, internal planning) skip the run entirely — they're already classified and a
+    # triage comment would be noise. Same author_association gate as slash-commands.yml; composes with
+    # allowed_non_write_users below (this `if` decides whether the job runs; that setting lets the
+    # action act on the external issues that do run).
+    if: ${{ !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
