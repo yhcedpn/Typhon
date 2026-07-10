@@ -20,6 +20,9 @@ on:
 permissions:
   contents: read
   issues: write
+  id-token: write   # required by claude-code-action to mint a GitHub OIDC identity token
+                    # (workflow identity for Anthropic's backend / GitHub App token exchange);
+                    # this is identity only — it grants NO repo write beyond issues:write above.
 
 concurrency:
   group: issue-triage-${{ github.event.issue.number }}
