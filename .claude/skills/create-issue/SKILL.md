@@ -46,8 +46,9 @@ Gather the following. If NOT provided in the arguments, use `AskUserQuestion`:
 
 1. **Title** (required): a clear, concise issue title
 2. **Description** (required): what needs to be done and why
-3. **Issue Type** (recommended — native): `Task`, `Bug`, `Feature`, or `Epic`
-4. **Type labels** (optional): one or more of `bug`, `enhancement`, `documentation`, `performance`, `refactoring`, `testing`, `technical-debt`, `question`
+3. **Issue Type** (recommended — native): `Task`, `Bug`, `Feature`, `Question`, or `Epic`
+4. **Type labels** (optional): one or more of `bug`, `enhancement`, `documentation`, `performance`, `refactoring`, `testing`, `technical-debt`
+   (Questions use the **`Question` Issue Type**, not a label.)
 5. **Area** (optional — issue-level field): the subsystem outcome area (e.g. Execution, Storage, Concurrency, Observability, …). Match the parent Epic's Area when there is one.
 6. **Product** (optional — issue-level field): e.g. `Engine`, `Workbench`.
 7. **Milestone** (optional — release maturity on Features): e.g. `alpha-1`.
@@ -80,7 +81,7 @@ Capture the returned `number`, `html_url`, and `id` (the big integer — needed 
 ### Step 2: Set the Issue Type (gh — MCP has no field for it)
 
 ```bash
-gh issue edit <number> --repo log2n-io/Typhon --type "Feature"   # or Task / Bug / Epic
+gh issue edit <number> --repo log2n-io/Typhon --type "Feature"   # or Task / Bug / Question / Epic
 ```
 
 ### Step 3: Add to the project board
@@ -171,7 +172,7 @@ Do both — the `[tasklist]` gives a body-embedded checklist (used by `/complete
 - Re-verify anytime: `gh project field-list 1 --owner Log2n-io --format json`
 
 ### Issue-level classifiers (not project fields)
-- **Issue Type:** `gh issue edit <n> --repo log2n-io/Typhon --type "<Type>"` (Task/Bug/Feature/Epic)
+- **Issue Type:** `gh issue edit <n> --repo log2n-io/Typhon --type "<Type>"` (Task/Bug/Feature/Question/Epic)
 - **Area / Product:** issue custom fields (web UI / GraphQL); mirror the parent Epic
 - **Milestone:** release maturity — `gh issue edit <n> --repo log2n-io/Typhon --milestone "<name>"`
 

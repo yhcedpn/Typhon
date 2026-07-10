@@ -1,0 +1,46 @@
+name: Feature Request
+description: Propose a capability or enhancement.
+title: "[Feature]: "
+labels: ["enhancement"]
+type: Feature
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and why can't you today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Database
+        - MVCC
+        - Transactions
+        - Indexes
+        - Schema
+        - Storage
+        - Memory
+        - Concurrency
+        - Primitives
+        - Observability
+        - Execution
+        - Errors
+        - Workbench
+        - Unsure
+    validations:
+      required: true

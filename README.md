@@ -5,9 +5,9 @@
 > ### 📣 New here? Read [**PITCH.md**](PITCH.md) first.
 > It makes the case for Typhon — the problem it solves, what's actually built and measured today, and where it's headed — before you dive into the technical docs below.
 
-### ⚠️ The engine is in active development and not usable as a library or product. ⚠️
+### ⚠️ The engine is in active development — pre-alpha, stabilizing fast, not yet production-hardened. ⚠️
 
-There is no reference documentation, no stable API, no NuGet package, and no support.
+Early **[alpha NuGet packages](https://www.nuget.org/packages/Typhon)** and full **[reference documentation](https://doc.typhondb.io)** are now live. Most of the public API is now stable — and you can **[open an issue](https://github.com/Log2n-io/Typhon/issues)** for help, questions, or feedback.
 
 
 **A microsecond-latency ACID data engine combining ECS archetype storage with tick-based parallel execution.**
@@ -17,6 +17,7 @@ It pairs a microsecond-latency ACID store — MVCC snapshot isolation, configura
 The runtime doesn't sit on top of the database — it runs inside it.
 
 📖 **Start here:**
+- **[📚 doc.typhondb.io](https://doc.typhondb.io)** — the new documentation site: guide, in-depth overview, feature catalog, and full **API reference**, all in one browsable, searchable place.
 - **[User Guide](doc/guide/README.md)** — learn the key concepts hands-on, backed by a small **runnable sample project** ([`doc/guide/example`](doc/guide/example)).
 - **[In-Depth Overview](doc/in-depth-overview/README.md)** — dig into how every subsystem works, and the reasoning behind it.
 
@@ -33,7 +34,7 @@ The runtime doesn't sit on top of the database — it runs inside it.
 - **MVCC Snapshot Isolation** — Readers never block writers; each transaction sees a consistent snapshot
 - **ECS Archetype System** — Entities are typed by archetype; components are blittable structs with source-generated accessors and archetype inheritance
 - **Larger-Than-RAM Storage** — The database is a memory-mapped, paged file on disk, virtualized through a page cache that holds only the hot working set — so resident memory is bounded by the cache, not the database. Manipulate a 100 GiB store on a machine with a fraction of that RAM; component data, indexes, and the entity map all page to/from disk on demand (in-memory ECS frameworks, by contrast, must fit the entire world in RAM)
-- **Workbench Dev UI** — A local, browser-based companion (ASP.NET Core + React/Vite) — *DataGrip for Typhon*, not just a profiler. Open a recorded `.typhon-trace`, attach to a live engine over TCP, or open a `.typhon` database file directly. **Performance:** per-tick profiler timeline with CPU-sample + off-CPU overlays, Top Spans, Call Tree, Critical Path, System DAG. **Data & schema:** component/archetype browsers, Schema Inspector, a zoomable Hilbert-curve Database File Map, live Resource Tree. **Queries:** catalog, plan tree, per-execution inspector — all in a dockable, persisted workspace
+- **Workbench Dev UI** — **📣[Demo video #1](https://www.youtube.com/watch?v=yIFqwPJKOlA)📣** A local, browser-based companion (ASP.NET Core + React/Vite) — *DataGrip for Typhon*, not just a profiler. Open a recorded `.typhon-trace`, attach to a live engine over TCP, or open a `.typhon` database file directly. **Performance:** per-tick profiler timeline with CPU-sample + off-CPU overlays, Top Spans, Call Tree, Critical Path, System DAG. **Data & schema:** component/archetype browsers, Schema Inspector, a zoomable Hilbert-curve Database File Map, live Resource Tree. **Queries:** catalog, plan tree, per-execution inspector — all in a dockable, persisted workspace
 - **Entity Clusters** — SoA batched storage co-locating up to 64 entities per cluster, with cluster-native SIMD predicate evaluation (AVX-512 / AVX2 / scalar dispatch), zone-map pruning, and k-way sorted merge
 - **Query Engine** — Typed queries with `Where`, `With`/`Without` filters, polymorphic iteration, OR logic, navigation joins, and a cluster execution path that routes filtered scans through SIMD gather-compare on cluster SoA columns
 - **Entity Relationships** — Typed `EntityLink<T>` references for 1:1, 1:N, and N:M relationships, with declarative cascade delete and reactive FK-joined queries

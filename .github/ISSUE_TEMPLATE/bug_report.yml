@@ -1,0 +1,65 @@
+name: Bug Report
+description: Report a defect in Typhon.
+title: "[Bug]: "
+labels: ["bug"]
+type: Bug
+body:
+  - type: markdown
+    attributes:
+      value: "Thanks for filing a bug. Complete the fields below so it can be triaged fast."
+  - type: input
+    id: version
+    attributes:
+      label: Typhon version / commit
+      placeholder: "e.g. 0.0.1-alpha.2 or commit 1ce2761"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Database
+        - MVCC
+        - Transactions
+        - Indexes
+        - Schema
+        - Storage
+        - Memory
+        - Concurrency
+        - Primitives
+        - Observability
+        - Execution
+        - Errors
+        - Workbench
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal, deterministic repro if possible.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: I can reproduce this on the latest `main`
