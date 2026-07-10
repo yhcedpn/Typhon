@@ -77,6 +77,10 @@ jobs:
 
             Do NOT set the issue Type, assignees, milestone, or project. Do NOT edit the issue title or
             body. Only add labels and post the single comment.
+          # Model pinned deliberately (not the floating action default): Sonnet 4.6 is ample for triage,
+          # ~30% lighter on token/quota than Sonnet 5's new tokenizer, and pinning prevents silent default
+          # drift on the subscription. Bump this line intentionally to upgrade.
           claude_args: |
             --allowedTools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue edit:*),Bash(gh issue comment:*)"
             --max-turns 15
+            --model claude-sonnet-4-6
