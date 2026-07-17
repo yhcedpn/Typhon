@@ -1,6 +1,14 @@
 # Typhon
 
-[![.NET](https://img.shields.io/badge/.NET-10-512BD4)](https://dotnet.microsoft.com/)
+[![Merge Gate](https://github.com/Log2n-io/Typhon/actions/workflows/merge-gate.yml/badge.svg?branch=main)](https://github.com/Log2n-io/Typhon/actions/workflows/merge-gate.yml)
+[![Build docs](https://github.com/Log2n-io/Typhon/actions/workflows/build-docs.yml/badge.svg?branch=main)](https://github.com/Log2n-io/Typhon/actions/workflows/build-docs.yml)
+[![License](https://img.shields.io/badge/license-Source%20Available-blue)](LICENSE.md)
+[![.NET](https://img.shields.io/badge/.NET-10-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/)
+<br/>
+[![Typhon](https://img.shields.io/nuget/vpre/Typhon?logo=nuget&label=Typhon)](https://www.nuget.org/packages/Typhon)
+[![Typhon.Cli](https://img.shields.io/nuget/vpre/Typhon.Cli?logo=nuget&label=Typhon.Cli)](https://www.nuget.org/packages/Typhon.Cli)
+[![Docs](https://img.shields.io/badge/docs-doc.typhondb.io-1f6feb?logo=readthedocs&logoColor=white)](https://doc.typhondb.io)
+[![Status](https://img.shields.io/badge/status-pre--alpha-orange)](https://github.com/Log2n-io/Typhon)
 
 > ### 📣 New here? Read [**PITCH.md**](PITCH.md) first.
 > It makes the case for Typhon — the problem it solves, what's actually built and measured today, and where it's headed — before you dive into the technical docs below.
