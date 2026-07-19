@@ -7,11 +7,17 @@ internal static class Program
     public static int Main()
     {
         var databaseLocation = Path.Combine(AppContext.BaseDirectory, $"{RunName}.typhon");
-        SpaceBattleHost.Run(
+        var result = SpaceBattleHost.Run(
             SimulationDefinition.Default,
             databaseLocation,
             CancellationToken.None,
             new ConsoleObservationSink());
+
+        if (result.StartupAction == SimulationStartupAction.Resumed)
+        {
+            Console.WriteLine($"恢复运行 {RunName}，当前存活飞船数 {result.ShipCount:N0}。");
+        }
+
         return 0;
     }
 

@@ -26,4 +26,5 @@ public sealed partial class Ship : Archetype<Ship>
 public sealed partial class SimulationRunEntity : Archetype<SimulationRunEntity>
 {
     public static readonly Comp<SimulationRunComponent> Run = Register<SimulationRunComponent>();
+    public static readonly Comp<SimulationRunStateComponent> State = Register<SimulationRunStateComponent>();
 }

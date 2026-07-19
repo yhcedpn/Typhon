@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Numerics;
 using Typhon.Engine;
 using Typhon.Schema.Definition;
 
@@ -22,8 +21,32 @@ public static class SpaceBattleHost
         ArgumentNullException.ThrowIfNull(observationSink);
         cancellationToken.ThrowIfCancellationRequested();
 
+        var databaseAlreadyExists = Directory.Exists(databaseLocation) || File.Exists(databaseLocation);
+        using var engine = SpaceBattleDatabase.Open(definition, databaseLocation);
+
+        var persistedRun = FindPersistedRun(engine, databaseAlreadyExists);
+        if (persistedRun is not null)
+        {
+            ValidateRunIdentity(definition, persistedRun.Value);
+            return ResumeRunningRun(engine, persistedRun.Value);
+        }
+
         var stopwatch = Stopwatch.StartNew();
-        using var engine = OpenEngine(definition, databaseLocation);
+        return CreateInitialWorld(
+            engine,
+            definition,
+            cancellationToken,
+            observationSink,
+            stopwatch);
+    }
+
+    private static SpaceBattleRunResult CreateInitialWorld(
+        DatabaseEngine engine,
+        SimulationDefinition definition,
+        CancellationToken cancellationToken,
+        ISpaceBattleObservationSink observationSink,
+        Stopwatch stopwatch)
+    {
         using var bulkLoad = engine.BeginBulkLoad(new BulkLoadOptions
         {
             ProgressBatchSize = Math.Max(1, Math.Min(10_000, definition.ShipCount)),
@@ -39,10 +62,15 @@ public static class SpaceBattleHost
             RulesetVersion = definition.RulesetVersion,
             InitialShipCount = checked((uint)definition.ShipCount),
             AliveShipCount = checked((uint)definition.ShipCount),
+        };
+        var runState = new SimulationRunStateComponent
+        {
             ProcessSegment = 1,
             Status = (byte)SimulationRunStatus.Running,
         };
-        bulkLoad.Spawn<SimulationRunEntity>(SimulationRunEntity.Run.Set(in run));
+        bulkLoad.Spawn<SimulationRunEntity>(
+            SimulationRunEntity.Run.Set(in run),
+            SimulationRunEntity.State.Set(in runState));
 
         var motion = new MotionComponent { DirectionX = 1f, DirectionY = 0f, DirectionZ = 0f, Speed = 0f };
         var health = new HealthComponent { Current = definition.MaximumHealth };
@@ -87,7 +115,80 @@ public static class SpaceBattleHost
 
         var observation = new InitializationCompleted(definition.ShipCount, stopwatch.Elapsed);
         observationSink.Publish(observation);
-        return new SpaceBattleRunResult(definition.ShipCount, stopwatch.Elapsed);
+        return new SpaceBattleRunResult(
+            definition.ShipCount,
+            stopwatch.Elapsed,
+            SimulationStartupAction.Initialized);
+    }
+
+    private static PersistedRun? FindPersistedRun(
+        DatabaseEngine engine,
+        bool databaseAlreadyExists)
+    {
+        using var transaction = engine.CreateReadOnlyTransaction();
+        var runEntities = transaction.Query<SimulationRunEntity>().Execute();
+        if (runEntities.Count == 0)
+        {
+            if (databaseAlreadyExists)
+            {
+                throw new InvalidOperationException("既有数据库的 SimulationRun 实体数量必须为 1，实际为 0。");
+            }
+
+            return null;
+        }
+
+        if (runEntities.Count != 1)
+        {
+            throw new InvalidOperationException($"SimulationRun 实体数量必须为 1，实际为 {runEntities.Count}。");
+        }
+
+        var runEntityId = runEntities.Single();
+        var runEntity = transaction.Open(runEntityId);
+        ref readonly var run = ref runEntity.Read(SimulationRunEntity.Run);
+        ref readonly var runState = ref runEntity.Read(SimulationRunEntity.State);
+        return new PersistedRun(
+            runEntityId,
+            run.Seed,
+            run.RulesetVersion,
+            run.AliveShipCount,
+            (SimulationRunStatus)runState.Status);
+    }
+
+    private static void ValidateRunIdentity(
+        SimulationDefinition definition,
+        PersistedRun persistedRun)
+    {
+        if (persistedRun.Seed != definition.Seed)
+        {
+            throw new InvalidOperationException(
+                $"SimulationRun seed 不匹配：数据库为 {persistedRun.Seed}，当前定义为 {definition.Seed}。");
+        }
+
+        if (persistedRun.RulesetVersion != definition.RulesetVersion)
+        {
+            throw new InvalidOperationException(
+                $"SimulationRun ruleset version 不匹配：数据库为 {persistedRun.RulesetVersion}，当前定义为 {definition.RulesetVersion}。");
+        }
+    }
+
+    private static SpaceBattleRunResult ResumeRunningRun(
+        DatabaseEngine engine,
+        PersistedRun persistedRun)
+    {
+        if (persistedRun.Status != SimulationRunStatus.Running)
+        {
+            throw new InvalidOperationException($"SimulationRun 状态 {persistedRun.Status} 不可恢复。");
+        }
+
+        using var transaction = engine.CreateQuickTransaction(DurabilityMode.Immediate);
+        ref var runState = ref transaction.OpenMut(persistedRun.EntityId).Write(SimulationRunEntity.State);
+        runState.ProcessSegment = checked(runState.ProcessSegment + 1);
+        transaction.Commit();
+
+        return new SpaceBattleRunResult(
+            checked((int)persistedRun.AliveShipCount),
+            TimeSpan.Zero,
+            SimulationStartupAction.Resumed);
     }
 
     public static InitialWorldSnapshot ReadSnapshot(
@@ -97,7 +198,7 @@ public static class SpaceBattleHost
         ArgumentNullException.ThrowIfNull(definition);
         ArgumentException.ThrowIfNullOrWhiteSpace(databaseLocation);
 
-        using var engine = OpenEngine(definition, databaseLocation);
+        using var engine = SpaceBattleDatabase.Open(definition, databaseLocation);
         using var transaction = engine.CreateReadOnlyTransaction();
 
         var runEntities = transaction.Query<SimulationRunEntity>().Execute();
@@ -108,14 +209,15 @@ public static class SpaceBattleHost
 
         var runEntity = transaction.Open(runEntities.Single());
         ref readonly var run = ref runEntity.Read(SimulationRunEntity.Run);
+        ref readonly var runState = ref runEntity.Read(SimulationRunEntity.State);
         var runSnapshot = new SimulationRunSnapshot(
             run.Seed,
             run.CompletedTicks,
             run.RulesetVersion,
             run.InitialShipCount,
             run.AliveShipCount,
-            run.ProcessSegment,
-            (SimulationRunStatus)run.Status);
+            runState.ProcessSegment,
+            (SimulationRunStatus)runState.Status);
 
         var shipEntities = transaction.Query<Ship>().Execute().OrderBy(static id => id.EntityKey);
         var ships = new List<ShipSnapshot>();
@@ -150,24 +252,6 @@ public static class SpaceBattleHost
 
         return new InitialWorldSnapshot(runEntities.Count, runSnapshot, ships);
     }
-
-    private static DatabaseEngine OpenEngine(SimulationDefinition definition, string databaseLocation) =>
-        DatabaseEngine.Open(databaseLocation, options => options
-            .Register<SimulationRunComponent>()
-            .Register<PositionComponent>()
-            .Register<SpatialBoundsComponent>()
-            .Register<MotionComponent>()
-            .Register<HealthComponent>()
-            .Register<BehaviorComponent>()
-            .Register<TrackingComponent>()
-            .Register<WeaponComponent>()
-            .Register<AfterburnerComponent>()
-            .RegisterArchetype<SimulationRunEntity>()
-            .RegisterArchetype<Ship>()
-            .ConfigureSpatialGrid(new SpatialGridConfig(
-                Vector2.Zero,
-                new Vector2(definition.WorldSize, definition.WorldSize),
-                definition.SpatialCellSize)));
 
     private static PositionComponent CreateInitialPosition(
         SimulationDefinition definition,
@@ -205,4 +289,11 @@ public static class SpaceBattleHost
             MaxZ = position.Z,
         },
     };
+
+    private readonly record struct PersistedRun(
+        EntityId EntityId,
+        ulong Seed,
+        uint RulesetVersion,
+        uint AliveShipCount,
+        SimulationRunStatus Status);
 }

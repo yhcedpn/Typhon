@@ -47,6 +47,7 @@ public sealed class InitialWorldTests
         Assert.Multiple(() =>
         {
             Assert.That(result.ShipCount, Is.EqualTo(8));
+            Assert.That(result.StartupAction, Is.EqualTo(SimulationStartupAction.Initialized));
             Assert.That(persisted.RunCount, Is.EqualTo(1));
             Assert.That(persisted.Run.Seed, Is.EqualTo(definition.Seed));
             Assert.That(persisted.Run.RulesetVersion, Is.EqualTo(definition.RulesetVersion));
@@ -116,7 +117,7 @@ public sealed class InitialWorldTests
     }
 
     [Test]
-    public void Run_WhenCancelledDuringBulkLoad_DiscardsPartialWorld()
+    public void Run_WhenCancelledDuringBulkLoad_RejectsTheExistingEmptyDatabase()
     {
         var definition = CreateDefinition(shipCount: 20);
         var databaseLocation = Path.Combine(_temporaryDirectory, "cancelled.typhon");
@@ -129,18 +130,11 @@ public sealed class InitialWorldTests
             cancellation.Token,
             cancellingSink));
 
-        SpaceBattleHost.Run(
+        Assert.Throws<InvalidOperationException>(() => SpaceBattleHost.Run(
             definition,
             databaseLocation,
             CancellationToken.None,
-            new RecordingObservationSink());
-        var persisted = SpaceBattleHost.ReadSnapshot(definition, databaseLocation);
-
-        Assert.Multiple(() =>
-        {
-            Assert.That(persisted.RunCount, Is.EqualTo(1));
-            Assert.That(persisted.Ships, Has.Count.EqualTo(definition.ShipCount));
-        });
+            new RecordingObservationSink()));
     }
 
     private static SimulationDefinition CreateDefinition(int shipCount) => new(

@@ -7,6 +7,12 @@ public enum SimulationRunStatus : byte
     TimedOut = 3,
 }
 
+public enum SimulationStartupAction : byte
+{
+    Initialized = 1,
+    Resumed = 2,
+}
+
 public enum BehaviorMode : byte
 {
     Staging = 1,
@@ -61,4 +67,5 @@ public sealed record InitialWorldSnapshot(
 
 public sealed record SpaceBattleRunResult(
     int ShipCount,
-    TimeSpan InitializationDuration);
+    TimeSpan InitializationDuration,
+    SimulationStartupAction StartupAction);
