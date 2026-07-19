@@ -3,6 +3,10 @@ namespace SpaceBattle;
 public sealed record SimulationDefinition
 {
     public const ulong DefaultSeed = 0x5350414345424154UL;
+    public const int FixedTickRate = 25;
+    public const float FixedSimulationDeltaSeconds = 0.04f;
+    public const float BaseMaximumSpeed = 50f;
+    public const float MaximumWanderingSpeed = BaseMaximumSpeed * 0.75f;
 
     public static SimulationDefinition Default { get; } = new(
         runName: "default",

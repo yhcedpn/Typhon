@@ -23,21 +23,79 @@ public static class SpaceBattleHost
 
         var databaseAlreadyExists = Directory.Exists(databaseLocation) || File.Exists(databaseLocation);
         using var engine = SpaceBattleDatabase.Open(definition, databaseLocation);
+        return InitializeOrResume(
+            engine,
+            definition,
+            databaseAlreadyExists,
+            cancellationToken,
+            observationSink,
+            out _);
+    }
 
-        var persistedRun = FindPersistedRun(engine, databaseAlreadyExists);
-        if (persistedRun is not null)
+    public static SpaceBattleSimulation Start(
+        SimulationDefinition definition,
+        string databaseLocation,
+        CancellationToken cancellationToken,
+        ISpaceBattleObservationSink observationSink)
+    {
+        ArgumentNullException.ThrowIfNull(definition);
+        ArgumentException.ThrowIfNullOrWhiteSpace(databaseLocation);
+        ArgumentNullException.ThrowIfNull(observationSink);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var databaseAlreadyExists = Directory.Exists(databaseLocation) || File.Exists(databaseLocation);
+        var engine = SpaceBattleDatabase.Open(definition, databaseLocation);
+
+        try
         {
-            ValidateRunIdentity(definition, persistedRun.Value);
-            return ResumeRunningRun(engine, persistedRun.Value);
+            var startupResult = InitializeOrResume(
+                engine,
+                definition,
+                databaseAlreadyExists,
+                cancellationToken,
+                observationSink,
+                out var persistedRun);
+
+            var simulation = SpaceBattleSimulation.Create(
+                engine,
+                definition,
+                persistedRun.EntityId,
+                persistedRun.CompletedTicks,
+                startupResult);
+            engine = null!;
+            return simulation;
+        }
+        finally
+        {
+            engine?.Dispose();
+        }
+    }
+
+    private static SpaceBattleRunResult InitializeOrResume(
+        DatabaseEngine engine,
+        SimulationDefinition definition,
+        bool databaseAlreadyExists,
+        CancellationToken cancellationToken,
+        ISpaceBattleObservationSink observationSink,
+        out PersistedRun persistedRun)
+    {
+        var existingRun = FindPersistedRun(engine, databaseAlreadyExists);
+        if (existingRun is not null)
+        {
+            persistedRun = existingRun.Value;
+            ValidateRunIdentity(definition, persistedRun);
+            return ResumeRunningRun(engine, persistedRun);
         }
 
         var stopwatch = Stopwatch.StartNew();
-        return CreateInitialWorld(
+        var result = CreateInitialWorld(
             engine,
             definition,
             cancellationToken,
             observationSink,
             stopwatch);
+        persistedRun = FindPersistedRun(engine, databaseAlreadyExists: true)!.Value;
+        return result;
     }
 
     private static SpaceBattleRunResult CreateInitialWorld(
@@ -150,6 +208,7 @@ public static class SpaceBattleHost
             runEntityId,
             run.Seed,
             run.RulesetVersion,
+            run.CompletedTicks,
             run.AliveShipCount,
             (SimulationRunStatus)runState.Status);
     }
@@ -199,6 +258,12 @@ public static class SpaceBattleHost
         ArgumentException.ThrowIfNullOrWhiteSpace(databaseLocation);
 
         using var engine = SpaceBattleDatabase.Open(definition, databaseLocation);
+        return ReadSnapshot(engine);
+    }
+
+    internal static InitialWorldSnapshot ReadSnapshot(DatabaseEngine engine)
+    {
+        ArgumentNullException.ThrowIfNull(engine);
         using var transaction = engine.CreateReadOnlyTransaction();
 
         var runEntities = transaction.Query<SimulationRunEntity>().Execute();
@@ -294,6 +359,7 @@ public static class SpaceBattleHost
         EntityId EntityId,
         ulong Seed,
         uint RulesetVersion,
+        ulong CompletedTicks,
         uint AliveShipCount,
         SimulationRunStatus Status);
 }

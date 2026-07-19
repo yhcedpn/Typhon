@@ -7,16 +7,26 @@ internal static class Program
     public static int Main()
     {
         var databaseLocation = Path.Combine(AppContext.BaseDirectory, $"{RunName}.typhon");
-        var result = SpaceBattleHost.Run(
+        using var cancellation = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            cancellation.Cancel();
+        };
+
+        using var simulation = SpaceBattleHost.Start(
             SimulationDefinition.Default,
             databaseLocation,
-            CancellationToken.None,
+            cancellation.Token,
             new ConsoleObservationSink());
 
-        if (result.StartupAction == SimulationStartupAction.Resumed)
+        if (simulation.StartupResult.StartupAction == SimulationStartupAction.Resumed)
         {
-            Console.WriteLine($"恢复运行 {RunName}，当前存活飞船数 {result.ShipCount:N0}。");
+            Console.WriteLine($"恢复运行 {RunName}，当前存活飞船数 {simulation.StartupResult.ShipCount:N0}。");
         }
+
+        Console.WriteLine("模拟运行中。按 Ctrl+C 安全停止。");
+        cancellation.Token.WaitHandle.WaitOne();
 
         return 0;
     }
