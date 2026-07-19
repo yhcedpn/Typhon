@@ -12,7 +12,7 @@ internal static class DeterministicRandom
         ulong purpose,
         float worldSize)
     {
-        var value = Mix(seed ^ Mix(entityId) ^ Mix(decisionOrdinal) ^ Mix(purpose));
+        var value = Value(seed, entityId, decisionOrdinal, purpose);
         var unit = (value >> 40) * UnitFloatScale;
         return unit * worldSize;
     }
@@ -23,8 +23,32 @@ internal static class DeterministicRandom
         ulong decisionOrdinal,
         ulong purpose)
     {
-        var value = Mix(seed ^ Mix(entityId) ^ Mix(decisionOrdinal) ^ Mix(purpose));
+        var value = Value(seed, entityId, decisionOrdinal, purpose);
         return (value >> 40) * UnitFloatScale;
+    }
+
+    public static int UniformIndex(
+        ulong seed,
+        ulong entityId,
+        ulong decisionOrdinal,
+        ulong purpose,
+        int exclusiveUpperBound)
+    {
+        if (exclusiveUpperBound <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(exclusiveUpperBound));
+        }
+
+        var range = (ulong)exclusiveUpperBound;
+        var rejectionThreshold = unchecked(0UL - range) % range;
+        for (ulong attempt = 0; ; attempt++)
+        {
+            var value = Value(seed, entityId, decisionOrdinal, unchecked(purpose + attempt));
+            if (value >= rejectionThreshold)
+            {
+                return (int)(value % range);
+            }
+        }
     }
 
     public static MotionSnapshot UnitDirection(
@@ -43,6 +67,12 @@ internal static class DeterministicRandom
             z,
             0f);
     }
+
+    private static ulong Value(
+        ulong seed,
+        ulong entityId,
+        ulong decisionOrdinal,
+        ulong purpose) => Mix(seed ^ Mix(entityId) ^ Mix(decisionOrdinal) ^ Mix(purpose));
 
     private static ulong Mix(ulong value)
     {

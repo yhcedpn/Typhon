@@ -109,7 +109,7 @@ public sealed class SpaceBattleSimulation : IDisposable
         dag.Add(new MovementSystem(state));
         dag.Add(new TargetingSystem());
         dag.Add(new CombatSystem());
-        dag.Add(new ResolutionSystem());
+        dag.Add(new ResolutionSystem(state));
         dag.Add(new OutputSystem(state));
     }
 }
@@ -228,48 +228,212 @@ internal sealed class StateSystem : CallbackSystem
 
 internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSystem
 {
-    private const ulong WanderingSpeedPurpose = 4;
-    private const ulong WanderingAzimuthPurpose = 5;
-    private const ulong WanderingElevationPurpose = 6;
-
     protected override void Configure(SystemBuilder builder) => builder
         .Name("Steering")
         .After("State")
         .Phase(SpaceBattlePhases.Steering)
         .ReadsFresh<BehaviorComponent>()
+        .Reads<PositionComponent>()
         .Writes<BehaviorComponent>()
+        .Writes<TrackingComponent>()
         .Writes<MotionComponent>();
 
     protected override void Execute(TickContext context)
     {
-        foreach (var shipId in context.Transaction.Query<Ship>().Execute())
+        var shipIds = context.Transaction.Query<Ship>().Execute();
+        List<TrackingStart> trackingStarts = null;
+
+        foreach (var shipId in shipIds)
         {
             var ship = context.Transaction.OpenMut(shipId);
             ref var behavior = ref ship.Write(Ship.Behavior);
-            if ((BehaviorMode)behavior.Mode != BehaviorMode.Wandering || behavior.DecisionOrdinal != 1)
+            ref var tracking = ref ship.Write(Ship.Tracking);
+            var shipIdForRandom = PackShipId(shipId);
+
+            switch ((BehaviorMode)behavior.Mode)
             {
+                case BehaviorMode.Wandering:
+                    ProcessWandering(
+                        state.Definition,
+                        shipId,
+                        shipIdForRandom,
+                        ref behavior,
+                        ref tracking,
+                        ref ship.Write(Ship.Motion),
+                        ref trackingStarts);
+                    break;
+                case BehaviorMode.Tracking:
+                    ProcessTracking(
+                        context,
+                        state.Definition,
+                        ship,
+                        shipIdForRandom,
+                        ref behavior,
+                        ref tracking,
+                        ref ship.Write(Ship.Motion));
+                    break;
+            }
+        }
+
+        if (trackingStarts is not null)
+        {
+            StartTracking(context, state.Definition, shipIds, trackingStarts);
+        }
+    }
+
+    private static void ProcessWandering(
+        SimulationDefinition definition,
+        EntityId shipId,
+        ulong shipIdForRandom,
+        ref BehaviorComponent behavior,
+        ref TrackingComponent tracking,
+        ref MotionComponent motion,
+        ref List<TrackingStart> trackingStarts)
+    {
+        if (behavior.DecisionOrdinal == 1 && behavior.ModeTicksRemaining == 0)
+        {
+            StartWandering(definition, shipIdForRandom, ref behavior, ref tracking, ref motion);
+            return;
+        }
+
+        if (behavior.ModeTicksRemaining > 0)
+        {
+            behavior.ModeTicksRemaining--;
+            return;
+        }
+
+        var decisionOrdinal = behavior.DecisionOrdinal;
+        switch (BehaviorRules.DecideWandering(definition.Seed, shipIdForRandom, decisionOrdinal))
+        {
+            case WanderingDecision.ContinueWandering:
+                StartWandering(definition, shipIdForRandom, ref behavior, ref tracking, ref motion);
+                break;
+            case WanderingDecision.Track:
+                behavior.Mode = (byte)BehaviorMode.Tracking;
+                behavior.DecisionOrdinal++;
+                trackingStarts ??= new List<TrackingStart>();
+                trackingStarts.Add(new TrackingStart(shipId, shipIdForRandom, decisionOrdinal));
+                break;
+            case WanderingDecision.Combat:
+                behavior.Mode = (byte)BehaviorMode.Combat;
+                behavior.DecisionOrdinal++;
+                break;
+            default:
+                throw new InvalidOperationException("未知的游荡决策。");
+        }
+    }
+
+    private static void ProcessTracking(
+        TickContext context,
+        SimulationDefinition definition,
+        EntityRef ship,
+        ulong shipIdForRandom,
+        ref BehaviorComponent behavior,
+        ref TrackingComponent tracking,
+        ref MotionComponent motion)
+    {
+        if (tracking.Target.IsNull ||
+            !context.Transaction.TryOpen(tracking.Target, out var target) ||
+            tracking.TrackingTicksRemaining == 0)
+        {
+            StartWandering(
+                definition,
+                shipIdForRandom,
+                ref behavior,
+                ref tracking,
+                ref motion);
+            return;
+        }
+
+        ref readonly var position = ref ship.Read(Ship.Position);
+        ref readonly var targetPosition = ref target.Read(Ship.Position);
+        var nextMotion = BehaviorRules.CreateTrackingMotion(
+            new PositionSnapshot(position.X, position.Y, position.Z),
+            new PositionSnapshot(targetPosition.X, targetPosition.Y, targetPosition.Z),
+            new MotionSnapshot(motion.DirectionX, motion.DirectionY, motion.DirectionZ, motion.Speed));
+        SetMotion(ref motion, nextMotion);
+        tracking.TrackingTicksRemaining--;
+    }
+
+    private static void StartTracking(
+        TickContext context,
+        SimulationDefinition definition,
+        IEnumerable<EntityId> shipIds,
+        IReadOnlyList<TrackingStart> trackingStarts)
+    {
+        var roster = shipIds.OrderBy(static id => id.EntityKey).ToArray();
+        var rosterIndexes = new Dictionary<long, int>(roster.Length);
+        for (var index = 0; index < roster.Length; index++)
+        {
+            rosterIndexes.Add(roster[index].EntityKey, index);
+        }
+
+        foreach (var trackingStart in trackingStarts)
+        {
+            var ship = context.Transaction.OpenMut(trackingStart.ShipId);
+            ref var behavior = ref ship.Write(Ship.Behavior);
+            ref var tracking = ref ship.Write(Ship.Tracking);
+            ref var motion = ref ship.Write(Ship.Motion);
+            var sourceIndex = rosterIndexes[trackingStart.ShipId.EntityKey];
+            var targetIndex = BehaviorRules.SelectTrackingTargetIndex(
+                definition.Seed,
+                trackingStart.ShipIdForRandom,
+                trackingStart.DecisionOrdinal,
+                roster.Length,
+                sourceIndex);
+            if (targetIndex < 0)
+            {
+                StartWandering(
+                    definition,
+                    trackingStart.ShipIdForRandom,
+                    ref behavior,
+                    ref tracking,
+                    ref motion);
                 continue;
             }
 
-            var packedShipId = ((ulong)shipId.EntityKey << 12) | shipId.ArchetypeId;
-            var direction = DeterministicRandom.UnitDirection(
-                state.Definition.Seed,
-                packedShipId,
-                behavior.DecisionOrdinal,
-                WanderingAzimuthPurpose,
-                WanderingElevationPurpose);
-            ref var motion = ref ship.Write(Ship.Motion);
-            motion.DirectionX = direction.DirectionX;
-            motion.DirectionY = direction.DirectionY;
-            motion.DirectionZ = direction.DirectionZ;
-            motion.Speed = DeterministicRandom.UnitInterval(
-                state.Definition.Seed,
-                packedShipId,
-                behavior.DecisionOrdinal,
-                WanderingSpeedPurpose) * SimulationDefinition.MaximumWanderingSpeed;
-            behavior.DecisionOrdinal++;
+            var target = context.Transaction.Open(roster[targetIndex]);
+            ref readonly var position = ref ship.Read(Ship.Position);
+            ref readonly var targetPosition = ref target.Read(Ship.Position);
+            tracking.Target = roster[targetIndex];
+            tracking.TrackingTicksRemaining = BehaviorRules.TrackingDurationTicks;
+            SetMotion(
+                ref motion,
+                BehaviorRules.CreateTrackingMotion(
+                    new PositionSnapshot(position.X, position.Y, position.Z),
+                    new PositionSnapshot(targetPosition.X, targetPosition.Y, targetPosition.Z),
+                    new MotionSnapshot(motion.DirectionX, motion.DirectionY, motion.DirectionZ, motion.Speed)));
         }
     }
+
+    internal static void StartWandering(
+        SimulationDefinition definition,
+        ulong shipIdForRandom,
+        ref BehaviorComponent behavior,
+        ref TrackingComponent tracking,
+        ref MotionComponent motion)
+    {
+        behavior.Mode = (byte)BehaviorMode.Wandering;
+        behavior.ModeTicksRemaining = BehaviorRules.WanderingDecisionIntervalTicks;
+        tracking.Target = EntityLink<Ship>.Null;
+        tracking.TrackingTicksRemaining = 0;
+        SetMotion(
+            ref motion,
+            BehaviorRules.CreateWanderingMotion(definition.Seed, shipIdForRandom, behavior.DecisionOrdinal));
+        behavior.DecisionOrdinal++;
+    }
+
+    private static void SetMotion(ref MotionComponent motion, MotionSnapshot value)
+    {
+        motion.DirectionX = value.DirectionX;
+        motion.DirectionY = value.DirectionY;
+        motion.DirectionZ = value.DirectionZ;
+        motion.Speed = value.Speed;
+    }
+
+    internal static ulong PackShipId(EntityId shipId) => ((ulong)shipId.EntityKey << 12) | shipId.ArchetypeId;
+
+    private readonly record struct TrackingStart(EntityId ShipId, ulong ShipIdForRandom, ulong DecisionOrdinal);
 }
 
 internal sealed class MovementSystem(SimulationRuntimeState state) : CallbackSystem
@@ -345,15 +509,45 @@ internal sealed class CombatSystem : CallbackSystem
     }
 }
 
-internal sealed class ResolutionSystem : CallbackSystem
+internal sealed class ResolutionSystem(SimulationRuntimeState state) : CallbackSystem
 {
     protected override void Configure(SystemBuilder builder) => builder
         .Name("Resolution")
         .After("Combat")
-        .Phase(SpaceBattlePhases.Resolution);
+        .Phase(SpaceBattlePhases.Resolution)
+        .Writes<BehaviorComponent>()
+        .Writes<TrackingComponent>()
+        .Writes<MotionComponent>();
 
     protected override void Execute(TickContext context)
     {
+        foreach (var shipId in context.Transaction.Query<Ship>().Execute())
+        {
+            if (!context.Transaction.IsAlive(shipId))
+            {
+                continue;
+            }
+
+            var ship = context.Transaction.OpenMut(shipId);
+            ref var behavior = ref ship.Write(Ship.Behavior);
+            if ((BehaviorMode)behavior.Mode != BehaviorMode.Tracking)
+            {
+                continue;
+            }
+
+            ref var tracking = ref ship.Write(Ship.Tracking);
+            if (!tracking.Target.IsNull && context.Transaction.IsAlive(tracking.Target))
+            {
+                continue;
+            }
+
+            SteeringSystem.StartWandering(
+                state.Definition,
+                SteeringSystem.PackShipId(shipId),
+                ref behavior,
+                ref tracking,
+                ref ship.Write(Ship.Motion));
+        }
     }
 }
 

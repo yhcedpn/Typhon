@@ -124,9 +124,38 @@ public sealed class RuntimeProgressionTests
         });
     }
 
-    private static SimulationDefinition CreateDefinition(ushort stagingTicks) => new(
+    [Test]
+    public void Start_AfterOneWanderingInterval_BeginsDeterministicGlobalTracking()
+    {
+        var definition = CreateDefinition(stagingTicks: 0, shipCount: 16);
+        var databaseLocation = Path.Combine(_temporaryDirectory, "tracking.typhon");
+
+        using var simulation = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+
+        Assert.That(
+            simulation.WaitForCompletedTicks(252, TimeSpan.FromSeconds(15)),
+            Is.True);
+
+        var trackingShips = simulation.GetSnapshot().Ships
+            .Where(static ship => ship.Mode == BehaviorMode.Tracking)
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(trackingShips, Is.Not.Empty);
+            Assert.That(trackingShips, Has.All.Matches<ShipSnapshot>(
+                ship => !ship.TrackingTargetIsNull &&
+                    ship.Motion.Speed == BehaviorRules.TrackingSpeed));
+        });
+    }
+
+    private static SimulationDefinition CreateDefinition(ushort stagingTicks, int shipCount = 4) => new(
         runName: "runtime-test",
-        shipCount: 4,
+        shipCount,
         seed: SimulationDefinition.DefaultSeed,
         rulesetVersion: 1,
         worldSize: 1_000f,
