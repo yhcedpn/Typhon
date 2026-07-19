@@ -28,6 +28,21 @@ public sealed class SpaceBattleSimulation : IDisposable
 
     public float SimulationDeltaSeconds => SimulationDefinition.FixedSimulationDeltaSeconds;
 
+    public SpaceBattleRuntimeConfiguration RuntimeConfiguration => new(
+        SpaceBattleProductionSettings.ResourceEnvelope.PageCacheSizeBytes,
+        SpaceBattleProductionSettings.ResourceEnvelope.MemoryBudgetBytes,
+        _runtime.Options.WorkerCount,
+        _runtime.Scheduler.WorkerCount,
+        _runtime.Options.Overload.MinTickRateHz,
+        _runtime.Options.Overload.QueueGrowthTicks,
+        _runtime.CurrentOverloadLevel,
+        _runtime.UserSystems.Select(static system => new SpaceBattleSystemConfiguration(
+            system.Name,
+            system.Priority,
+            system.TickDivisor,
+            system.ThrottledTickDivisor,
+            system.CanShed)).ToArray());
+
     public IReadOnlyList<string> SystemNames => _runtime.UserSystems.Select(static system => system.Name).ToArray();
 
     public IReadOnlyList<string> SystemPhases => _runtime.UserSystems.Select(static system => system.Phase.Name).ToArray();
@@ -69,7 +84,16 @@ public sealed class SpaceBattleSimulation : IDisposable
             runtime = TyphonRuntime.Create(
                 engine,
                 schedule => ConfigureRuntime(schedule, state),
-                new RuntimeOptions { BaseTickRate = SimulationDefinition.FixedTickRate });
+                new RuntimeOptions
+                {
+                    BaseTickRate = SimulationDefinition.FixedTickRate,
+                    WorkerCount = SpaceBattleProductionSettings.AutomaticWorkerCount,
+                    Overload = new OverloadOptions
+                    {
+                        MinTickRateHz = SimulationDefinition.FixedTickRate,
+                        QueueGrowthTicks = SpaceBattleProductionSettings.DisabledQueueGrowthEscalationTicks,
+                    },
+                });
             runtime.Start();
             return new SpaceBattleSimulation(engine, runtime, state, startupResult);
         }
@@ -123,6 +147,15 @@ internal static class SpaceBattlePhases
     public static readonly Phase Combat = new("Combat");
     public static readonly Phase Resolution = new("Resolution");
     public static readonly Phase Output = new("Output");
+}
+
+internal static class SpaceBattleSystemPolicies
+{
+    public static SystemBuilder Apply(SystemBuilder builder) => builder
+        .Priority(SystemPriority.Critical)
+        .TickDivisor(1)
+        .ThrottledTickDivisor(1)
+        .CanShed(false);
 }
 
 internal sealed class SimulationRuntimeState
@@ -198,7 +231,7 @@ internal sealed class SimulationRuntimeState
 
 internal sealed class StateSystem : CallbackSystem
 {
-    protected override void Configure(SystemBuilder builder) => builder
+    protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("State")
         .Phase(SpaceBattlePhases.State)
         .Writes<BehaviorComponent>();
@@ -228,7 +261,7 @@ internal sealed class StateSystem : CallbackSystem
 
 internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSystem
 {
-    protected override void Configure(SystemBuilder builder) => builder
+    protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("Steering")
         .After("State")
         .Phase(SpaceBattlePhases.Steering)
@@ -438,7 +471,7 @@ internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSys
 
 internal sealed class MovementSystem(SimulationRuntimeState state) : CallbackSystem
 {
-    protected override void Configure(SystemBuilder builder) => builder
+    protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("Movement")
         .After("Steering")
         .Phase(SpaceBattlePhases.Movement)
@@ -487,7 +520,7 @@ internal sealed class MovementSystem(SimulationRuntimeState state) : CallbackSys
 
 internal sealed class TargetingSystem : CallbackSystem
 {
-    protected override void Configure(SystemBuilder builder) => builder
+    protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("Targeting")
         .After("Movement")
         .Phase(SpaceBattlePhases.Targeting);
@@ -499,7 +532,7 @@ internal sealed class TargetingSystem : CallbackSystem
 
 internal sealed class CombatSystem : CallbackSystem
 {
-    protected override void Configure(SystemBuilder builder) => builder
+    protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("Combat")
         .After("Targeting")
         .Phase(SpaceBattlePhases.Combat);
@@ -511,7 +544,7 @@ internal sealed class CombatSystem : CallbackSystem
 
 internal sealed class ResolutionSystem(SimulationRuntimeState state) : CallbackSystem
 {
-    protected override void Configure(SystemBuilder builder) => builder
+    protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("Resolution")
         .After("Combat")
         .Phase(SpaceBattlePhases.Resolution)
@@ -553,7 +586,7 @@ internal sealed class ResolutionSystem(SimulationRuntimeState state) : CallbackS
 
 internal sealed class OutputSystem(SimulationRuntimeState state) : CallbackSystem
 {
-    protected override void Configure(SystemBuilder builder) => builder
+    protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("Output")
         .After("Resolution")
         .Phase(SpaceBattlePhases.Output)

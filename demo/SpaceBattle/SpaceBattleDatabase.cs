@@ -11,8 +11,10 @@ public static class SpaceBattleDatabase
     {
         ArgumentNullException.ThrowIfNull(definition);
         ArgumentException.ThrowIfNullOrWhiteSpace(databaseLocation);
+        SpaceBattleProductionSettings.ResourceEnvelope.Validate();
 
         return DatabaseEngine.Open(databaseLocation, options => options
+            .PageCacheSize(SpaceBattleProductionSettings.ResourceEnvelope.PageCacheSizeBytes)
             .Register<SimulationRunComponent>()
             .Register<SimulationRunStateComponent>()
             .Register<PositionComponent>()
