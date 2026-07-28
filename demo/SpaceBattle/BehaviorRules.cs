@@ -1,3 +1,5 @@
+using Typhon.Engine;
+
 namespace SpaceBattle;
 
 public enum WanderingDecision : byte
@@ -11,13 +13,19 @@ public static class BehaviorRules
 {
     public const ushort WanderingDecisionIntervalTicks = 250;
     public const ushort TrackingDurationTicks = 250;
+    public const ushort CombatAcquisitionDurationTicks = 250;
+    public const ushort LockAcquisitionDurationTicks = 50;
     public const float TrackingSpeed = SimulationDefinition.BaseMaximumSpeed;
+    public const float LockRange = 300f;
+    public const int MaximumLockCandidatesPerAttempt = 64;
+    public const int MaximumTargetLocksPerShip = 1;
 
     private const ulong WanderingDecisionPurpose = 7;
     private const ulong TrackingTargetPurpose = 8;
     private const ulong WanderingSpeedPurpose = 4;
     private const ulong WanderingAzimuthPurpose = 5;
     private const ulong WanderingElevationPurpose = 6;
+    private const ulong LockTargetCandidatePurpose = 9;
 
     public static WanderingDecision DecideWandering(
         ulong seed,
@@ -60,6 +68,53 @@ public static class BehaviorRules
             return -1;
         }
 
+        return SelectOtherRosterIndex(
+            seed,
+            shipId,
+            decisionOrdinal,
+            rosterCount,
+            sourceIndex,
+            TrackingTargetPurpose);
+    }
+
+    public static int SelectLockTargetCandidateIndex(
+        ulong seed,
+        ulong shipId,
+        ulong decisionOrdinal,
+        int rosterCount,
+        int sourceIndex,
+        int candidateOrdinal)
+    {
+        if (rosterCount < 2)
+        {
+            return -1;
+        }
+
+        if (candidateOrdinal < 0 || candidateOrdinal >= MaximumLockCandidatesPerAttempt)
+        {
+            throw new ArgumentOutOfRangeException(nameof(candidateOrdinal));
+        }
+
+        return SelectOtherRosterIndex(
+            seed,
+            shipId,
+            decisionOrdinal,
+            rosterCount,
+            sourceIndex,
+            LockTargetCandidatePurpose + (ulong)candidateOrdinal);
+    }
+
+    public static ulong PackShipId(EntityId shipId) =>
+        ((ulong)shipId.EntityKey << 12) | shipId.ArchetypeId;
+
+    private static int SelectOtherRosterIndex(
+        ulong seed,
+        ulong shipId,
+        ulong decisionOrdinal,
+        int rosterCount,
+        int sourceIndex,
+        ulong purpose)
+    {
         if (sourceIndex < 0 || sourceIndex >= rosterCount)
         {
             throw new ArgumentOutOfRangeException(nameof(sourceIndex));
@@ -69,7 +124,7 @@ public static class BehaviorRules
             seed,
             shipId,
             decisionOrdinal,
-            TrackingTargetPurpose,
+            purpose,
             rosterCount - 1);
         return selected < sourceIndex ? selected : selected + 1;
     }

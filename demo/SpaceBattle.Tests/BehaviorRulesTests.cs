@@ -79,6 +79,44 @@ public sealed class BehaviorRulesTests
     }
 
     [Test]
+    public void SelectLockTargetCandidateIndex_IsRepeatableAndNeverReturnsTheSource()
+    {
+        const int rosterCount = 97;
+        const int sourceIndex = 42;
+
+        var selected = BehaviorRules.SelectLockTargetCandidateIndex(
+            SimulationDefinition.DefaultSeed,
+            shipId: 0xBBAA,
+            decisionOrdinal: 42,
+            rosterCount,
+            sourceIndex,
+            candidateOrdinal: BehaviorRules.MaximumLockCandidatesPerAttempt - 1);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(selected, Is.InRange(0, rosterCount - 1));
+            Assert.That(selected, Is.Not.EqualTo(sourceIndex));
+            Assert.That(
+                BehaviorRules.SelectLockTargetCandidateIndex(
+                    SimulationDefinition.DefaultSeed,
+                    0xBBAA,
+                    42,
+                    rosterCount,
+                    sourceIndex,
+                    BehaviorRules.MaximumLockCandidatesPerAttempt - 1),
+                Is.EqualTo(selected));
+            Assert.That(() => BehaviorRules.SelectLockTargetCandidateIndex(
+                    SimulationDefinition.DefaultSeed,
+                    0xBBAA,
+                    42,
+                    rosterCount,
+                    sourceIndex,
+                    BehaviorRules.MaximumLockCandidatesPerAttempt),
+                Throws.TypeOf<ArgumentOutOfRangeException>());
+        });
+    }
+
+    [Test]
     public void CreateTrackingMotion_AimsAtTheTargetAtFullBaseSpeed()
     {
         var motion = BehaviorRules.CreateTrackingMotion(

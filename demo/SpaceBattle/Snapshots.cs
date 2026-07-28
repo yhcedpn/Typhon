@@ -23,6 +23,13 @@ public enum BehaviorMode : byte
     Escaping = 6,
 }
 
+public enum TargetLockStatus : byte
+{
+    Acquiring = 1,
+    Locked = 2,
+    Releasing = 3,
+}
+
 public readonly record struct PositionSnapshot(float X, float Y, float Z);
 
 public readonly record struct SpatialBoundsSnapshot(
@@ -60,10 +67,18 @@ public sealed record ShipSnapshot(
     bool WeaponEnabled,
     bool AfterburnerEnabled);
 
+public sealed record TargetLockSnapshot(
+    long EntityKey,
+    long OwnerEntityKey,
+    long TargetEntityKey,
+    TargetLockStatus Status,
+    ushort TicksRemaining);
+
 public sealed record InitialWorldSnapshot(
     int RunCount,
     SimulationRunSnapshot Run,
-    IReadOnlyList<ShipSnapshot> Ships);
+    IReadOnlyList<ShipSnapshot> Ships,
+    IReadOnlyList<TargetLockSnapshot> TargetLocks);
 
 public sealed record SpaceBattleRunResult(
     int ShipCount,

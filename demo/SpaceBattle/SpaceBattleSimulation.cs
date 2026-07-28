@@ -131,7 +131,7 @@ public sealed class SpaceBattleSimulation : IDisposable
         dag.Add(new StateSystem());
         dag.Add(new SteeringSystem(state));
         dag.Add(new MovementSystem(state));
-        dag.Add(new TargetingSystem());
+        dag.Add(new TargetingSystem(state));
         dag.Add(new CombatSystem());
         dag.Add(new ResolutionSystem(state));
         dag.Add(new OutputSystem(state));
@@ -156,6 +156,24 @@ internal static class SpaceBattleSystemPolicies
         .TickDivisor(1)
         .ThrottledTickDivisor(1)
         .CanShed(false);
+}
+
+internal static class ShipRoster
+{
+    public static EntityId[] Ordered(IEnumerable<EntityId> shipIds) => shipIds
+        .OrderBy(static id => id.EntityKey)
+        .ToArray();
+
+    public static Dictionary<long, int> IndexByEntityKey(IReadOnlyList<EntityId> roster)
+    {
+        var indexes = new Dictionary<long, int>(roster.Count);
+        for (var index = 0; index < roster.Count; index++)
+        {
+            indexes.Add(roster[index].EntityKey, index);
+        }
+
+        return indexes;
+    }
 }
 
 internal sealed class SimulationRuntimeState
@@ -281,7 +299,7 @@ internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSys
             var ship = context.Transaction.OpenMut(shipId);
             ref var behavior = ref ship.Write(Ship.Behavior);
             ref var tracking = ref ship.Write(Ship.Tracking);
-            var shipIdForRandom = PackShipId(shipId);
+            var shipIdForRandom = BehaviorRules.PackShipId(shipId);
 
             switch ((BehaviorMode)behavior.Mode)
             {
@@ -349,6 +367,7 @@ internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSys
                 break;
             case WanderingDecision.Combat:
                 behavior.Mode = (byte)BehaviorMode.Combat;
+                behavior.ModeTicksRemaining = BehaviorRules.CombatAcquisitionDurationTicks + 1;
                 behavior.DecisionOrdinal++;
                 break;
             default:
@@ -394,12 +413,8 @@ internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSys
         IEnumerable<EntityId> shipIds,
         IReadOnlyList<TrackingStart> trackingStarts)
     {
-        var roster = shipIds.OrderBy(static id => id.EntityKey).ToArray();
-        var rosterIndexes = new Dictionary<long, int>(roster.Length);
-        for (var index = 0; index < roster.Length; index++)
-        {
-            rosterIndexes.Add(roster[index].EntityKey, index);
-        }
+        var roster = ShipRoster.Ordered(shipIds);
+        var rosterIndexes = ShipRoster.IndexByEntityKey(roster);
 
         foreach (var trackingStart in trackingStarts)
         {
@@ -464,8 +479,6 @@ internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSys
         motion.Speed = value.Speed;
     }
 
-    internal static ulong PackShipId(EntityId shipId) => ((ulong)shipId.EntityKey << 12) | shipId.ArchetypeId;
-
     private readonly record struct TrackingStart(EntityId ShipId, ulong ShipIdForRandom, ulong DecisionOrdinal);
 }
 
@@ -518,15 +531,166 @@ internal sealed class MovementSystem(SimulationRuntimeState state) : CallbackSys
     }
 }
 
-internal sealed class TargetingSystem : CallbackSystem
+internal sealed class TargetingSystem(SimulationRuntimeState state) : CallbackSystem
 {
     protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("Targeting")
         .After("Movement")
-        .Phase(SpaceBattlePhases.Targeting);
+        .Phase(SpaceBattlePhases.Targeting)
+        .Reads<PositionComponent>()
+        .ReadsFresh<BehaviorComponent>()
+        .Reads<TargetLockComponent>()
+        .Writes<BehaviorComponent>()
+        .Writes<TargetLockComponent>();
 
     protected override void Execute(TickContext context)
     {
+        var activeLockCounts = AdvanceExistingLocks(context);
+        var roster = ShipRoster.Ordered(context.Transaction.Query<Ship>().Execute());
+        var rosterIndexes = ShipRoster.IndexByEntityKey(roster);
+
+        foreach (var shipId in roster)
+        {
+            if (activeLockCounts.GetValueOrDefault(shipId.EntityKey) >=
+                BehaviorRules.MaximumTargetLocksPerShip)
+            {
+                continue;
+            }
+
+            var ship = context.Transaction.OpenMut(shipId);
+            ref var behavior = ref ship.Write(Ship.Behavior);
+            if ((BehaviorMode)behavior.Mode != BehaviorMode.Combat)
+            {
+                continue;
+            }
+
+            if (behavior.ModeTicksRemaining > 0 && --behavior.ModeTicksRemaining == 0)
+            {
+                ref var tracking = ref ship.Write(Ship.Tracking);
+                ref var motion = ref ship.Write(Ship.Motion);
+                SteeringSystem.StartWandering(
+                    state.Definition,
+                    BehaviorRules.PackShipId(shipId),
+                    ref behavior,
+                    ref tracking,
+                    ref motion);
+                continue;
+            }
+
+            var decisionOrdinal = behavior.DecisionOrdinal++;
+            var targetId = FindInRangeCandidate(
+                context,
+                roster,
+                rosterIndexes[shipId.EntityKey],
+                shipId,
+                state.Definition.Seed,
+                decisionOrdinal);
+            if (targetId.IsNull)
+            {
+                continue;
+            }
+
+            var targetLock = new TargetLockComponent
+            {
+                Owner = shipId,
+                Target = targetId,
+                TicksRemaining = BehaviorRules.LockAcquisitionDurationTicks,
+                Status = (byte)TargetLockStatus.Acquiring,
+            };
+            context.Transaction.Spawn<TargetLock>(TargetLock.Data.Set(in targetLock));
+            activeLockCounts[shipId.EntityKey] =
+                activeLockCounts.GetValueOrDefault(shipId.EntityKey) + 1;
+        }
+    }
+
+    private static Dictionary<long, int> AdvanceExistingLocks(TickContext context)
+    {
+        var activeLockCounts = new Dictionary<long, int>();
+        foreach (var targetLockId in context.Transaction.Query<TargetLock>().Execute())
+        {
+            var targetLockEntity = context.Transaction.OpenMut(targetLockId);
+            ref var targetLock = ref targetLockEntity.Write(TargetLock.Data);
+            var ownerId = (EntityId)targetLock.Owner;
+            var targetId = (EntityId)targetLock.Target;
+            if (!context.Transaction.TryOpen(ownerId, out var owner) ||
+                !context.Transaction.TryOpen(targetId, out var target))
+            {
+                context.Transaction.Destroy(targetLockId);
+                continue;
+            }
+
+            if (!IsWithinLockRange(owner, target))
+            {
+                if ((TargetLockStatus)targetLock.Status == TargetLockStatus.Locked)
+                {
+                    ref var ownerBehavior = ref context.Transaction.OpenMut(ownerId).Write(Ship.Behavior);
+                    if ((BehaviorMode)ownerBehavior.Mode == BehaviorMode.Combat)
+                    {
+                        ownerBehavior.ModeTicksRemaining = BehaviorRules.CombatAcquisitionDurationTicks + 1;
+                    }
+                }
+
+                context.Transaction.Destroy(targetLockId);
+                continue;
+            }
+
+            if ((TargetLockStatus)targetLock.Status == TargetLockStatus.Acquiring)
+            {
+                if (targetLock.TicksRemaining == 0)
+                {
+                    targetLock.Status = (byte)TargetLockStatus.Locked;
+                }
+                else
+                {
+                    targetLock.TicksRemaining--;
+                }
+            }
+
+            activeLockCounts[ownerId.EntityKey] = activeLockCounts.GetValueOrDefault(ownerId.EntityKey) + 1;
+        }
+
+        return activeLockCounts;
+    }
+
+    private static EntityId FindInRangeCandidate(
+        TickContext context,
+        IReadOnlyList<EntityId> roster,
+        int sourceIndex,
+        EntityId shipId,
+        ulong seed,
+        ulong decisionOrdinal)
+    {
+        var source = context.Transaction.Open(shipId);
+        for (var candidateOrdinal = 0;
+             candidateOrdinal < BehaviorRules.MaximumLockCandidatesPerAttempt;
+             candidateOrdinal++)
+        {
+            var candidateIndex = BehaviorRules.SelectLockTargetCandidateIndex(
+                seed,
+                BehaviorRules.PackShipId(shipId),
+                decisionOrdinal,
+                roster.Count,
+                sourceIndex,
+                candidateOrdinal);
+            var candidate = context.Transaction.Open(roster[candidateIndex]);
+            if (IsWithinLockRange(source, candidate))
+            {
+                return roster[candidateIndex];
+            }
+        }
+
+        return EntityId.Null;
+    }
+
+    private static bool IsWithinLockRange(EntityRef source, EntityRef target)
+    {
+        ref readonly var sourcePosition = ref source.Read(Ship.Position);
+        ref readonly var targetPosition = ref target.Read(Ship.Position);
+        var deltaX = targetPosition.X - sourcePosition.X;
+        var deltaY = targetPosition.Y - sourcePosition.Y;
+        var deltaZ = targetPosition.Z - sourcePosition.Z;
+        return (deltaX * deltaX) + (deltaY * deltaY) + (deltaZ * deltaZ)
+            <= BehaviorRules.LockRange * BehaviorRules.LockRange;
     }
 }
 
@@ -576,7 +740,7 @@ internal sealed class ResolutionSystem(SimulationRuntimeState state) : CallbackS
 
             SteeringSystem.StartWandering(
                 state.Definition,
-                SteeringSystem.PackShipId(shipId),
+                BehaviorRules.PackShipId(shipId),
                 ref behavior,
                 ref tracking,
                 ref ship.Write(Ship.Motion));

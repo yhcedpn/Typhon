@@ -25,8 +25,7 @@ public static class SpaceBattleDatabase
             .Register<TrackingComponent>()
             .Register<WeaponComponent>()
             .Register<AfterburnerComponent>()
-            .RegisterArchetype<SimulationRunEntity>()
-            .RegisterArchetype<Ship>()
+            .Register<TargetLockComponent>()
             .ConfigureSpatialGrid(new SpatialGridConfig(
                 Vector2.Zero,
                 new Vector2(definition.WorldSize, definition.WorldSize),

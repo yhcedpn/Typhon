@@ -88,3 +88,19 @@ public struct AfterburnerComponent
 {
     [Field] public ulong ActivatedTick;
 }
+
+[Component("SpaceBattle.TargetLock", 1, StorageMode = StorageMode.SingleVersion)]
+[StructLayout(LayoutKind.Sequential)]
+public struct TargetLockComponent
+{
+    [Field]
+    [Index(AllowMultiple = true)]
+    public EntityLink<Ship> Owner;
+
+    [Field]
+    [Index(AllowMultiple = true)]
+    public EntityLink<Ship> Target;
+
+    [Field] public ushort TicksRemaining;
+    [Field] public byte Status;
+}

@@ -315,7 +315,23 @@ public static class SpaceBattleHost
                 entity.IsEnabled(Ship.Afterburner)));
         }
 
-        return new InitialWorldSnapshot(runEntities.Count, runSnapshot, ships);
+        var targetLockEntities = transaction.Query<TargetLock>().Execute().OrderBy(static id => id.EntityKey);
+        var targetLocks = new List<TargetLockSnapshot>();
+        foreach (var entityId in targetLockEntities)
+        {
+            var entity = transaction.Open(entityId);
+            ref readonly var targetLock = ref entity.Read(TargetLock.Data);
+            var owner = (EntityId)targetLock.Owner;
+            var target = (EntityId)targetLock.Target;
+            targetLocks.Add(new TargetLockSnapshot(
+                entityId.EntityKey,
+                owner.EntityKey,
+                target.EntityKey,
+                (TargetLockStatus)targetLock.Status,
+                targetLock.TicksRemaining));
+        }
+
+        return new InitialWorldSnapshot(runEntities.Count, runSnapshot, ships, targetLocks);
     }
 
     private static PositionComponent CreateInitialPosition(
