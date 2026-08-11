@@ -219,15 +219,23 @@ public sealed class SpaceBattleSimulation : IDisposable
         SpaceBattleRunResult startupResult,
         ISpaceBattleObservationSink observationSink)
     {
-        EcsView<Ship> ships;
+        ShipMembershipViews shipViews = ShipMembershipViews.RebuildAndCreate(
+            engine,
+            runEntityId,
+            startupFenceTick: 0);
         uint aliveShipCount;
-        using (Transaction transaction = engine.CreateQuickTransaction())
+        try
         {
-            ships = transaction.Query<Ship>().ToView();
+            using Transaction transaction = engine.CreateQuickTransaction();
             aliveShipCount = checked((uint)transaction.Query<Ship>().Execute().Count);
         }
+        catch
+        {
+            shipViews.Dispose();
+            throw;
+        }
 
-        SimulationRuntimeState state = new(definition, runEntityId, completedTicks, aliveShipCount, ships);
+        SimulationRuntimeState state = new(definition, runEntityId, completedTicks, aliveShipCount, shipViews);
         using (Transaction transaction = engine.CreateQuickTransaction())
         {
             state.RebuildDerivedState(transaction, resetTickWorkset: true);
@@ -340,6 +348,7 @@ public sealed class SpaceBattleSimulation : IDisposable
     {
         var dag = schedule.PublicTrack.DeclareDag("SpaceBattle")
             .Phases(
+                SpaceBattlePhases.ShipViewRefresh,
                 SpaceBattlePhases.State,
                 SpaceBattlePhases.Steering,
                 SpaceBattlePhases.Movement,
@@ -350,12 +359,13 @@ public sealed class SpaceBattleSimulation : IDisposable
                 SpaceBattlePhases.Output);
         EventQueue<DamageIntent>[] damageIntentQueues = CreateDamageIntentQueues(dag);
         DamageResolutionState damageResolutionState = new();
+        dag.Add(new ShipViewRefreshSystem(state));
         dag.Add(new StateSystem(state));
         dag.Add(new SteeringSystem(state));
         dag.Add(new MovementSystem(state));
         dag.Add(new TargetLockCleanupSystem(state));
         dag.Add(new TargetingSystem(state));
-        dag.Add(new CombatSystem(state, state.Ships, damageIntentQueues, damageResolutionState));
+        dag.Add(new CombatSystem(state, state.CombatShips, damageIntentQueues, damageResolutionState));
         dag.Add(new DamageResolutionSystem(state, damageIntentQueues, damageResolutionState));
         dag.Add(new ResolutionSystem(state, damageResolutionState));
         dag.Add(new OutputSystem(state, damageResolutionState, observationPublisher));
@@ -388,6 +398,7 @@ public sealed class SpaceBattleSimulation : IDisposable
 
 internal static class SpaceBattlePhases
 {
+    public static readonly Phase ShipViewRefresh = new("ShipViewRefresh");
     public static readonly Phase State = new("State");
     public static readonly Phase Steering = new("Steering");
     public static readonly Phase Movement = new("Movement");
@@ -456,14 +467,14 @@ internal sealed class SimulationRuntimeState : IDisposable
         EntityId runEntityId,
         ulong completedTicks,
         uint aliveShipCount,
-        EcsView<Ship> ships)
+        ShipMembershipViews shipViews)
     {
         Definition = definition;
         RunEntityId = runEntityId;
         _completedTicks = completedTicks;
         _aliveShipCount = aliveShipCount;
         StartingCompletedTicks = completedTicks;
-        Ships = ships;
+        ShipViews = shipViews;
     }
 
     public SimulationDefinition Definition { get; }
@@ -472,7 +483,11 @@ internal sealed class SimulationRuntimeState : IDisposable
 
     public ulong StartingCompletedTicks { get; }
 
-    public EcsView<Ship> Ships { get; }
+    public ShipMembershipViews ShipViews { get; }
+
+    public EcsView<Ship> Ships => ShipViews.RuntimeShips;
+
+    public EcsView<Ship> CombatShips => ShipViews.CombatShips;
 
     public IReadOnlyList<EntityId> ShipRoster
     {
@@ -513,7 +528,7 @@ internal sealed class SimulationRuntimeState : IDisposable
 
     public void Dispose()
     {
-        Ships.Dispose();
+        ShipViews.Dispose();
         lock (_sync)
         {
             _shipRoster = [];
@@ -534,12 +549,19 @@ internal sealed class SimulationRuntimeState : IDisposable
             return SpaceBattleRuntimeDiagnosticsSnapshot.Create(
                 _completedTicks,
                 Ships.Count,
+                CombatShips.Count,
                 _shipRoster.Length,
                 _tickWorkset.Length,
                 _ownerLockIndex,
                 _targetLockIndex,
                 checked((int)_aliveShipCount),
                 _derivedActiveLockCount,
+                ShipViews.RuntimeRefreshCount,
+                ShipViews.CombatRefreshCount,
+                ShipViews.RuntimeAddedCount,
+                ShipViews.CombatAddedCount,
+                ShipViews.RuntimeRemovedCount,
+                ShipViews.CombatRemovedCount,
                 _consumerProcessingCounts);
         }
     }
@@ -547,7 +569,16 @@ internal sealed class SimulationRuntimeState : IDisposable
     public void RebuildDerivedState(Transaction transaction, bool resetTickWorkset)
     {
         ArgumentNullException.ThrowIfNull(transaction);
-        EntityId[] shipRoster = global::SpaceBattle.ShipRoster.Ordered(transaction.Query<Ship>().Execute());
+        List<EntityId> aliveShipIds = new(Ships.Count);
+        foreach (EntityId shipId in Ships.GetEntityEnumerator())
+        {
+            if (transaction.IsAlive(shipId))
+            {
+                aliveShipIds.Add(shipId);
+            }
+        }
+
+        EntityId[] shipRoster = global::SpaceBattle.ShipRoster.Ordered(aliveShipIds);
         Dictionary<long, int> ownerLockIndex = [];
         Dictionary<long, int> targetLockIndex = [];
         int activeLockCount = 0;
@@ -908,10 +939,22 @@ internal sealed class SimulationRuntimeState : IDisposable
     }
 }
 
+internal sealed class ShipViewRefreshSystem(SimulationRuntimeState state) : CallbackSystem
+{
+    protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
+        .Name("ShipViewRefresh")
+        .Phase(SpaceBattlePhases.ShipViewRefresh)
+        .ShouldRun(() => state.IsRunning)
+        .Reads<ShipRunMembershipComponent>();
+
+    protected override void Execute(TickContext context) => state.ShipViews.RefreshForRuntime(context.Transaction);
+}
+
 internal sealed class StateSystem(SimulationRuntimeState state) : CallbackSystem
 {
     protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("State")
+        .After("ShipViewRefresh")
         .Phase(SpaceBattlePhases.State)
         .ShouldRun(() => state.IsRunning)
         .Writes<BehaviorComponent>();

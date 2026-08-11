@@ -150,7 +150,7 @@ public static class SpaceBattleHost
             WinnerEntityKey = 0,
         };
         var pauseRunCheckpoint = default(PauseRunCheckpointComponent);
-        bulkLoad.Spawn<SimulationRunEntity>(
+        EntityId runEntityId = bulkLoad.Spawn<SimulationRunEntity>(
             SimulationRunEntity.Run.Set(in run),
             SimulationRunEntity.State.Set(in runState),
             SimulationRunEntity.PauseCheckpoint.Set(in pauseRunCheckpoint));
@@ -169,6 +169,7 @@ public static class SpaceBattleHost
             TrackingTicksRemaining = 0,
         };
         var pauseShipCheckpoint = default(PauseShipCheckpointComponent);
+        ShipRunMembershipComponent runMembership = new() { RunEntityKey = runEntityId.EntityKey };
 
         for (var index = 0; index < definition.ShipCount; index++)
         {
@@ -184,6 +185,7 @@ public static class SpaceBattleHost
                 Ship.Health.Set(in health),
                 Ship.Behavior.Set(in behavior),
                 Ship.Tracking.Set(in tracking),
+                Ship.RunMembership.Set(in runMembership),
                 Ship.PauseCheckpoint.Set(in pauseShipCheckpoint));
 
             var packedEntityId = ((ulong)entityId.EntityKey << 12) | entityId.ArchetypeId;

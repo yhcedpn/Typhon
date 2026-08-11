@@ -46,6 +46,7 @@ public sealed class RuntimeProgressionTests
             Assert.That(simulation.SimulationDeltaSeconds, Is.EqualTo(0.04f));
             Assert.That(simulation.SystemNames, Is.EqualTo(new[]
             {
+                "ShipViewRefresh",
                 "State",
                 "Steering",
                 "Movement",
@@ -58,6 +59,7 @@ public sealed class RuntimeProgressionTests
             }));
             Assert.That(simulation.SystemPhases, Is.EqualTo(new[]
             {
+                "ShipViewRefresh",
                 "State",
                 "Steering",
                 "Movement",

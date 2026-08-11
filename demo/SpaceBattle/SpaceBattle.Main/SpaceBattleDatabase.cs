@@ -25,6 +25,7 @@ public static class SpaceBattleDatabase
             .Register<TrackingComponent>()
             .Register<WeaponComponent>()
             .Register<AfterburnerComponent>()
+            .Register<ShipRunMembershipComponent>()
             .Register<TargetLockComponent>()
             .Register<PauseShipCheckpointComponent>()
             .Register<PauseTargetLockCheckpointComponent>()

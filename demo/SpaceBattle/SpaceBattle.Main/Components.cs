@@ -91,6 +91,15 @@ public struct AfterburnerComponent
     [Field] public ulong ActivatedTick;
 }
 
+[Component("SpaceBattle.ShipMembership", 1, StorageMode = StorageMode.Transient)]
+[StructLayout(LayoutKind.Sequential)]
+public struct ShipRunMembershipComponent
+{
+    [Field]
+    [Index(AllowMultiple = true)]
+    public long RunEntityKey;
+}
+
 [Component("SpaceBattle.TargetLock", 1, StorageMode = StorageMode.SingleVersion)]
 [StructLayout(LayoutKind.Sequential)]
 public struct TargetLockComponent

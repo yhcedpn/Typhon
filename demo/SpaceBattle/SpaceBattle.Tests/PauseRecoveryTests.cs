@@ -115,22 +115,30 @@ public sealed class PauseRecoveryTests
                    new RecordingObservationSink()))
         {
             Assert.That(simulation.WaitForCompletedTicks(1, TimeSpan.FromSeconds(5)), Is.True);
-            var runningDiagnostics = simulation.GetRuntimeDiagnostics();
-
-            Assert.Multiple(() =>
-            {
-                Assert.That(runningDiagnostics.ViewMembershipCount, Is.EqualTo(definition.ShipCount));
-                Assert.That(runningDiagnostics.ShipRosterCount, Is.EqualTo(definition.ShipCount));
-                Assert.That(runningDiagnostics.TickWorksetCount, Is.EqualTo(definition.ShipCount));
-                Assert.That(runningDiagnostics.DerivedAliveShipCount, Is.EqualTo(definition.ShipCount));
-                Assert.That(runningDiagnostics.DerivedActiveLockCount, Is.EqualTo(0));
-                Assert.That(runningDiagnostics.ConsumerProcessingCounts["State"], Is.EqualTo(definition.ShipCount));
-                Assert.That(runningDiagnostics.ConsumerProcessingCounts["Combat"], Is.EqualTo(definition.ShipCount));
-            });
-
             cancellation.Cancel();
             Assert.That(simulation.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
             pausedDiagnostics = simulation.GetRuntimeDiagnostics();
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(pausedDiagnostics.ViewMembershipCount, Is.EqualTo(definition.ShipCount));
+                Assert.That(pausedDiagnostics.CombatViewMembershipCount, Is.EqualTo(definition.ShipCount));
+                Assert.That(pausedDiagnostics.ShipRosterCount, Is.EqualTo(definition.ShipCount));
+                Assert.That(pausedDiagnostics.TickWorksetCount, Is.EqualTo(definition.ShipCount));
+                Assert.That(pausedDiagnostics.DerivedAliveShipCount, Is.EqualTo(definition.ShipCount));
+                Assert.That(pausedDiagnostics.DerivedActiveLockCount, Is.EqualTo(0));
+                Assert.That(pausedDiagnostics.ConsumerProcessingCounts["State"], Is.EqualTo(definition.ShipCount));
+                Assert.That(pausedDiagnostics.ConsumerProcessingCounts["Combat"], Is.EqualTo(definition.ShipCount));
+                Assert.That(pausedDiagnostics.RuntimeShipViewRefreshCount, Is.GreaterThan(0));
+                Assert.That(
+                    pausedDiagnostics.RuntimeShipViewRefreshCount,
+                    Is.EqualTo(checked((long)pausedDiagnostics.CompletedTicks)));
+                Assert.That(
+                    pausedDiagnostics.CombatShipViewRefreshCount,
+                    Is.EqualTo(pausedDiagnostics.RuntimeShipViewRefreshCount));
+                Assert.That(pausedDiagnostics.RuntimeShipViewAddedCount, Is.Zero);
+                Assert.That(pausedDiagnostics.CombatShipViewAddedCount, Is.Zero);
+            });
         }
 
         using var resumed = SpaceBattleHost.Start(
@@ -143,6 +151,7 @@ public sealed class PauseRecoveryTests
         Assert.Multiple(() =>
         {
             Assert.That(resumedDiagnostics.ViewMembershipCount, Is.EqualTo(pausedDiagnostics.ViewMembershipCount));
+            Assert.That(resumedDiagnostics.CombatViewMembershipCount, Is.EqualTo(pausedDiagnostics.CombatViewMembershipCount));
             Assert.That(resumedDiagnostics.ShipRosterCount, Is.EqualTo(pausedDiagnostics.ShipRosterCount));
             Assert.That(resumedDiagnostics.TickWorksetCount, Is.EqualTo(pausedDiagnostics.TickWorksetCount));
             Assert.That(resumedDiagnostics.DerivedAliveShipCount, Is.EqualTo(pausedDiagnostics.DerivedAliveShipCount));
@@ -151,17 +160,26 @@ public sealed class PauseRecoveryTests
 
         var nextTick = checked(pausedDiagnostics.CompletedTicks + 1);
         Assert.That(resumed.WaitForCompletedTicks(nextTick, TimeSpan.FromSeconds(5)), Is.True);
+        resumed.RequestPause();
+        Assert.That(resumed.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
         var afterResumeDiagnostics = resumed.GetRuntimeDiagnostics();
         Assert.Multiple(() =>
         {
             Assert.That(afterResumeDiagnostics.ViewMembershipCount, Is.EqualTo(definition.ShipCount));
+            Assert.That(afterResumeDiagnostics.CombatViewMembershipCount, Is.EqualTo(definition.ShipCount));
             Assert.That(afterResumeDiagnostics.ShipRosterCount, Is.EqualTo(definition.ShipCount));
             Assert.That(afterResumeDiagnostics.DerivedAliveShipCount, Is.EqualTo(definition.ShipCount));
             Assert.That(afterResumeDiagnostics.ConsumerProcessingCounts["State"], Is.EqualTo(definition.ShipCount));
+            Assert.That(afterResumeDiagnostics.ConsumerProcessingCounts["Combat"], Is.EqualTo(definition.ShipCount));
+            Assert.That(afterResumeDiagnostics.RuntimeShipViewAddedCount, Is.Zero);
+            Assert.That(afterResumeDiagnostics.CombatShipViewAddedCount, Is.Zero);
+            Assert.That(
+                afterResumeDiagnostics.RuntimeShipViewRefreshCount,
+                Is.EqualTo(checked((long)(afterResumeDiagnostics.CompletedTicks - pausedDiagnostics.CompletedTicks))));
+            Assert.That(
+                afterResumeDiagnostics.CombatShipViewRefreshCount,
+                Is.EqualTo(afterResumeDiagnostics.RuntimeShipViewRefreshCount));
         });
-
-        resumed.RequestPause();
-        Assert.That(resumed.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
     }
 
     [Test]

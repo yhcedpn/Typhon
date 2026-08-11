@@ -21,6 +21,7 @@ public sealed partial class Ship : Archetype<Ship>
     public static readonly Comp<TrackingComponent> Tracking = Register<TrackingComponent>();
     public static readonly Comp<WeaponComponent> Weapon = Register<WeaponComponent>();
     public static readonly Comp<AfterburnerComponent> Afterburner = Register<AfterburnerComponent>();
+    public static readonly Comp<ShipRunMembershipComponent> RunMembership = Register<ShipRunMembershipComponent>();
     public static readonly Comp<PauseShipCheckpointComponent> PauseCheckpoint = Register<PauseShipCheckpointComponent>();
 }
 
