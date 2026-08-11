@@ -52,6 +52,7 @@ public sealed class RuntimeProgressionTests
                 "TargetLockCleanup",
                 "Targeting",
                 "Combat",
+                "DamageResolution",
                 "Resolution",
                 "Output",
             }));
@@ -63,6 +64,7 @@ public sealed class RuntimeProgressionTests
                 "TargetLockCleanup",
                 "Targeting",
                 "Combat",
+                "Resolution",
                 "Resolution",
                 "Output",
             }));

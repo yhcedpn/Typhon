@@ -57,6 +57,20 @@ public sealed class ProductionConfigurationTests
     }
 
     [Test]
+    public void ValidateDamageIntentQueueCapacity_RejectsMoreShipsThanTheWorkerQueuesCanHold()
+    {
+        long unsupportedShipCount = SpaceBattleProductionSettings.MaximumSupportedShipCount + 1;
+
+        Assert.DoesNotThrow(() => SpaceBattleProductionSettings.ValidateDamageIntentQueueCapacity(
+            SimulationDefinition.Default.ShipCount));
+        if (unsupportedShipCount <= int.MaxValue)
+        {
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                SpaceBattleProductionSettings.ValidateDamageIntentQueueCapacity((int)unsupportedShipCount));
+        }
+    }
+
+    [Test]
     public void Start_UsesTheProductionEnvelopeAndNeverShedsSimulationWork()
     {
         string databaseLocation = Path.Combine(_temporaryDirectory, "production-settings.typhon");
@@ -85,6 +99,13 @@ public sealed class ProductionConfigurationTests
                 system.TickDivisor == 1 &&
                 system.ThrottledTickDivisor == 1 &&
                 !system.CanShed));
+            Assert.That(configuration.EventQueues,
+                Has.Count.EqualTo(configuration.EffectiveWorkerCount));
+            Assert.That(configuration.EventQueues.Select(static queue => queue.Name),
+                Is.EqualTo(Enumerable.Range(0, configuration.EffectiveWorkerCount)
+                    .Select(static workerId => $"DamageIntent-{workerId}")));
+            Assert.That(configuration.EventQueues.Select(static queue => queue.Capacity),
+                Has.All.EqualTo(BehaviorRules.DamageIntentQueueCapacity));
         });
     }
 

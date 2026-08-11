@@ -7,6 +7,12 @@ public static class SpaceBattleProductionSettings
     public const int AutomaticWorkerCount = -1;
     public const int DisabledQueueGrowthEscalationTicks = 0;
 
+    public static int EffectiveWorkerCount => AutomaticWorkerCount == -1
+        ? Math.Max(1, Environment.ProcessorCount - 4)
+        : AutomaticWorkerCount;
+
+    public static int MaximumSupportedShipCount => BehaviorRules.DamageIntentQueueCapacity;
+
     public static SpaceBattleResourceEnvelope ResourceEnvelope { get; } = new(
         PageCacheSizeBytes: 512UL * 1024 * 1024,
         MemoryBudgetBytes: 1024UL * 1024 * 1024);
@@ -15,6 +21,17 @@ public static class SpaceBattleProductionSettings
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(databaseLocation);
         return Path.ChangeExtension(databaseLocation, ".typhon-trace");
+    }
+
+    public static void ValidateDamageIntentQueueCapacity(int shipCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(shipCount);
+        if (shipCount > MaximumSupportedShipCount)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(shipCount),
+                $"飞船数量不能超过 {MaximumSupportedShipCount:N0}，否则单 worker DamageIntent 队列可能溢出。");
+        }
     }
 }
 
@@ -50,7 +67,8 @@ public sealed record SpaceBattleRuntimeConfiguration(
     int OverloadMinimumTickRateHz,
     int QueueGrowthEscalationTicks,
     OverloadLevel CurrentOverloadLevel,
-    IReadOnlyList<SpaceBattleSystemConfiguration> Systems);
+    IReadOnlyList<SpaceBattleSystemConfiguration> Systems,
+    IReadOnlyList<SpaceBattleEventQueueConfiguration> EventQueues);
 
 public sealed record SpaceBattleSystemConfiguration(
     string Name,
@@ -58,3 +76,7 @@ public sealed record SpaceBattleSystemConfiguration(
     int TickDivisor,
     int ThrottledTickDivisor,
     bool CanShed);
+
+public sealed record SpaceBattleEventQueueConfiguration(
+    string Name,
+    int Capacity);

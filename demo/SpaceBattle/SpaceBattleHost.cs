@@ -19,6 +19,7 @@ public static class SpaceBattleHost
         ArgumentNullException.ThrowIfNull(definition);
         ArgumentException.ThrowIfNullOrWhiteSpace(databaseLocation);
         ArgumentNullException.ThrowIfNull(observationSink);
+        SpaceBattleProductionSettings.ValidateDamageIntentQueueCapacity(definition.ShipCount);
         cancellationToken.ThrowIfCancellationRequested();
 
         var databaseAlreadyExists = Directory.Exists(databaseLocation) || File.Exists(databaseLocation);
@@ -43,6 +44,7 @@ public static class SpaceBattleHost
         ArgumentNullException.ThrowIfNull(definition);
         ArgumentException.ThrowIfNullOrWhiteSpace(databaseLocation);
         ArgumentNullException.ThrowIfNull(observationSink);
+        SpaceBattleProductionSettings.ValidateDamageIntentQueueCapacity(definition.ShipCount);
         cancellationToken.ThrowIfCancellationRequested();
 
         var databaseAlreadyExists = Directory.Exists(databaseLocation) || File.Exists(databaseLocation);
@@ -294,6 +296,11 @@ public static class SpaceBattleHost
     }
 
     internal static InitialWorldSnapshot ReadSnapshot(Transaction transaction)
+        => ReadSnapshot(transaction, []);
+
+    internal static InitialWorldSnapshot ReadSnapshot(
+        Transaction transaction,
+        IReadOnlyList<KillParticipation> killParticipations)
     {
         ArgumentNullException.ThrowIfNull(transaction);
         var runEntities = transaction.Query<SimulationRunEntity>().Execute();
@@ -361,7 +368,17 @@ public static class SpaceBattleHost
                 targetLock.TicksRemaining));
         }
 
-        return new InitialWorldSnapshot(runEntities.Count, runSnapshot, ships, targetLocks);
+        List<KillParticipationSnapshot> participationSnapshots = killParticipations
+            .Select(static participation => new KillParticipationSnapshot(
+                participation.Attacker.EntityKey,
+                participation.Target.EntityKey))
+            .ToList();
+        return new InitialWorldSnapshot(
+            runEntities.Count,
+            runSnapshot,
+            ships,
+            targetLocks,
+            participationSnapshots);
     }
 
     private static PositionComponent CreateInitialPosition(

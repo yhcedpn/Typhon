@@ -18,6 +18,10 @@ public static class BehaviorRules
     public const ushort LockReleaseDurationTicks = 25;
     public const float TrackingSpeed = SimulationDefinition.BaseMaximumSpeed;
     public const float LockRange = 300f;
+    public const float WeaponRange = 250f;
+    public const uint WeaponDamage = 200;
+    public const ushort WeaponFireIntervalTicks = 50;
+    public const int DamageIntentQueueCapacity = 65_536;
     public const int MaximumLockCandidatesPerAttempt = 64;
     public const int MaximumTargetLocksPerShip = 1;
 

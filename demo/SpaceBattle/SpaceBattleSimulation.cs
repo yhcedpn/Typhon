@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Diagnostics;
 using Typhon.Engine;
 
@@ -41,7 +42,10 @@ public sealed class SpaceBattleSimulation : IDisposable
             system.Priority,
             system.TickDivisor,
             system.ThrottledTickDivisor,
-            system.CanShed)).ToArray());
+            system.CanShed)).ToArray(),
+        _runtime.Scheduler.EventQueues.Select(static queue => new SpaceBattleEventQueueConfiguration(
+            queue.Name,
+            queue.Capacity)).ToArray());
 
     public IReadOnlyList<string> SystemNames => _runtime.UserSystems.Select(static system => system.Name).ToArray();
 
@@ -123,7 +127,13 @@ public sealed class SpaceBattleSimulation : IDisposable
         ulong completedTicks,
         SpaceBattleRunResult startupResult)
     {
-        var state = new SimulationRuntimeState(definition, runEntityId, completedTicks);
+        EcsView<Ship> ships;
+        using (Transaction transaction = engine.CreateQuickTransaction())
+        {
+            ships = transaction.Query<Ship>().ToView();
+        }
+
+        SimulationRuntimeState state = new(definition, runEntityId, completedTicks, ships);
         TyphonRuntime runtime = null!;
 
         try
@@ -147,6 +157,7 @@ public sealed class SpaceBattleSimulation : IDisposable
         catch
         {
             runtime?.Dispose();
+            state.Dispose();
             throw;
         }
     }
@@ -161,6 +172,7 @@ public sealed class SpaceBattleSimulation : IDisposable
         _disposed = true;
         _runtime.Shutdown();
         _runtime.Dispose();
+        _state.Dispose();
         _engine.Dispose();
     }
 
@@ -176,14 +188,30 @@ public sealed class SpaceBattleSimulation : IDisposable
                 SpaceBattlePhases.Combat,
                 SpaceBattlePhases.Resolution,
                 SpaceBattlePhases.Output);
+        EventQueue<DamageIntent>[] damageIntentQueues = CreateDamageIntentQueues(dag);
+        DamageResolutionState damageResolutionState = new();
         dag.Add(new StateSystem());
         dag.Add(new SteeringSystem(state));
         dag.Add(new MovementSystem(state));
         dag.Add(new TargetLockCleanupSystem(state));
         dag.Add(new TargetingSystem(state));
-        dag.Add(new CombatSystem());
+        dag.Add(new CombatSystem(state.Ships, damageIntentQueues));
+        dag.Add(new DamageResolutionSystem(damageIntentQueues, damageResolutionState));
         dag.Add(new ResolutionSystem(state));
-        dag.Add(new OutputSystem(state));
+        dag.Add(new OutputSystem(state, damageResolutionState));
+    }
+
+    private static EventQueue<DamageIntent>[] CreateDamageIntentQueues(Dag dag)
+    {
+        EventQueue<DamageIntent>[] queues = new EventQueue<DamageIntent>[SpaceBattleProductionSettings.EffectiveWorkerCount];
+        for (int workerId = 0; workerId < queues.Length; workerId++)
+        {
+            queues[workerId] = dag.CreateEventQueue<DamageIntent>(
+                $"DamageIntent-{workerId}",
+                BehaviorRules.DamageIntentQueueCapacity);
+        }
+
+        return queues;
     }
 }
 
@@ -226,7 +254,7 @@ internal static class ShipRoster
     }
 }
 
-internal sealed class SimulationRuntimeState
+internal sealed class SimulationRuntimeState : IDisposable
 {
     private readonly object _sync = new();
     private ulong _completedTicks;
@@ -236,12 +264,14 @@ internal sealed class SimulationRuntimeState
     public SimulationRuntimeState(
         SimulationDefinition definition,
         EntityId runEntityId,
-        ulong completedTicks)
+        ulong completedTicks,
+        EcsView<Ship> ships)
     {
         Definition = definition;
         RunEntityId = runEntityId;
         _completedTicks = completedTicks;
         StartingCompletedTicks = completedTicks;
+        Ships = ships;
     }
 
     public SimulationDefinition Definition { get; }
@@ -249,6 +279,10 @@ internal sealed class SimulationRuntimeState
     public EntityId RunEntityId { get; }
 
     public ulong StartingCompletedTicks { get; }
+
+    public EcsView<Ship> Ships { get; }
+
+    public void Dispose() => Ships.Dispose();
 
     public ulong CompletedTicks
     {
@@ -771,7 +805,7 @@ internal sealed class TargetLockCleanupSystem(SimulationRuntimeState state) : Ca
                     if (targetLock.TicksRemaining == 0 || --targetLock.TicksRemaining == 0)
                     {
                         targetLock.Status = (byte)TargetLockStatus.Locked;
-                        EnableWeapon(context, ownerId);
+                        EnableWeapon(context, ownerId, targetId);
                     }
 
                     break;
@@ -782,7 +816,7 @@ internal sealed class TargetLockCleanupSystem(SimulationRuntimeState state) : Ca
                     }
                     else
                     {
-                        EnableWeapon(context, ownerId);
+                        EnableWeapon(context, ownerId, targetId);
                     }
 
                     break;
@@ -803,33 +837,60 @@ internal sealed class TargetLockCleanupSystem(SimulationRuntimeState state) : Ca
         DisableWeapon(context, ownerId);
     }
 
-    private static void EnableWeapon(TickContext context, EntityId ownerId)
+    private static void EnableWeapon(TickContext context, EntityId ownerId, EntityId targetId)
     {
-        var owner = context.Transaction.OpenMut(ownerId);
+        EntityRef owner = context.Transaction.OpenMut(ownerId);
+        ref TrackingComponent tracking = ref owner.Write(Ship.Tracking);
+        tracking.Target = targetId;
+        tracking.TrackingTicksRemaining = 0;
         if (!owner.IsEnabled(Ship.Weapon))
         {
             owner.Enable(Ship.Weapon);
+            owner.Write(Ship.Weapon).CooldownTicksRemaining = 0;
         }
     }
 
     private static void DisableWeapon(TickContext context, EntityId ownerId)
     {
-        var owner = context.Transaction.OpenMut(ownerId);
+        EntityRef owner = context.Transaction.OpenMut(ownerId);
+        ref TrackingComponent tracking = ref owner.Write(Ship.Tracking);
+        tracking.Target = EntityLink<Ship>.Null;
+        tracking.TrackingTicksRemaining = 0;
         if (owner.IsEnabled(Ship.Weapon))
         {
             owner.Disable(Ship.Weapon);
         }
     }
 
+    internal static void ClearDeadLocks(TickContext context)
+    {
+        foreach (EntityId targetLockId in context.Transaction.Query<TargetLock>().Execute())
+        {
+            TargetLockComponent targetLock = context.Transaction.Open(targetLockId).Read(TargetLock.Data);
+            EntityId ownerId = (EntityId)targetLock.Owner;
+            EntityId targetId = (EntityId)targetLock.Target;
+            if (!context.Transaction.TryOpen(ownerId, out _))
+            {
+                context.Transaction.Destroy(targetLockId);
+                continue;
+            }
+
+            if (!context.Transaction.TryOpen(targetId, out _))
+            {
+                DisableWeapon(context, ownerId);
+                context.Transaction.Destroy(targetLockId);
+            }
+        }
+    }
+
     internal static bool IsWithinLockRange(EntityRef source, EntityRef target)
     {
-        ref readonly var sourcePosition = ref source.Read(Ship.Position);
-        ref readonly var targetPosition = ref target.Read(Ship.Position);
-        var deltaX = targetPosition.X - sourcePosition.X;
-        var deltaY = targetPosition.Y - sourcePosition.Y;
-        var deltaZ = targetPosition.Z - sourcePosition.Z;
-        return (deltaX * deltaX) + (deltaY * deltaY) + (deltaZ * deltaZ)
-            <= BehaviorRules.LockRange * BehaviorRules.LockRange;
+        ref readonly PositionComponent sourcePosition = ref source.Read(Ship.Position);
+        ref readonly PositionComponent targetPosition = ref target.Read(Ship.Position);
+        return CombatRules.IsWithinRange(
+            new PositionSnapshot(sourcePosition.X, sourcePosition.Y, sourcePosition.Z),
+            new PositionSnapshot(targetPosition.X, targetPosition.Y, targetPosition.Z),
+            BehaviorRules.LockRange);
     }
 }
 
@@ -936,45 +997,229 @@ internal sealed class TargetingSystem(SimulationRuntimeState state) : CallbackSy
     }
 }
 
-internal sealed class CombatSystem : CallbackSystem
+internal sealed class CombatSystem(
+    EcsView<Ship> ships,
+    IReadOnlyList<EventQueue<DamageIntent>> damageIntentQueues) : QuerySystem
 {
-    protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
-        .Name("Combat")
-        .After("Targeting")
-        .Phase(SpaceBattlePhases.Combat);
+    protected override void Configure(SystemBuilder builder)
+    {
+        SpaceBattleSystemPolicies.Apply(builder)
+            .Name("Combat")
+            .After("Targeting")
+            .Phase(SpaceBattlePhases.Combat)
+            .Input(() => ships)
+            .Parallel()
+            .ReadsFresh<BehaviorComponent>()
+            .ReadsFresh<TrackingComponent>()
+            .AdditionalReads<PositionComponent>()
+            .Writes<WeaponComponent>();
+
+        foreach (EventQueue<DamageIntent> queue in damageIntentQueues)
+        {
+            builder.WritesEvents(queue);
+        }
+    }
 
     protected override void Execute(TickContext context)
     {
+        EntityAccessor accessor = context.Accessor;
+        EventQueue<DamageIntent> damageIntentQueue = damageIntentQueues[context.WorkerId];
+        foreach (EntityId attackerId in context.Entities)
+        {
+            EntityRef attacker = accessor.OpenMut(attackerId);
+            ref readonly TrackingComponent tracking = ref attacker.Read(Ship.Tracking);
+            if (tracking.Target.IsNull ||
+                !accessor.TryOpen(tracking.Target, out EntityRef target) ||
+                !attacker.IsEnabled(Ship.Weapon) ||
+                (BehaviorMode)attacker.Read(Ship.Behavior).Mode != BehaviorMode.Combat)
+            {
+                continue;
+            }
+
+            EntityId targetId = (EntityId)tracking.Target;
+            ref WeaponComponent weapon = ref attacker.Write(Ship.Weapon);
+            ref readonly PositionComponent attackerPosition = ref attacker.Read(Ship.Position);
+            ref readonly PositionComponent targetPosition = ref target.Read(Ship.Position);
+            WeaponFireResult fireResult = CombatRules.AdvanceWeaponFire(
+                weapon.CooldownTicksRemaining,
+                new PositionSnapshot(attackerPosition.X, attackerPosition.Y, attackerPosition.Z),
+                new PositionSnapshot(targetPosition.X, targetPosition.Y, targetPosition.Z));
+            weapon.CooldownTicksRemaining = fireResult.CooldownTicksRemaining;
+            if (fireResult.Hit)
+            {
+                damageIntentQueue.Push(new DamageIntent(attackerId, targetId));
+            }
+        }
     }
+}
+
+internal sealed class DamageResolutionSystem(
+    IReadOnlyList<EventQueue<DamageIntent>> damageIntentQueues,
+    DamageResolutionState damageResolutionState) : CallbackSystem
+{
+    protected override void Configure(SystemBuilder builder)
+    {
+        SpaceBattleSystemPolicies.Apply(builder)
+            .Name("DamageResolution")
+            .After("Combat")
+            .Phase(SpaceBattlePhases.Resolution)
+            .ShouldRun(HasDamageIntents)
+            .Writes<HealthComponent>();
+
+        foreach (EventQueue<DamageIntent> queue in damageIntentQueues)
+        {
+            builder.ReadsEvents(queue);
+        }
+    }
+
+    protected override void Execute(TickContext context)
+    {
+        damageResolutionState.Clear();
+        int intentCount = 0;
+        foreach (EventQueue<DamageIntent> queue in damageIntentQueues)
+        {
+            intentCount += queue.Count;
+        }
+
+        if (intentCount == 0)
+        {
+            return;
+        }
+
+        DamageIntent[] damageIntents = ArrayPool<DamageIntent>.Shared.Rent(intentCount);
+        try
+        {
+            int count = 0;
+            foreach (EventQueue<DamageIntent> queue in damageIntentQueues)
+            {
+                count += queue.Drain(damageIntents.AsSpan(count, queue.Count));
+            }
+
+            Array.Sort(damageIntents, 0, count, DamageIntentComparer.Instance);
+            for (int groupStart = 0; groupStart < count;)
+            {
+                EntityId targetId = damageIntents[groupStart].Target;
+                int groupEnd = groupStart + 1;
+                while (groupEnd < count && damageIntents[groupEnd].Target == targetId)
+                {
+                    groupEnd++;
+                }
+
+                int participatingAttackerCount = 1;
+                EntityId previousAttackerId = damageIntents[groupStart].Attacker;
+                for (int intentIndex = groupStart + 1; intentIndex < groupEnd; intentIndex++)
+                {
+                    EntityId attackerId = damageIntents[intentIndex].Attacker;
+                    if (attackerId != previousAttackerId)
+                    {
+                        participatingAttackerCount++;
+                        previousAttackerId = attackerId;
+                    }
+                }
+
+                if (context.Transaction.TryOpen(targetId, out _))
+                {
+                    EntityRef target = context.Transaction.OpenMut(targetId);
+                    ref HealthComponent health = ref target.Write(Ship.Health);
+                    DamageResolution resolution = DamageResolutionRules.Resolve(
+                        health.Current,
+                        groupEnd - groupStart,
+                        participatingAttackerCount);
+                    health.Current = resolution.RemainingHealth;
+                    if (resolution.IsDestroyed)
+                    {
+                        RecordKillParticipations(damageIntents, groupStart, groupEnd, targetId);
+                        context.Transaction.Destroy(targetId);
+                    }
+                }
+
+                groupStart = groupEnd;
+            }
+        }
+        finally
+        {
+            ArrayPool<DamageIntent>.Shared.Return(damageIntents);
+        }
+    }
+
+    private bool HasDamageIntents() => damageIntentQueues.Any(static queue => !queue.IsEmpty);
+
+    private void RecordKillParticipations(
+        DamageIntent[] damageIntents,
+        int groupStart,
+        int groupEnd,
+        EntityId targetId)
+    {
+        EntityId previousAttackerId = EntityId.Null;
+        for (int intentIndex = groupStart; intentIndex < groupEnd; intentIndex++)
+        {
+            EntityId attackerId = damageIntents[intentIndex].Attacker;
+            if (intentIndex == groupStart || attackerId != previousAttackerId)
+            {
+                damageResolutionState.AddKillParticipation(attackerId, targetId);
+                previousAttackerId = attackerId;
+            }
+        }
+    }
+
+    private sealed class DamageIntentComparer : IComparer<DamageIntent>
+    {
+        public static DamageIntentComparer Instance { get; } = new();
+
+        public int Compare(DamageIntent left, DamageIntent right)
+        {
+            int targetComparison = left.Target.EntityKey.CompareTo(right.Target.EntityKey);
+            return targetComparison != 0
+                ? targetComparison
+                : left.Attacker.EntityKey.CompareTo(right.Attacker.EntityKey);
+        }
+    }
+}
+
+internal readonly record struct KillParticipation(EntityId Attacker, EntityId Target);
+
+internal sealed class DamageResolutionState
+{
+    private readonly List<KillParticipation> _killParticipations = [];
+
+    public IReadOnlyList<KillParticipation> KillParticipations => _killParticipations;
+
+    public void AddKillParticipation(EntityId attacker, EntityId target)
+        => _killParticipations.Add(new KillParticipation(attacker, target));
+
+    public void Clear() => _killParticipations.Clear();
 }
 
 internal sealed class ResolutionSystem(SimulationRuntimeState state) : CallbackSystem
 {
     protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("Resolution")
-        .After("Combat")
+        .After("DamageResolution")
         .Phase(SpaceBattlePhases.Resolution)
         .Writes<BehaviorComponent>()
         .Writes<TrackingComponent>()
-        .Writes<MotionComponent>();
+        .Writes<MotionComponent>()
+        .Writes<WeaponComponent>()
+        .Writes<TargetLockComponent>();
 
     protected override void Execute(TickContext context)
     {
-        foreach (var shipId in context.Transaction.Query<Ship>().Execute())
+        TargetLockCleanupSystem.ClearDeadLocks(context);
+        foreach (EntityId shipId in context.Transaction.Query<Ship>().Execute())
         {
             if (!context.Transaction.IsAlive(shipId))
             {
                 continue;
             }
 
-            var ship = context.Transaction.OpenMut(shipId);
-            ref var behavior = ref ship.Write(Ship.Behavior);
+            EntityRef ship = context.Transaction.OpenMut(shipId);
+            ref BehaviorComponent behavior = ref ship.Write(Ship.Behavior);
             if ((BehaviorMode)behavior.Mode != BehaviorMode.Tracking)
             {
                 continue;
             }
 
-            ref var tracking = ref ship.Write(Ship.Tracking);
+            ref TrackingComponent tracking = ref ship.Write(Ship.Tracking);
             if (!tracking.Target.IsNull && context.Transaction.IsAlive(tracking.Target))
             {
                 continue;
@@ -990,7 +1235,9 @@ internal sealed class ResolutionSystem(SimulationRuntimeState state) : CallbackS
     }
 }
 
-internal sealed class OutputSystem(SimulationRuntimeState state) : CallbackSystem
+internal sealed class OutputSystem(
+    SimulationRuntimeState state,
+    DamageResolutionState damageResolutionState) : CallbackSystem
 {
     protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("Output")
@@ -1010,14 +1257,24 @@ internal sealed class OutputSystem(SimulationRuntimeState state) : CallbackSyste
 
     protected override void Execute(TickContext context)
     {
-        var completedTicks = state.CompletedTicksForRuntimeTick(context.TickNumber);
-        ref var run = ref context.Transaction.OpenMut(state.RunEntityId).Write(SimulationRunEntity.Run);
-        run.CompletedTicks = completedTicks;
-        if (state.IsSnapshotRequested(completedTicks))
+        try
         {
-            state.CaptureSnapshot(completedTicks, SpaceBattleHost.ReadSnapshot(context.Transaction));
-        }
+            ulong completedTicks = state.CompletedTicksForRuntimeTick(context.TickNumber);
+            ref SimulationRunComponent run = ref context.Transaction.OpenMut(state.RunEntityId)
+                .Write(SimulationRunEntity.Run);
+            run.CompletedTicks = completedTicks;
+            if (state.IsSnapshotRequested(completedTicks))
+            {
+                state.CaptureSnapshot(
+                    completedTicks,
+                    SpaceBattleHost.ReadSnapshot(context.Transaction, damageResolutionState.KillParticipations));
+            }
 
-        state.MarkCompletedTicks(completedTicks);
+            state.MarkCompletedTicks(completedTicks);
+        }
+        finally
+        {
+            damageResolutionState.Clear();
+        }
     }
 }

@@ -31,25 +31,16 @@ public sealed class TargetLockTests
     [Test]
     public void Start_CombatShipsCreateOneAcquiringLockForAnInRangeRosterCandidate()
     {
-        var definition = new SimulationDefinition(
-            runName: "target-lock-test",
-            shipCount: 64,
-            seed: SimulationDefinition.DefaultSeed,
-            rulesetVersion: 1,
-            worldSize: 100f,
-            maximumHealth: 1_000,
-            stagingTicks: 0,
-            spatialCellSize: 100f,
-            spatialMargin: 20f);
-        var databaseLocation = Path.Combine(_temporaryDirectory, "locks.typhon");
+        SimulationDefinition definition = CreateCombatDefinition("target-lock-test");
+        string databaseLocation = Path.Combine(_temporaryDirectory, "locks.typhon");
 
-        using var simulation = SpaceBattleHost.Start(
+        using SpaceBattleSimulation simulation = SpaceBattleHost.Start(
             definition,
             databaseLocation,
             CancellationToken.None,
             new RecordingObservationSink());
 
-        var snapshot = simulation.WaitForSnapshot(252, TimeSpan.FromSeconds(15));
+        InitialWorldSnapshot snapshot = simulation.WaitForSnapshot(252, TimeSpan.FromSeconds(15));
 
         Assert.Multiple(() =>
         {
@@ -78,26 +69,17 @@ public sealed class TargetLockTests
     [Test]
     public void Start_WhenAcquisitionCompletes_LockedTargetAuthorizesItsOwnerWeapon()
     {
-        var definition = new SimulationDefinition(
-            runName: "target-lock-authorization-test",
-            shipCount: 64,
-            seed: SimulationDefinition.DefaultSeed,
-            rulesetVersion: 1,
-            worldSize: 100f,
-            maximumHealth: 1_000,
-            stagingTicks: 0,
-            spatialCellSize: 100f,
-            spatialMargin: 20f);
-        var databaseLocation = Path.Combine(_temporaryDirectory, "authorization.typhon");
+        SimulationDefinition definition = CreateCombatDefinition("target-lock-authorization-test");
+        string databaseLocation = Path.Combine(_temporaryDirectory, "authorization.typhon");
 
-        using var simulation = SpaceBattleHost.Start(
+        using SpaceBattleSimulation simulation = SpaceBattleHost.Start(
             definition,
             databaseLocation,
             CancellationToken.None,
             new RecordingObservationSink());
 
-        var snapshot = simulation.WaitForSnapshot(303, TimeSpan.FromSeconds(20));
-        var lockedOwners = snapshot.TargetLocks
+        InitialWorldSnapshot snapshot = simulation.WaitForSnapshot(303, TimeSpan.FromSeconds(20));
+        HashSet<long> lockedOwners = snapshot.TargetLocks
             .Where(static targetLock => targetLock.Status == TargetLockStatus.Locked)
             .Select(static targetLock => targetLock.OwnerEntityKey)
             .ToHashSet();
@@ -113,28 +95,99 @@ public sealed class TargetLockTests
     }
 
     [Test]
-    public void Start_WhenCombatEnds_ReleasesLocksBeforeFreeingTheirSlots()
+    public void Start_WhenLockedWeaponsFire_ResolvesDamageAndDeathsInTheSameTick()
     {
-        var definition = new SimulationDefinition(
-            runName: "target-lock-release-test",
-            shipCount: 64,
-            seed: SimulationDefinition.DefaultSeed,
-            rulesetVersion: 1,
-            worldSize: 100f,
-            maximumHealth: 1_000,
-            stagingTicks: 0,
-            spatialCellSize: 100f,
-            spatialMargin: 20f);
-        var databaseLocation = Path.Combine(_temporaryDirectory, "release.typhon");
+        SimulationDefinition definition = CreateCombatDefinition(
+            "damage-resolution-test",
+            maximumHealth: 200);
+        string databaseLocation = Path.Combine(_temporaryDirectory, "damage-resolution.typhon");
 
-        using var simulation = SpaceBattleHost.Start(
+        using SpaceBattleSimulation simulation = SpaceBattleHost.Start(
             definition,
             databaseLocation,
             CancellationToken.None,
             new RecordingObservationSink());
 
-        var snapshots = simulation.WaitForSnapshots([502, 527], TimeSpan.FromSeconds(40));
-        var releasingSnapshot = snapshots[0];
+        IReadOnlyList<InitialWorldSnapshot> snapshots = simulation.WaitForSnapshots(
+            [299, 300, 301, 302, 303],
+            TimeSpan.FromSeconds(20));
+        int resolutionSnapshotIndex = snapshots
+            .Select(static (snapshot, index) => (Snapshot: snapshot, Index: index))
+            .First(item => item.Snapshot.KillParticipations.Count > 0)
+            .Index;
+        InitialWorldSnapshot previousSnapshot = snapshots[resolutionSnapshotIndex - 1];
+        InitialWorldSnapshot snapshot = snapshots[resolutionSnapshotIndex];
+        HashSet<long> liveShipKeys = snapshot.Ships.Select(static ship => ship.EntityKey).ToHashSet();
+        HashSet<long> previousLiveShipKeys = previousSnapshot.Ships
+            .Select(static ship => ship.EntityKey)
+            .ToHashSet();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(snapshot.Ships.Count, Is.LessThan(definition.ShipCount));
+            Assert.That(snapshot.Ships.Select(static ship => ship.Health), Has.All.GreaterThan(0));
+            Assert.That(snapshot.KillParticipations, Is.Not.Empty);
+            Assert.That(snapshot.KillParticipations.Select(static participation => participation.TargetEntityKey),
+                Has.All.Matches<long>(targetEntityKey =>
+                    previousLiveShipKeys.Contains(targetEntityKey) &&
+                    !liveShipKeys.Contains(targetEntityKey)));
+            Assert.That(snapshot.TargetLocks, Has.All.Matches<TargetLockSnapshot>(targetLock =>
+                liveShipKeys.Contains(targetLock.OwnerEntityKey) &&
+                liveShipKeys.Contains(targetLock.TargetEntityKey)));
+        });
+    }
+
+    [Test]
+    public void Start_WhenWeaponsKillShips_ReportsEveryKillParticipationForTheSameTick()
+    {
+        SimulationDefinition definition = CreateCombatDefinition(
+            "kill-participation-test",
+            maximumHealth: 200);
+        string databaseLocation = Path.Combine(_temporaryDirectory, "kill-participation.typhon");
+
+        using SpaceBattleSimulation simulation = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+
+        IReadOnlyList<InitialWorldSnapshot> snapshots = simulation.WaitForSnapshots(
+            [300, 301, 302, 303],
+            TimeSpan.FromSeconds(20));
+        InitialWorldSnapshot resolutionSnapshot = snapshots
+            .First(snapshot => snapshot.KillParticipations.Count > 0);
+        HashSet<long> liveShipKeys = resolutionSnapshot.Ships
+            .Select(static ship => ship.EntityKey)
+            .ToHashSet();
+        IReadOnlyList<(long Attacker, long Target)> participations = resolutionSnapshot.KillParticipations
+            .Select(static participation => (participation.AttackerEntityKey, participation.TargetEntityKey))
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(participations, Is.Not.Empty);
+            Assert.That(participations, Is.Unique);
+            Assert.That(resolutionSnapshot.KillParticipations.Select(static participation => participation.TargetEntityKey),
+                Has.All.Matches<long>(targetEntityKey => !liveShipKeys.Contains(targetEntityKey)));
+        });
+    }
+
+    [Test]
+    public void Start_WhenCombatEnds_ReleasesLocksBeforeFreeingTheirSlots()
+    {
+        SimulationDefinition definition = CreateCombatDefinition("target-lock-release-test");
+        string databaseLocation = Path.Combine(_temporaryDirectory, "release.typhon");
+
+        using SpaceBattleSimulation simulation = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+
+        IReadOnlyList<InitialWorldSnapshot> snapshots = simulation.WaitForSnapshots(
+            [502, 527],
+            TimeSpan.FromSeconds(40));
+        InitialWorldSnapshot releasingSnapshot = snapshots[0];
         Assert.Multiple(() =>
         {
             Assert.That(releasingSnapshot.TargetLocks, Is.Not.Empty);
@@ -148,13 +201,13 @@ public sealed class TargetLockTests
                 Is.All.False);
         });
 
-        var releasingLockIds = releasingSnapshot.TargetLocks
+        HashSet<long> releasingLockIds = releasingSnapshot.TargetLocks
             .Select(static targetLock => targetLock.EntityKey)
             .ToHashSet();
-        var releasingOwners = releasingSnapshot.TargetLocks
+        HashSet<long> releasingOwners = releasingSnapshot.TargetLocks
             .Select(static targetLock => targetLock.OwnerEntityKey)
             .ToHashSet();
-        var releasedSnapshot = snapshots[1];
+        InitialWorldSnapshot releasedSnapshot = snapshots[1];
         Assert.Multiple(() =>
         {
             Assert.That(releasedSnapshot.TargetLocks
@@ -165,6 +218,19 @@ public sealed class TargetLockTests
                 Is.Empty);
         });
     }
+
+    private static SimulationDefinition CreateCombatDefinition(
+        string runName,
+        uint maximumHealth = 1_000) => new(
+        runName: runName,
+        shipCount: 64,
+        seed: SimulationDefinition.DefaultSeed,
+        rulesetVersion: 1,
+        worldSize: 100f,
+        maximumHealth: maximumHealth,
+        stagingTicks: 0,
+        spatialCellSize: 100f,
+        spatialMargin: 20f);
 
     private sealed class RecordingObservationSink : ISpaceBattleObservationSink
     {

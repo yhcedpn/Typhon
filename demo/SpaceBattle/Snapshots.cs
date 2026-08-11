@@ -74,11 +74,16 @@ public sealed record TargetLockSnapshot(
     TargetLockStatus Status,
     ushort TicksRemaining);
 
+public sealed record KillParticipationSnapshot(
+    long AttackerEntityKey,
+    long TargetEntityKey);
+
 public sealed record InitialWorldSnapshot(
     int RunCount,
     SimulationRunSnapshot Run,
     IReadOnlyList<ShipSnapshot> Ships,
-    IReadOnlyList<TargetLockSnapshot> TargetLocks);
+    IReadOnlyList<TargetLockSnapshot> TargetLocks,
+    IReadOnlyList<KillParticipationSnapshot> KillParticipations);
 
 public sealed record SpaceBattleRunResult(
     int ShipCount,
