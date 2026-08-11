@@ -26,6 +26,9 @@ public static class SpaceBattleDatabase
             .Register<WeaponComponent>()
             .Register<AfterburnerComponent>()
             .Register<TargetLockComponent>()
+            .Register<PauseShipCheckpointComponent>()
+            .Register<PauseTargetLockCheckpointComponent>()
+            .Register<PauseRunCheckpointComponent>()
             .ConfigureSpatialGrid(new SpatialGridConfig(
                 Vector2.Zero,
                 new Vector2(definition.WorldSize, definition.WorldSize),

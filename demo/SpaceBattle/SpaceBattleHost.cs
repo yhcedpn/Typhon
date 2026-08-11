@@ -80,6 +80,7 @@ public static class SpaceBattleHost
                 persistedRun.EntityId,
                 persistedRun.CompletedTicks,
                 startupResult);
+            simulation.RegisterPauseCancellation(cancellationToken);
             engine = null!;
             return simulation;
         }
@@ -146,9 +147,11 @@ public static class SpaceBattleHost
             Outcome = (byte)SimulationRunOutcome.None,
             WinnerEntityKey = 0,
         };
+        var pauseRunCheckpoint = default(PauseRunCheckpointComponent);
         bulkLoad.Spawn<SimulationRunEntity>(
             SimulationRunEntity.Run.Set(in run),
-            SimulationRunEntity.State.Set(in runState));
+            SimulationRunEntity.State.Set(in runState),
+            SimulationRunEntity.PauseCheckpoint.Set(in pauseRunCheckpoint));
 
         var motion = new MotionComponent { DirectionX = 1f, DirectionY = 0f, DirectionZ = 0f, Speed = 0f };
         var health = new HealthComponent { Current = definition.MaximumHealth };
@@ -163,6 +166,7 @@ public static class SpaceBattleHost
             Target = EntityLink<Ship>.Null,
             TrackingTicksRemaining = 0,
         };
+        var pauseShipCheckpoint = default(PauseShipCheckpointComponent);
 
         for (var index = 0; index < definition.ShipCount; index++)
         {
@@ -177,7 +181,8 @@ public static class SpaceBattleHost
                 Ship.Motion.Set(in motion),
                 Ship.Health.Set(in health),
                 Ship.Behavior.Set(in behavior),
-                Ship.Tracking.Set(in tracking));
+                Ship.Tracking.Set(in tracking),
+                Ship.PauseCheckpoint.Set(in pauseShipCheckpoint));
 
             var packedEntityId = ((ulong)entityId.EntityKey << 12) | entityId.ArchetypeId;
             position = CreateInitialPosition(definition, packedEntityId);
@@ -268,6 +273,7 @@ public static class SpaceBattleHost
             throw new InvalidOperationException($"SimulationRun 状态 {persistedRun.Status} 不可恢复。");
         }
 
+        SpaceBattleCheckpoint.Restore(engine, persistedRun.EntityId, persistedRun.CompletedTicks);
         using var transaction = engine.CreateQuickTransaction(DurabilityMode.Immediate);
         ref var runState = ref transaction.OpenMut(persistedRun.EntityId).Write(SimulationRunEntity.State);
         runState.ProcessSegment = checked(runState.ProcessSegment + 1);
@@ -314,6 +320,11 @@ public static class SpaceBattleHost
         var runEntity = transaction.Open(runEntities.Single());
         ref readonly var run = ref runEntity.Read(SimulationRunEntity.Run);
         ref readonly var runState = ref runEntity.Read(SimulationRunEntity.State);
+        bool usePauseCheckpoint = SpaceBattleCheckpoint.TryReadRun(
+            transaction,
+            out var checkpoint) &&
+            checkpoint.CompletedTicks == run.CompletedTicks;
+
         var runSnapshot = new SimulationRunSnapshot(
             run.Seed,
             run.CompletedTicks,
@@ -372,6 +383,12 @@ public static class SpaceBattleHost
                 target.EntityKey,
                 (TargetLockStatus)targetLock.Status,
                 targetLock.TicksRemaining));
+        }
+
+        if (usePauseCheckpoint)
+        {
+            ships = SpaceBattleCheckpoint.ReadShipSnapshots(transaction);
+            targetLocks = SpaceBattleCheckpoint.ReadTargetLockSnapshots(transaction);
         }
 
         List<KillParticipationSnapshot> participationSnapshots = killParticipations

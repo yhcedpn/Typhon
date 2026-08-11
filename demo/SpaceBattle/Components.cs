@@ -4,7 +4,7 @@ using Typhon.Schema.Definition;
 
 namespace SpaceBattle;
 
-[Component("SpaceBattle.SimulationRun", 1, StorageMode = StorageMode.SingleVersion)]
+[Component("SpaceBattle.SimulationRun", 1)]
 [StructLayout(LayoutKind.Sequential)]
 public struct SimulationRunComponent
 {
@@ -105,4 +105,54 @@ public struct TargetLockComponent
 
     [Field] public ushort TicksRemaining;
     [Field] public byte Status;
+}
+
+[Component("SpaceBattle.PauseShipCheckpoint", 1)]
+[StructLayout(LayoutKind.Sequential)]
+public struct PauseShipCheckpointComponent
+{
+    [Field] public byte IsValid;
+    [Field] public float PositionX;
+    [Field] public float PositionY;
+    [Field] public float PositionZ;
+    [Field] public float BoundsMinX;
+    [Field] public float BoundsMinY;
+    [Field] public float BoundsMinZ;
+    [Field] public float BoundsMaxX;
+    [Field] public float BoundsMaxY;
+    [Field] public float BoundsMaxZ;
+    [Field] public float DirectionX;
+    [Field] public float DirectionY;
+    [Field] public float DirectionZ;
+    [Field] public float Speed;
+    [Field] public uint Health;
+    [Field] public ulong DecisionOrdinal;
+    [Field] public ushort ModeTicksRemaining;
+    [Field] public byte Mode;
+    [Field] public long TrackingTargetEntityKey;
+    [Field] public ushort TrackingTicksRemaining;
+    [Field] public ushort CooldownTicksRemaining;
+    [Field] public ulong AfterburnerActivatedTick;
+    [Field] public byte WeaponEnabled;
+    [Field] public byte AfterburnerEnabled;
+}
+
+[Component("SpaceBattle.PauseTargetLockCheckpoint", 1)]
+[StructLayout(LayoutKind.Sequential)]
+public struct PauseTargetLockCheckpointComponent
+{
+    [Field] public byte IsValid;
+    [Field] public long OwnerEntityKey;
+    [Field] public long TargetEntityKey;
+    [Field] public ushort TicksRemaining;
+    [Field] public byte Status;
+}
+
+[Component("SpaceBattle.PauseRunCheckpoint", 1)]
+[StructLayout(LayoutKind.Sequential)]
+public struct PauseRunCheckpointComponent
+{
+    [Field] public ulong CompletedTicks;
+    [Field] public uint AliveShipCount;
+    [Field] public byte IsValid;
 }

@@ -54,15 +54,7 @@ internal static class Program
             return snapshot.Run.Status == SimulationRunStatus.TimedOut ? 1 : 0;
         }
 
-        InitialWorldSnapshot snapshotBeforePause = simulation.GetSnapshot();
-        if (snapshotBeforePause.Run.Status != SimulationRunStatus.Running)
-        {
-            Console.WriteLine(DescribeTerminalResult(snapshotBeforePause.Run));
-            return snapshotBeforePause.Run.Status == SimulationRunStatus.TimedOut ? 1 : 0;
-        }
-
-        ulong nextCompletedTick = checked(snapshotBeforePause.Run.CompletedTicks + 1);
-        if (!simulation.WaitForCompletedTicks(nextCompletedTick, TimeSpan.FromSeconds(5)))
+        if (!simulation.WaitForPause(TimeSpan.FromSeconds(5)))
         {
             throw new TimeoutException("等待 Ctrl+C 时正在执行的模拟 tick 完成超时。");
         }

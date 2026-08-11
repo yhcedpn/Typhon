@@ -21,6 +21,7 @@ public sealed partial class Ship : Archetype<Ship>
     public static readonly Comp<TrackingComponent> Tracking = Register<TrackingComponent>();
     public static readonly Comp<WeaponComponent> Weapon = Register<WeaponComponent>();
     public static readonly Comp<AfterburnerComponent> Afterburner = Register<AfterburnerComponent>();
+    public static readonly Comp<PauseShipCheckpointComponent> PauseCheckpoint = Register<PauseShipCheckpointComponent>();
 }
 
 [Archetype(SpaceBattleSchemaIds.SimulationRun)]
@@ -28,10 +29,12 @@ public sealed partial class SimulationRunEntity : Archetype<SimulationRunEntity>
 {
     public static readonly Comp<SimulationRunComponent> Run = Register<SimulationRunComponent>();
     public static readonly Comp<SimulationRunStateComponent> State = Register<SimulationRunStateComponent>();
+    public static readonly Comp<PauseRunCheckpointComponent> PauseCheckpoint = Register<PauseRunCheckpointComponent>();
 }
 
 [Archetype(SpaceBattleSchemaIds.TargetLock)]
 public sealed partial class TargetLock : Archetype<TargetLock>
 {
     public static readonly Comp<TargetLockComponent> Data = Register<TargetLockComponent>();
+    public static readonly Comp<PauseTargetLockCheckpointComponent> PauseCheckpoint = Register<PauseTargetLockCheckpointComponent>();
 }

@@ -10,8 +10,11 @@ public sealed class SpaceBattleSimulation : IDisposable
     private readonly TyphonRuntime _runtime;
     private readonly SimulationRuntimeState _state;
     private readonly object _terminalPersistenceSync = new();
+    private readonly object _pausePersistenceSync = new();
+    private CancellationTokenRegistration _pauseCancellation;
     private bool _terminalStatePersisted;
-    private bool _disposed;
+    private bool _pauseStatePersisted;
+    private int _disposed;
 
     internal SpaceBattleSimulation(
         DatabaseEngine engine,
@@ -55,7 +58,7 @@ public sealed class SpaceBattleSimulation : IDisposable
 
     public bool WaitForCompletedTicks(ulong completedTicks, TimeSpan timeout)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         var startedAt = Stopwatch.GetTimestamp();
         if (!_state.WaitForCompletedTicks(completedTicks, timeout))
         {
@@ -71,7 +74,7 @@ public sealed class SpaceBattleSimulation : IDisposable
 
     public bool WaitForTerminal(TimeSpan timeout)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         var startedAt = Stopwatch.GetTimestamp();
         if (!_state.WaitForTerminal(timeout, out ulong completedTicks))
         {
@@ -87,13 +90,53 @@ public sealed class SpaceBattleSimulation : IDisposable
             return false;
         }
 
-        PersistTerminalState();
+        PersistTerminalState(completedTicks);
+        return true;
+    }
+
+    public void RequestPause()
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return;
+        }
+
+        _state.RequestPause();
+    }
+
+    public bool WaitForPause(TimeSpan timeout)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        return WaitForPauseCore(timeout);
+    }
+
+    private bool WaitForPauseCore(TimeSpan timeout)
+    {
+        _state.RequestPause();
+        var startedAt = Stopwatch.GetTimestamp();
+        if (!_state.WaitForPause(timeout, out ulong completedTicks))
+        {
+            return false;
+        }
+
+        var remaining = timeout == Timeout.InfiniteTimeSpan
+            ? Timeout.InfiniteTimeSpan
+            : timeout - Stopwatch.GetElapsedTime(startedAt);
+        bool timedOut = remaining != Timeout.InfiniteTimeSpan && remaining <= TimeSpan.Zero;
+        if (timedOut || !SpinWait.SpinUntil(
+            () => _runtime.CurrentTickNumber >= _state.RuntimeTicksRequired(completedTicks),
+            remaining))
+        {
+            return false;
+        }
+
+        PersistPausedState(completedTicks);
         return true;
     }
 
     public InitialWorldSnapshot GetSnapshot()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         return SpaceBattleHost.ReadSnapshot(_engine);
     }
 
@@ -104,7 +147,7 @@ public sealed class SpaceBattleSimulation : IDisposable
         IReadOnlyList<ulong> completedTicks,
         TimeSpan timeout)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         ArgumentNullException.ThrowIfNull(completedTicks);
         var requestedTicks = completedTicks.Distinct().Order().ToArray();
         if (requestedTicks.Length == 0)
@@ -141,6 +184,16 @@ public sealed class SpaceBattleSimulation : IDisposable
         finally
         {
             _state.EndSnapshotRequest();
+        }
+    }
+
+    internal void RegisterPauseCancellation(CancellationToken cancellationToken)
+    {
+        if (cancellationToken.CanBeCanceled)
+        {
+            _pauseCancellation = cancellationToken.Register(
+                static state => ((SpaceBattleSimulation)state!).RequestPause(),
+                this);
         }
     }
 
@@ -190,19 +243,26 @@ public sealed class SpaceBattleSimulation : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             return;
         }
 
-        _disposed = true;
+        _pauseCancellation.Dispose();
+        if (_state.IsRunning &&
+            !WaitForPauseCore(Timeout.InfiniteTimeSpan) &&
+            !_state.IsTerminal)
+        {
+            throw new InvalidOperationException("无法在关闭 SpaceBattle 前完成当前模拟 tick。");
+        }
+
         _runtime.Shutdown();
         _runtime.Dispose();
         _state.Dispose();
         _engine.Dispose();
     }
 
-    private void PersistTerminalState()
+    private void PersistTerminalState(ulong completedTicks)
     {
         lock (_terminalPersistenceSync)
         {
@@ -211,16 +271,34 @@ public sealed class SpaceBattleSimulation : IDisposable
                 return;
             }
 
-            using var transaction = _engine.CreateQuickTransaction(DurabilityMode.Immediate);
-            ref SimulationRunStateComponent runState = ref transaction.OpenMut(_state.RunEntityId)
-                .Write(SimulationRunEntity.State);
-            if ((SimulationRunStatus)runState.Status == SimulationRunStatus.Running)
+            using (var transaction = _engine.CreateQuickTransaction(DurabilityMode.Immediate))
             {
-                throw new InvalidOperationException("终态尚未写入 SimulationRun。");
+                ref SimulationRunStateComponent runState = ref transaction.OpenMut(_state.RunEntityId)
+                    .Write(SimulationRunEntity.State);
+                if ((SimulationRunStatus)runState.Status == SimulationRunStatus.Running)
+                {
+                    throw new InvalidOperationException("终态尚未写入 SimulationRun。");
+                }
+
+                transaction.Commit();
             }
 
-            transaction.Commit();
+            SpaceBattleCheckpoint.Persist(_engine, _state.RunEntityId, completedTicks);
             _terminalStatePersisted = true;
+        }
+    }
+
+    private void PersistPausedState(ulong completedTicks)
+    {
+        lock (_pausePersistenceSync)
+        {
+            if (_pauseStatePersisted)
+            {
+                return;
+            }
+
+            SpaceBattleCheckpoint.Persist(_engine, _state.RunEntityId, completedTicks);
+            _pauseStatePersisted = true;
         }
     }
 
@@ -307,8 +385,13 @@ internal sealed class SimulationRuntimeState : IDisposable
     private readonly object _sync = new();
     private ulong _completedTicks;
     private ulong _terminalCompletedTicks;
+    private ulong _pauseCompletedTicks;
     private uint _aliveShipCount;
     private int _isRunning = 1;
+    private int _isTerminal;
+    private bool _pauseRequested;
+    private bool _pauseAcknowledged;
+    private bool _tickInProgress;
     private ulong[] _requestedSnapshotTicks = [];
     private readonly Dictionary<ulong, InitialWorldSnapshot> _snapshots = new();
 
@@ -336,6 +419,8 @@ internal sealed class SimulationRuntimeState : IDisposable
     public EcsView<Ship> Ships { get; }
 
     public bool IsRunning => Volatile.Read(ref _isRunning) != 0;
+
+    public bool IsTerminal => Volatile.Read(ref _isTerminal) != 0;
 
     public void Dispose() => Ships.Dispose();
 
@@ -366,6 +451,57 @@ internal sealed class SimulationRuntimeState : IDisposable
         }
     }
 
+    public bool BeginTick()
+    {
+        lock (_sync)
+        {
+            if (_isRunning == 0)
+            {
+                return false;
+            }
+
+            _tickInProgress = true;
+            return true;
+        }
+    }
+
+    public void EndTick(ulong completedTicks, bool completed)
+    {
+        lock (_sync)
+        {
+            _tickInProgress = false;
+            if (completed && _pauseRequested && _isTerminal == 0)
+            {
+                Volatile.Write(ref _isRunning, 0);
+                _pauseCompletedTicks = completedTicks;
+                _pauseAcknowledged = true;
+            }
+
+            Monitor.PulseAll(_sync);
+        }
+    }
+
+    public void RequestPause()
+    {
+        lock (_sync)
+        {
+            if (_isTerminal != 0 || _pauseAcknowledged)
+            {
+                return;
+            }
+
+            _pauseRequested = true;
+            if (!_tickInProgress)
+            {
+                Volatile.Write(ref _isRunning, 0);
+                _pauseCompletedTicks = _completedTicks;
+                _pauseAcknowledged = true;
+            }
+
+            Monitor.PulseAll(_sync);
+        }
+    }
+
     public uint ApplyDestroyedShips(int destroyedShipCount)
     {
         lock (_sync)
@@ -388,6 +524,7 @@ internal sealed class SimulationRuntimeState : IDisposable
         lock (_sync)
         {
             _terminalCompletedTicks = completedTicks;
+            Volatile.Write(ref _isTerminal, 1);
             Volatile.Write(ref _isRunning, 0);
             Monitor.PulseAll(_sync);
         }
@@ -399,7 +536,7 @@ internal sealed class SimulationRuntimeState : IDisposable
 
         lock (_sync)
         {
-            while (IsRunning)
+            while (!IsTerminal)
             {
                 var remainingTicks = deadline - Stopwatch.GetTimestamp();
                 if (remainingTicks <= 0)
@@ -413,6 +550,38 @@ internal sealed class SimulationRuntimeState : IDisposable
 
             completedTicks = _terminalCompletedTicks;
             return true;
+        }
+    }
+
+    public bool WaitForPause(TimeSpan timeout, out ulong completedTicks)
+    {
+        bool infinite = timeout == Timeout.InfiniteTimeSpan;
+        var deadline = infinite
+            ? long.MaxValue
+            : Stopwatch.GetTimestamp() + (long)(timeout.TotalSeconds * Stopwatch.Frequency);
+
+        lock (_sync)
+        {
+            while (!_pauseAcknowledged && !IsTerminal)
+            {
+                if (infinite)
+                {
+                    Monitor.Wait(_sync);
+                    continue;
+                }
+
+                var remainingTicks = deadline - Stopwatch.GetTimestamp();
+                if (remainingTicks <= 0)
+                {
+                    completedTicks = 0;
+                    return false;
+                }
+
+                Monitor.Wait(_sync, TimeSpan.FromSeconds(remainingTicks / (double)Stopwatch.Frequency));
+            }
+
+            completedTicks = _pauseCompletedTicks;
+            return _pauseAcknowledged;
         }
     }
 
@@ -527,6 +696,11 @@ internal sealed class StateSystem(SimulationRuntimeState state) : CallbackSystem
 
     protected override void Execute(TickContext context)
     {
+        if (!state.BeginTick())
+        {
+            return;
+        }
+
         foreach (var shipId in context.Transaction.Query<Ship>().Execute())
         {
             var ship = context.Transaction.OpenMut(shipId);
@@ -1107,7 +1281,16 @@ internal sealed class TargetingSystem(SimulationRuntimeState state) : CallbackSy
                 TicksRemaining = BehaviorRules.LockAcquisitionDurationTicks,
                 Status = (byte)TargetLockStatus.Acquiring,
             };
-            context.Transaction.Spawn<TargetLock>(TargetLock.Data.Set(in targetLock));
+            var pauseCheckpoint = new PauseTargetLockCheckpointComponent
+            {
+                OwnerEntityKey = shipId.EntityKey,
+                TargetEntityKey = targetId.EntityKey,
+                TicksRemaining = targetLock.TicksRemaining,
+                Status = targetLock.Status,
+            };
+            context.Transaction.Spawn<TargetLock>(
+                TargetLock.Data.Set(in targetLock),
+                TargetLock.PauseCheckpoint.Set(in pauseCheckpoint));
             activeLockCounts[shipId.EntityKey] =
                 activeLockCounts.GetValueOrDefault(shipId.EntityKey) + 1;
         }
@@ -1525,9 +1708,11 @@ internal sealed class OutputSystem(
 
     protected override void Execute(TickContext context)
     {
+        ulong completedTicks = 0;
+        bool tickCompleted = false;
         try
         {
-            ulong completedTicks = state.CompletedTicksForRuntimeTick(context.TickNumber);
+            completedTicks = state.CompletedTicksForRuntimeTick(context.TickNumber);
             ref SimulationRunComponent run = ref context.Transaction.OpenMut(state.RunEntityId)
                 .Write(SimulationRunEntity.Run);
             run.CompletedTicks = completedTicks;
@@ -1556,9 +1741,11 @@ internal sealed class OutputSystem(
             }
 
             state.MarkCompletedTicks(completedTicks);
+            tickCompleted = true;
         }
         finally
         {
+            state.EndTick(completedTicks, tickCompleted);
             damageResolutionState.Clear();
         }
     }
