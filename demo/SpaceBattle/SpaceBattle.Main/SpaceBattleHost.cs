@@ -104,7 +104,6 @@ public static class SpaceBattleHost
         {
             persistedRun = existingRun.Value;
             ValidateRunIdentity(definition, persistedRun);
-            SpaceBattleRecoveryValidation.ValidateCurrent(engine, definition, persistedRun.EntityId);
             return ResumeRunningRun(engine, definition, persistedRun);
         }
 
@@ -279,6 +278,7 @@ public static class SpaceBattleHost
         }
 
         SpaceBattleCheckpoint.Restore(engine, definition, persistedRun.EntityId, persistedRun.CompletedTicks);
+        SpaceBattleRecoveryValidation.ValidateCurrent(engine, definition, persistedRun.EntityId);
         using var transaction = engine.CreateQuickTransaction(DurabilityMode.Immediate);
         ref var runState = ref transaction.OpenMut(persistedRun.EntityId).Write(SimulationRunEntity.State);
         runState.ProcessSegment = checked(runState.ProcessSegment + 1);

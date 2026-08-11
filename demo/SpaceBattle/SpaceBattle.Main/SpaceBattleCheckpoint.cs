@@ -244,13 +244,17 @@ internal static class SpaceBattleCheckpoint
         {
             EntityRef targetLock = transaction.OpenMut(validatedTargetLock.EntityId);
             PauseTargetLockCheckpointComponent checkpoint = validatedTargetLock.Checkpoint;
-            targetLock.Write(TargetLock.Data) = new TargetLockComponent
+            ref readonly TargetLockComponent currentData = ref targetLock.Read(TargetLock.Data);
+            if ((EntityId)currentData.Owner != validatedTargetLock.Owner ||
+                (EntityId)currentData.Target != validatedTargetLock.Target)
             {
-                Owner = validatedTargetLock.Owner,
-                Target = validatedTargetLock.Target,
-                TicksRemaining = checkpoint.TicksRemaining,
-                Status = checkpoint.Status,
-            };
+                throw SpaceBattleRecoveryValidation.Invalid(
+                    $"目标锁 {validatedTargetLock.EntityId.EntityKey} 的权威端点与暂停检查点不一致。");
+            }
+
+            ref TargetLockComponent data = ref targetLock.Write(TargetLock.Data);
+            data.TicksRemaining = checkpoint.TicksRemaining;
+            data.Status = checkpoint.Status;
         }
 
         transaction.Commit();

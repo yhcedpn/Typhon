@@ -228,17 +228,40 @@ public sealed class PauseRecoveryTests
             databaseLocation,
             CancellationToken.None,
             new RecordingObservationSink());
-        InitialWorldSnapshot snapshot = simulation.WaitForSnapshot(252, TimeSpan.FromSeconds(20));
+        simulation.WaitForSnapshot(252, TimeSpan.FromSeconds(20));
         simulation.RequestPause();
         Assert.That(simulation.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
 
+        InitialWorldSnapshot snapshot = simulation.GetSnapshot();
         SpaceBattleRuntimeDiagnosticsSnapshot diagnostics = simulation.GetRuntimeDiagnostics();
+        AssertLockIndexesMatch(snapshot, diagnostics);
+
+        ulong pausedTick = snapshot.Run.CompletedTicks;
+        simulation.Dispose();
+        using var resumed = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+        Assert.That(resumed.WaitForCompletedTicks(
+            checked(pausedTick + 1),
+            TimeSpan.FromSeconds(5)), Is.True);
+        resumed.RequestPause();
+        Assert.That(resumed.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
+        AssertLockIndexesMatch(resumed.GetSnapshot(), resumed.GetRuntimeDiagnostics());
+    }
+
+    private static void AssertLockIndexesMatch(
+        InitialWorldSnapshot snapshot,
+        SpaceBattleRuntimeDiagnosticsSnapshot diagnostics)
+    {
         IReadOnlyDictionary<long, int> ownerCounts = snapshot.TargetLocks
             .GroupBy(static targetLock => targetLock.OwnerEntityKey)
             .ToDictionary(static group => group.Key, static group => group.Count());
         IReadOnlyDictionary<long, int> targetCounts = snapshot.TargetLocks
             .GroupBy(static targetLock => targetLock.TargetEntityKey)
             .ToDictionary(static group => group.Key, static group => group.Count());
+        HashSet<long> shipKeys = snapshot.Ships.Select(static ship => ship.EntityKey).ToHashSet();
 
         Assert.Multiple(() =>
         {
@@ -246,6 +269,8 @@ public sealed class PauseRecoveryTests
             Assert.That(diagnostics.TargetLockIndex, Is.EqualTo(targetCounts));
             Assert.That(diagnostics.DerivedActiveLockCount, Is.EqualTo(snapshot.TargetLocks.Count));
             Assert.That(diagnostics.DerivedAliveShipCount, Is.EqualTo(snapshot.Ships.Count));
+            Assert.That(snapshot.TargetLocks, Has.All.Matches<TargetLockSnapshot>(targetLock =>
+                shipKeys.Contains(targetLock.OwnerEntityKey) && shipKeys.Contains(targetLock.TargetEntityKey)));
         });
     }
 

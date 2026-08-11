@@ -1,6 +1,7 @@
 using System.IO;
 using System.Threading;
 using NUnit.Framework;
+using Typhon.Engine;
 
 namespace SpaceBattle.Tests;
 
@@ -354,15 +355,177 @@ public sealed class TargetLockTests
         });
     }
 
+    [Test]
+    public void RuntimeDiagnostics_KeepBothLockDirectionsConsistentAfterDeathsAndRelocking()
+    {
+        SimulationDefinition definition = CreateCombatDefinition(
+            "target-lock-index-lifecycle-test",
+            maximumHealth: 200);
+        string databaseLocation = Path.Combine(_temporaryDirectory, "index-lifecycle.typhon");
+
+        using SpaceBattleSimulation simulation = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+
+        simulation.WaitForSnapshots(
+            [300, 301, 302, 303],
+            TimeSpan.FromSeconds(20));
+        simulation.RequestPause();
+        Assert.That(simulation.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
+
+        InitialWorldSnapshot snapshot = simulation.GetSnapshot();
+        SpaceBattleRuntimeDiagnosticsSnapshot diagnostics = simulation.GetRuntimeDiagnostics();
+        IReadOnlyDictionary<long, int> ownerCounts = snapshot.TargetLocks
+            .GroupBy(static targetLock => targetLock.OwnerEntityKey)
+            .ToDictionary(static group => group.Key, static group => group.Count());
+        IReadOnlyDictionary<long, int> targetCounts = snapshot.TargetLocks
+            .GroupBy(static targetLock => targetLock.TargetEntityKey)
+            .ToDictionary(static group => group.Key, static group => group.Count());
+        HashSet<long> shipKeys = snapshot.Ships.Select(static ship => ship.EntityKey).ToHashSet();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(diagnostics.OwnerLockIndex, Is.EqualTo(ownerCounts));
+            Assert.That(diagnostics.TargetLockIndex, Is.EqualTo(targetCounts));
+            Assert.That(diagnostics.DerivedActiveLockCount, Is.EqualTo(snapshot.TargetLocks.Count));
+            Assert.That(snapshot.TargetLocks, Has.All.Matches<TargetLockSnapshot>(targetLock =>
+                shipKeys.Contains(targetLock.OwnerEntityKey) && shipKeys.Contains(targetLock.TargetEntityKey)));
+        });
+    }
+
+    [Test]
+    public void TargetLockCleanup_WhenTargetMovesOutOfRange_RemovesLockAndAllowsRelocking()
+    {
+        SimulationDefinition initialDefinition = CreateCombatDefinition(
+            "target-lock-range-relock-test",
+            maximumHealth: uint.MaxValue,
+            shipCount: 2);
+        SimulationDefinition resumedDefinition = CreateCombatDefinition(
+            "target-lock-range-relock-test",
+            maximumHealth: uint.MaxValue,
+            shipCount: 2,
+            worldSize: 1_000f);
+        string databaseLocation = Path.Combine(_temporaryDirectory, "range-relock.typhon");
+        InitialWorldSnapshot pausedSnapshot;
+
+        using (SpaceBattleSimulation simulation = SpaceBattleHost.Start(
+                   initialDefinition,
+                   databaseLocation,
+                   CancellationToken.None,
+                   new RecordingObservationSink()))
+        {
+            simulation.WaitForSnapshot(303, TimeSpan.FromSeconds(20));
+            simulation.RequestPause();
+            Assert.That(simulation.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
+            pausedSnapshot = simulation.GetSnapshot();
+        }
+
+        TargetLockSnapshot lockToBreak = pausedSnapshot.TargetLocks
+            .First(static targetLock => targetLock.Status == TargetLockStatus.Locked);
+        ShipSnapshot ownerBeforeMove = pausedSnapshot.Ships
+            .Single(ship => ship.EntityKey == lockToBreak.OwnerEntityKey);
+        float farX = ownerBeforeMove.Position.X < resumedDefinition.WorldSize / 2f
+            ? resumedDefinition.WorldSize - 1f
+            : 0f;
+        SetShipPosition(
+            resumedDefinition,
+            databaseLocation,
+            lockToBreak.TargetEntityKey,
+            new PositionSnapshot(farX, ownerBeforeMove.Position.Y, ownerBeforeMove.Position.Z));
+
+        InitialWorldSnapshot outOfRangeSnapshot;
+        using (SpaceBattleSimulation simulation = SpaceBattleHost.Start(
+                   resumedDefinition,
+                   databaseLocation,
+                   CancellationToken.None,
+                   new RecordingObservationSink()))
+        {
+            ulong nextTick = checked(pausedSnapshot.Run.CompletedTicks + 1);
+            Assert.That(simulation.WaitForCompletedTicks(nextTick, TimeSpan.FromSeconds(5)), Is.True);
+            simulation.RequestPause();
+            Assert.That(simulation.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
+            outOfRangeSnapshot = simulation.GetSnapshot();
+        }
+
+        Assert.That(
+            outOfRangeSnapshot.TargetLocks.Select(static targetLock => targetLock.EntityKey),
+            Does.Not.Contain(lockToBreak.EntityKey));
+
+        ShipSnapshot ownerAfterMove = outOfRangeSnapshot.Ships
+            .Single(ship => ship.EntityKey == lockToBreak.OwnerEntityKey);
+        SetShipPosition(
+            resumedDefinition,
+            databaseLocation,
+            lockToBreak.TargetEntityKey,
+            ownerAfterMove.Position);
+
+        InitialWorldSnapshot relockedSnapshot;
+        using (SpaceBattleSimulation simulation = SpaceBattleHost.Start(
+                   resumedDefinition,
+                   databaseLocation,
+                   CancellationToken.None,
+                   new RecordingObservationSink()))
+        {
+            ulong nextTick = checked(outOfRangeSnapshot.Run.CompletedTicks + 1);
+            Assert.That(simulation.WaitForCompletedTicks(nextTick, TimeSpan.FromSeconds(5)), Is.True);
+            simulation.RequestPause();
+            Assert.That(simulation.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
+            relockedSnapshot = simulation.GetSnapshot();
+        }
+
+        Assert.That(relockedSnapshot.TargetLocks, Has.Some.Matches<TargetLockSnapshot>(targetLock =>
+            targetLock.EntityKey != lockToBreak.EntityKey &&
+            targetLock.OwnerEntityKey == lockToBreak.OwnerEntityKey &&
+            targetLock.TargetEntityKey == lockToBreak.TargetEntityKey));
+    }
+
+    private static void SetShipPosition(
+        SimulationDefinition definition,
+        string databaseLocation,
+        long shipEntityKey,
+        PositionSnapshot position)
+    {
+        using var engine = SpaceBattleDatabase.Open(definition, databaseLocation);
+        using var transaction = engine.CreateQuickTransaction(Typhon.Engine.DurabilityMode.Immediate);
+        EntityId shipId = transaction.Query<Ship>().Execute()
+            .Single(entityId => entityId.EntityKey == shipEntityKey);
+        EntityRef ship = transaction.OpenMut(shipId);
+        ref PositionComponent currentPosition = ref ship.Write(Ship.Position);
+        currentPosition.X = position.X;
+        currentPosition.Y = position.Y;
+        currentPosition.Z = position.Z;
+        ref SpatialBoundsComponent bounds = ref ship.Write(Ship.SpatialBounds);
+        bounds.Bounds.MinX = position.X;
+        bounds.Bounds.MinY = position.Y;
+        bounds.Bounds.MinZ = position.Z;
+        bounds.Bounds.MaxX = position.X;
+        bounds.Bounds.MaxY = position.Y;
+        bounds.Bounds.MaxZ = position.Z;
+        ref PauseShipCheckpointComponent checkpoint = ref ship.Write(Ship.PauseCheckpoint);
+        checkpoint.PositionX = position.X;
+        checkpoint.PositionY = position.Y;
+        checkpoint.PositionZ = position.Z;
+        checkpoint.BoundsMinX = position.X;
+        checkpoint.BoundsMinY = position.Y;
+        checkpoint.BoundsMinZ = position.Z;
+        checkpoint.BoundsMaxX = position.X;
+        checkpoint.BoundsMaxY = position.Y;
+        checkpoint.BoundsMaxZ = position.Z;
+        transaction.Commit();
+    }
+
     private static SimulationDefinition CreateCombatDefinition(
         string runName,
         uint maximumHealth = 1_000,
-        int shipCount = 64) => new(
+        int shipCount = 64,
+        float worldSize = 100f) => new(
         runName: runName,
         shipCount,
         seed: SimulationDefinition.DefaultSeed,
         rulesetVersion: 1,
-        worldSize: 100f,
+        worldSize,
         maximumHealth: maximumHealth,
         stagingTicks: 0,
         spatialCellSize: 100f,
