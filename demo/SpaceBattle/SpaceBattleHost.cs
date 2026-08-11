@@ -79,7 +79,8 @@ public static class SpaceBattleHost
                 definition,
                 persistedRun.EntityId,
                 persistedRun.CompletedTicks,
-                startupResult);
+                startupResult,
+                observationSink);
             simulation.RegisterPauseCancellation(cancellationToken);
             engine = null!;
             return simulation;

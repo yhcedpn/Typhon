@@ -1,3 +1,5 @@
+using Typhon.Engine;
+
 namespace SpaceBattle;
 
 internal static class Program
@@ -98,10 +100,30 @@ internal static class Program
     {
         public void Publish(SpaceBattleObservation observation)
         {
-            if (observation is InitializationCompleted completed)
+            switch (observation)
             {
-                Console.WriteLine(
-                    $"初始化完成：{completed.ShipCount:N0} 艘飞船，耗时 {completed.Duration.TotalSeconds:F2} 秒。");
+                case InitializationCompleted completed:
+                    Console.WriteLine(
+                        $"初始化完成：{completed.ShipCount:N0} 艘飞船，耗时 {completed.Duration.TotalSeconds:F2} 秒。");
+                    break;
+                case SpaceBattleLogSnapshot log:
+                    Console.WriteLine(
+                        $"战况：segment {log.ProcessSegment}，tick {log.CompletedTicks:N0}，存活 {log.Counters.AliveShipCount:N0}，" +
+                        $"锁定 {log.Counters.ActiveLockCount:N0}，射击 {log.Counters.ShotsFired:N0}，命中 {log.Counters.Hits:N0}，" +
+                        $"死亡 {log.Counters.Deaths:N0}；tick p50/p95/p99 " +
+                        $"{log.Performance.P50ActualDurationMilliseconds:F2}/" +
+                        $"{log.Performance.P95ActualDurationMilliseconds:F2}/" +
+                        $"{log.Performance.P99ActualDurationMilliseconds:F2} ms，" +
+                        $"超预算 {log.Performance.OverrunCount:N0} 次，状态 {log.Run.Status}。");
+                    break;
+                case SpaceBattleResourceSnapshot resources:
+                    NodeSnapshot bottleneck = resources.Snapshot.FindMostUtilized();
+                    Console.WriteLine(
+                        $"资源：segment {resources.ProcessSegment}，tick {resources.CompletedTicks:N0}，" +
+                        $"节点 {resources.Snapshot.Nodes.Count:N0}，" +
+                        $"最高容量利用率 {(bottleneck?.Capacity?.Utilization ?? 0d):P1}" +
+                        (bottleneck is null ? string.Empty : $"（{bottleneck.Path}）"));
+                    break;
             }
         }
     }
