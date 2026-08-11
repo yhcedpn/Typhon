@@ -7,6 +7,14 @@ public enum SimulationRunStatus : byte
     TimedOut = 3,
 }
 
+public enum SimulationRunOutcome : byte
+{
+    None = 0,
+    Winner = 1,
+    Draw = 2,
+    TimedOut = 3,
+}
+
 public enum SimulationStartupAction : byte
 {
     Initialized = 1,
@@ -53,7 +61,9 @@ public sealed record SimulationRunSnapshot(
     uint InitialShipCount,
     uint AliveShipCount,
     uint ProcessSegment,
-    SimulationRunStatus Status);
+    SimulationRunStatus Status,
+    SimulationRunOutcome Outcome,
+    long? WinnerEntityKey);
 
 public sealed record ShipSnapshot(
     long EntityKey,

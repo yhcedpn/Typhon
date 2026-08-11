@@ -143,6 +143,8 @@ public static class SpaceBattleHost
         {
             ProcessSegment = 1,
             Status = (byte)SimulationRunStatus.Running,
+            Outcome = (byte)SimulationRunOutcome.None,
+            WinnerEntityKey = 0,
         };
         bulkLoad.Spawn<SimulationRunEntity>(
             SimulationRunEntity.Run.Set(in run),
@@ -319,7 +321,11 @@ public static class SpaceBattleHost
             run.InitialShipCount,
             run.AliveShipCount,
             runState.ProcessSegment,
-            (SimulationRunStatus)runState.Status);
+            (SimulationRunStatus)runState.Status,
+            (SimulationRunOutcome)runState.Outcome,
+            runState.Outcome == (byte)SimulationRunOutcome.Winner
+                ? runState.WinnerEntityKey
+                : null);
 
         var shipEntities = transaction.Query<Ship>().Execute().OrderBy(static id => id.EntityKey);
         var ships = new List<ShipSnapshot>();

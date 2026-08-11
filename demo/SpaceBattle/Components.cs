@@ -15,12 +15,14 @@ public struct SimulationRunComponent
     [Field] public uint AliveShipCount;
 }
 
-[Component("SpaceBattle.SimulationRunState", 1)]
+[Component("SpaceBattle.SimulationRunState", 2)]
 [StructLayout(LayoutKind.Sequential)]
 public struct SimulationRunStateComponent
 {
-    [Field] public byte Status;
+    [Field] public long WinnerEntityKey;
     [Field] public uint ProcessSegment;
+    [Field] public byte Status;
+    [Field] public byte Outcome;
 }
 
 [Component("SpaceBattle.Position", 1, StorageMode = StorageMode.SingleVersion)]

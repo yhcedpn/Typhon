@@ -9,6 +9,8 @@ public sealed class SpaceBattleSimulation : IDisposable
     private readonly DatabaseEngine _engine;
     private readonly TyphonRuntime _runtime;
     private readonly SimulationRuntimeState _state;
+    private readonly object _terminalPersistenceSync = new();
+    private bool _terminalStatePersisted;
     private bool _disposed;
 
     internal SpaceBattleSimulation(
@@ -65,6 +67,28 @@ public sealed class SpaceBattleSimulation : IDisposable
         return remaining > TimeSpan.Zero && SpinWait.SpinUntil(
             () => _runtime.CurrentTickNumber >= _state.RuntimeTicksRequired(completedTicks),
             remaining);
+    }
+
+    public bool WaitForTerminal(TimeSpan timeout)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var startedAt = Stopwatch.GetTimestamp();
+        if (!_state.WaitForTerminal(timeout, out ulong completedTicks))
+        {
+            return false;
+        }
+
+        var elapsed = Stopwatch.GetTimestamp() - startedAt;
+        var remaining = timeout - TimeSpan.FromSeconds(elapsed / (double)Stopwatch.Frequency);
+        if (remaining <= TimeSpan.Zero || !SpinWait.SpinUntil(
+                () => _runtime.CurrentTickNumber >= _state.RuntimeTicksRequired(completedTicks),
+                remaining))
+        {
+            return false;
+        }
+
+        PersistTerminalState();
+        return true;
     }
 
     public InitialWorldSnapshot GetSnapshot()
@@ -128,12 +152,14 @@ public sealed class SpaceBattleSimulation : IDisposable
         SpaceBattleRunResult startupResult)
     {
         EcsView<Ship> ships;
+        uint aliveShipCount;
         using (Transaction transaction = engine.CreateQuickTransaction())
         {
             ships = transaction.Query<Ship>().ToView();
+            aliveShipCount = checked((uint)transaction.Query<Ship>().Execute().Count);
         }
 
-        SimulationRuntimeState state = new(definition, runEntityId, completedTicks, ships);
+        SimulationRuntimeState state = new(definition, runEntityId, completedTicks, aliveShipCount, ships);
         TyphonRuntime runtime = null!;
 
         try
@@ -176,6 +202,28 @@ public sealed class SpaceBattleSimulation : IDisposable
         _engine.Dispose();
     }
 
+    private void PersistTerminalState()
+    {
+        lock (_terminalPersistenceSync)
+        {
+            if (_terminalStatePersisted)
+            {
+                return;
+            }
+
+            using var transaction = _engine.CreateQuickTransaction(DurabilityMode.Immediate);
+            ref SimulationRunStateComponent runState = ref transaction.OpenMut(_state.RunEntityId)
+                .Write(SimulationRunEntity.State);
+            if ((SimulationRunStatus)runState.Status == SimulationRunStatus.Running)
+            {
+                throw new InvalidOperationException("终态尚未写入 SimulationRun。");
+            }
+
+            transaction.Commit();
+            _terminalStatePersisted = true;
+        }
+    }
+
     private static void ConfigureRuntime(RuntimeSchedule schedule, SimulationRuntimeState state)
     {
         var dag = schedule.PublicTrack.DeclareDag("SpaceBattle")
@@ -190,13 +238,13 @@ public sealed class SpaceBattleSimulation : IDisposable
                 SpaceBattlePhases.Output);
         EventQueue<DamageIntent>[] damageIntentQueues = CreateDamageIntentQueues(dag);
         DamageResolutionState damageResolutionState = new();
-        dag.Add(new StateSystem());
+        dag.Add(new StateSystem(state));
         dag.Add(new SteeringSystem(state));
         dag.Add(new MovementSystem(state));
         dag.Add(new TargetLockCleanupSystem(state));
         dag.Add(new TargetingSystem(state));
-        dag.Add(new CombatSystem(state.Ships, damageIntentQueues));
-        dag.Add(new DamageResolutionSystem(damageIntentQueues, damageResolutionState));
+        dag.Add(new CombatSystem(state, state.Ships, damageIntentQueues));
+        dag.Add(new DamageResolutionSystem(state, damageIntentQueues, damageResolutionState));
         dag.Add(new ResolutionSystem(state, damageResolutionState));
         dag.Add(new OutputSystem(state, damageResolutionState));
     }
@@ -258,6 +306,9 @@ internal sealed class SimulationRuntimeState : IDisposable
 {
     private readonly object _sync = new();
     private ulong _completedTicks;
+    private ulong _terminalCompletedTicks;
+    private uint _aliveShipCount;
+    private int _isRunning = 1;
     private ulong[] _requestedSnapshotTicks = [];
     private readonly Dictionary<ulong, InitialWorldSnapshot> _snapshots = new();
 
@@ -265,11 +316,13 @@ internal sealed class SimulationRuntimeState : IDisposable
         SimulationDefinition definition,
         EntityId runEntityId,
         ulong completedTicks,
+        uint aliveShipCount,
         EcsView<Ship> ships)
     {
         Definition = definition;
         RunEntityId = runEntityId;
         _completedTicks = completedTicks;
+        _aliveShipCount = aliveShipCount;
         StartingCompletedTicks = completedTicks;
         Ships = ships;
     }
@@ -281,6 +334,8 @@ internal sealed class SimulationRuntimeState : IDisposable
     public ulong StartingCompletedTicks { get; }
 
     public EcsView<Ship> Ships { get; }
+
+    public bool IsRunning => Volatile.Read(ref _isRunning) != 0;
 
     public void Dispose() => Ships.Dispose();
 
@@ -308,6 +363,56 @@ internal sealed class SimulationRuntimeState : IDisposable
         {
             _completedTicks = completedTicks;
             Monitor.PulseAll(_sync);
+        }
+    }
+
+    public uint ApplyDestroyedShips(int destroyedShipCount)
+    {
+        lock (_sync)
+        {
+            _aliveShipCount = checked(_aliveShipCount - (uint)destroyedShipCount);
+            return _aliveShipCount;
+        }
+    }
+
+    public void SetAliveShipCount(uint aliveShipCount)
+    {
+        lock (_sync)
+        {
+            _aliveShipCount = aliveShipCount;
+        }
+    }
+
+    public void MarkTerminal(ulong completedTicks)
+    {
+        lock (_sync)
+        {
+            _terminalCompletedTicks = completedTicks;
+            Volatile.Write(ref _isRunning, 0);
+            Monitor.PulseAll(_sync);
+        }
+    }
+
+    public bool WaitForTerminal(TimeSpan timeout, out ulong completedTicks)
+    {
+        var deadline = Stopwatch.GetTimestamp() + (long)(timeout.TotalSeconds * Stopwatch.Frequency);
+
+        lock (_sync)
+        {
+            while (IsRunning)
+            {
+                var remainingTicks = deadline - Stopwatch.GetTimestamp();
+                if (remainingTicks <= 0)
+                {
+                    completedTicks = 0;
+                    return false;
+                }
+
+                Monitor.Wait(_sync, TimeSpan.FromSeconds(remainingTicks / (double)Stopwatch.Frequency));
+            }
+
+            completedTicks = _terminalCompletedTicks;
+            return true;
         }
     }
 
@@ -412,11 +517,12 @@ internal sealed class SimulationRuntimeState : IDisposable
     }
 }
 
-internal sealed class StateSystem : CallbackSystem
+internal sealed class StateSystem(SimulationRuntimeState state) : CallbackSystem
 {
     protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("State")
         .Phase(SpaceBattlePhases.State)
+        .ShouldRun(() => state.IsRunning)
         .Writes<BehaviorComponent>();
 
     protected override void Execute(TickContext context)
@@ -448,6 +554,7 @@ internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSys
         .Name("Steering")
         .After("State")
         .Phase(SpaceBattlePhases.Steering)
+        .ShouldRun(() => state.IsRunning)
         .ReadsFresh<BehaviorComponent>()
         .Reads<PositionComponent>()
         .Writes<BehaviorComponent>()
@@ -702,6 +809,7 @@ internal sealed class MovementSystem(SimulationRuntimeState state) : CallbackSys
         .Name("Movement")
         .After("Steering")
         .Phase(SpaceBattlePhases.Movement)
+        .ShouldRun(() => state.IsRunning)
         .ReadsFresh<BehaviorComponent>()
         .ReadsFresh<MotionComponent>()
         .Writes<PositionComponent>()
@@ -751,6 +859,7 @@ internal sealed class TargetLockCleanupSystem(SimulationRuntimeState state) : Ca
         .Name("TargetLockCleanup")
         .After("Movement")
         .Phase(SpaceBattlePhases.TargetLockCleanup)
+        .ShouldRun(() => state.IsRunning)
         .Reads<PositionComponent>()
         .ReadsFresh<BehaviorComponent>()
         .ReadsFresh<TargetLockComponent>()
@@ -950,6 +1059,7 @@ internal sealed class TargetingSystem(SimulationRuntimeState state) : CallbackSy
         .Name("Targeting")
         .After("TargetLockCleanup")
         .Phase(SpaceBattlePhases.Targeting)
+        .ShouldRun(() => state.IsRunning)
         .Reads<PositionComponent>()
         .ReadsFresh<BehaviorComponent>()
         .ReadsFresh<TargetLockComponent>()
@@ -1048,6 +1158,7 @@ internal sealed class TargetingSystem(SimulationRuntimeState state) : CallbackSy
 }
 
 internal sealed class CombatSystem(
+    SimulationRuntimeState state,
     EcsView<Ship> ships,
     IReadOnlyList<EventQueue<DamageIntent>> damageIntentQueues) : QuerySystem
 {
@@ -1057,6 +1168,7 @@ internal sealed class CombatSystem(
             .Name("Combat")
             .After("Targeting")
             .Phase(SpaceBattlePhases.Combat)
+            .ShouldRun(() => state.IsRunning)
             .Input(() => ships)
             .Parallel()
             .ReadsFresh<BehaviorComponent>()
@@ -1104,6 +1216,7 @@ internal sealed class CombatSystem(
 }
 
 internal sealed class DamageResolutionSystem(
+    SimulationRuntimeState state,
     IReadOnlyList<EventQueue<DamageIntent>> damageIntentQueues,
     DamageResolutionState damageResolutionState) : CallbackSystem
 {
@@ -1113,7 +1226,7 @@ internal sealed class DamageResolutionSystem(
             .Name("DamageResolution")
             .After("Combat")
             .Phase(SpaceBattlePhases.Resolution)
-            .ShouldRun(HasDamageIntents)
+            .ShouldRun(() => state.IsRunning && HasDamageIntents())
             .Writes<HealthComponent>();
 
         foreach (EventQueue<DamageIntent> queue in damageIntentQueues)
@@ -1179,6 +1292,7 @@ internal sealed class DamageResolutionSystem(
                     if (resolution.IsDestroyed)
                     {
                         RecordKillParticipations(damageIntents, groupStart, groupEnd, targetId);
+                        damageResolutionState.RecordDestroyedShip();
                         context.Transaction.Destroy(targetId);
                     }
                     else if (resolution.AppliedDamage > 0)
@@ -1243,12 +1357,17 @@ internal sealed class DamageResolutionState
 
     public HashSet<EntityId> DamagedSurvivors { get; } = [];
 
+    public int DestroyedShipCount { get; private set; }
+
     public void AddDamagedSurvivor(EntityId shipId) => DamagedSurvivors.Add(shipId);
+
+    public void RecordDestroyedShip() => DestroyedShipCount++;
 
     public void Clear()
     {
         _killParticipations.Clear();
         DamagedSurvivors.Clear();
+        DestroyedShipCount = 0;
     }
 }
 
@@ -1260,6 +1379,7 @@ internal sealed class ResolutionSystem(
         .Name("Resolution")
         .After("DamageResolution")
         .Phase(SpaceBattlePhases.Resolution)
+        .ShouldRun(() => state.IsRunning)
         .Writes<BehaviorComponent>()
         .Writes<TrackingComponent>()
         .Writes<MotionComponent>()
@@ -1390,7 +1510,7 @@ internal sealed class OutputSystem(
         .Name("Output")
         .After("Resolution")
         .Phase(SpaceBattlePhases.Output)
-        .Reads<SimulationRunStateComponent>()
+        .ShouldRun(() => state.IsRunning)
         .ReadsFresh<PositionComponent>()
         .ReadsFresh<SpatialBoundsComponent>()
         .ReadsFresh<MotionComponent>()
@@ -1400,7 +1520,8 @@ internal sealed class OutputSystem(
         .ReadsFresh<WeaponComponent>()
         .ReadsFresh<AfterburnerComponent>()
         .ReadsFresh<TargetLockComponent>()
-        .Writes<SimulationRunComponent>();
+        .Writes<SimulationRunComponent>()
+        .Writes<SimulationRunStateComponent>();
 
     protected override void Execute(TickContext context)
     {
@@ -1410,6 +1531,23 @@ internal sealed class OutputSystem(
             ref SimulationRunComponent run = ref context.Transaction.OpenMut(state.RunEntityId)
                 .Write(SimulationRunEntity.Run);
             run.CompletedTicks = completedTicks;
+            uint aliveShipCount = state.ApplyDestroyedShips(damageResolutionState.DestroyedShipCount);
+            run.AliveShipCount = aliveShipCount;
+            if (aliveShipCount <= 1 || completedTicks >= state.Definition.MaximumCompletedTicks)
+            {
+                TerminalShipState terminalShipState = ReadTerminalShipState(context);
+                state.SetAliveShipCount(terminalShipState.AliveShipCount);
+                run.AliveShipCount = terminalShipState.AliveShipCount;
+                if (terminalShipState.AliveShipCount <= 1 ||
+                    completedTicks >= state.Definition.MaximumCompletedTicks)
+                {
+                    ref SimulationRunStateComponent runState = ref context.Transaction.OpenMut(state.RunEntityId)
+                        .Write(SimulationRunEntity.State);
+                    SetTerminalResult(terminalShipState, ref runState);
+                    state.MarkTerminal(completedTicks);
+                }
+            }
+
             if (state.IsSnapshotRequested(completedTicks))
             {
                 state.CaptureSnapshot(
@@ -1424,4 +1562,49 @@ internal sealed class OutputSystem(
             damageResolutionState.Clear();
         }
     }
+
+    private static void SetTerminalResult(
+        TerminalShipState terminalShipState,
+        ref SimulationRunStateComponent runState)
+    {
+        if (terminalShipState.AliveShipCount == 1)
+        {
+            runState.Status = (byte)SimulationRunStatus.Completed;
+            runState.Outcome = (byte)SimulationRunOutcome.Winner;
+            runState.WinnerEntityKey = terminalShipState.Winner.EntityKey;
+            return;
+        }
+
+        if (terminalShipState.AliveShipCount == 0)
+        {
+            runState.Status = (byte)SimulationRunStatus.Completed;
+            runState.Outcome = (byte)SimulationRunOutcome.Draw;
+            runState.WinnerEntityKey = 0;
+            return;
+        }
+
+        runState.Status = (byte)SimulationRunStatus.TimedOut;
+        runState.Outcome = (byte)SimulationRunOutcome.TimedOut;
+        runState.WinnerEntityKey = 0;
+    }
+
+    private static TerminalShipState ReadTerminalShipState(TickContext context)
+    {
+        EntityId survivor = EntityId.Null;
+        uint aliveShipCount = 0;
+        foreach (EntityId shipId in context.Transaction.Query<Ship>().Execute())
+        {
+            if (!context.Transaction.IsAlive(shipId))
+            {
+                continue;
+            }
+
+            aliveShipCount++;
+            survivor = aliveShipCount == 1 ? shipId : EntityId.Null;
+        }
+
+        return new TerminalShipState(aliveShipCount, survivor);
+    }
+
+    private readonly record struct TerminalShipState(uint AliveShipCount, EntityId Winner);
 }

@@ -7,6 +7,7 @@ public sealed record SimulationDefinition
     public const float FixedSimulationDeltaSeconds = 0.04f;
     public const float BaseMaximumSpeed = 50f;
     public const float MaximumWanderingSpeed = BaseMaximumSpeed * 0.75f;
+    public const ulong DefaultMaximumCompletedTicks = 45_000;
 
     public static SimulationDefinition Default { get; } = new(
         runName: "default",
@@ -17,7 +18,8 @@ public sealed record SimulationDefinition
         maximumHealth: 1_000,
         stagingTicks: 250,
         spatialCellSize: 100f,
-        spatialMargin: 20f);
+        spatialMargin: 20f,
+        maximumCompletedTicks: DefaultMaximumCompletedTicks);
 
     public SimulationDefinition(
         string runName,
@@ -28,7 +30,8 @@ public sealed record SimulationDefinition
         uint maximumHealth,
         ushort stagingTicks,
         float spatialCellSize,
-        float spatialMargin)
+        float spatialMargin,
+        ulong maximumCompletedTicks = DefaultMaximumCompletedTicks)
     {
         RunName = runName;
         ShipCount = shipCount;
@@ -39,6 +42,8 @@ public sealed record SimulationDefinition
         StagingTicks = stagingTicks;
         SpatialCellSize = spatialCellSize;
         SpatialMargin = spatialMargin;
+        ArgumentOutOfRangeException.ThrowIfZero(maximumCompletedTicks);
+        MaximumCompletedTicks = maximumCompletedTicks;
     }
 
     public string RunName { get; }
@@ -50,4 +55,5 @@ public sealed record SimulationDefinition
     public ushort StagingTicks { get; }
     public float SpatialCellSize { get; }
     public float SpatialMargin { get; }
+    public ulong MaximumCompletedTicks { get; }
 }
