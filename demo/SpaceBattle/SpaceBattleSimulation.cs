@@ -69,6 +69,53 @@ public sealed class SpaceBattleSimulation : IDisposable
         return SpaceBattleHost.ReadSnapshot(_engine);
     }
 
+    public InitialWorldSnapshot WaitForSnapshot(ulong completedTicks, TimeSpan timeout)
+        => WaitForSnapshots([completedTicks], timeout)[0];
+
+    public IReadOnlyList<InitialWorldSnapshot> WaitForSnapshots(
+        IReadOnlyList<ulong> completedTicks,
+        TimeSpan timeout)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(completedTicks);
+        var requestedTicks = completedTicks.Distinct().Order().ToArray();
+        if (requestedTicks.Length == 0)
+        {
+            throw new ArgumentException("至少需要请求一个模拟 tick。", nameof(completedTicks));
+        }
+
+        var startedAt = Stopwatch.GetTimestamp();
+        _state.BeginSnapshotRequest(requestedTicks);
+
+        try
+        {
+            var snapshots = new List<InitialWorldSnapshot>(requestedTicks.Length);
+            foreach (var requestedTick in requestedTicks)
+            {
+                var remaining = timeout - Stopwatch.GetElapsedTime(startedAt);
+                if (remaining <= TimeSpan.Zero ||
+                    !_state.WaitForSnapshot(requestedTick, remaining, out var snapshot))
+                {
+                    throw new TimeoutException($"等待模拟 tick {requestedTick} 的快照超时。");
+                }
+
+                remaining = timeout - Stopwatch.GetElapsedTime(startedAt);
+                if (remaining <= TimeSpan.Zero || !WaitForCompletedTicks(requestedTick, remaining))
+                {
+                    throw new TimeoutException($"等待模拟 tick {requestedTick} 完成持久化超时。");
+                }
+
+                snapshots.Add(snapshot);
+            }
+
+            return snapshots;
+        }
+        finally
+        {
+            _state.EndSnapshotRequest();
+        }
+    }
+
     internal static SpaceBattleSimulation Create(
         DatabaseEngine engine,
         SimulationDefinition definition,
@@ -183,6 +230,8 @@ internal sealed class SimulationRuntimeState
 {
     private readonly object _sync = new();
     private ulong _completedTicks;
+    private ulong[] _requestedSnapshotTicks = [];
+    private readonly Dictionary<ulong, InitialWorldSnapshot> _snapshots = new();
 
     public SimulationRuntimeState(
         SimulationDefinition definition,
@@ -225,6 +274,85 @@ internal sealed class SimulationRuntimeState
         {
             _completedTicks = completedTicks;
             Monitor.PulseAll(_sync);
+        }
+    }
+
+    public void BeginSnapshotRequest(IReadOnlyList<ulong> completedTicks)
+    {
+        lock (_sync)
+        {
+            if (_requestedSnapshotTicks.Length != 0)
+            {
+                throw new InvalidOperationException("同一模拟一次只能等待一组精确 tick 快照。");
+            }
+
+            if (completedTicks[0] <= _completedTicks)
+            {
+                throw new InvalidOperationException(
+                    $"无法读取已经完成的 tick {completedTicks[0]}；当前已完成 tick {_completedTicks}。");
+            }
+
+            _requestedSnapshotTicks = completedTicks.ToArray();
+            _snapshots.Clear();
+        }
+    }
+
+    public bool IsSnapshotRequested(ulong completedTicks)
+    {
+        lock (_sync)
+        {
+            return Array.BinarySearch(_requestedSnapshotTicks, completedTicks) >= 0;
+        }
+    }
+
+    public void CaptureSnapshot(ulong completedTicks, InitialWorldSnapshot snapshot)
+    {
+        lock (_sync)
+        {
+            if (Array.BinarySearch(_requestedSnapshotTicks, completedTicks) < 0)
+            {
+                return;
+            }
+
+            _snapshots[completedTicks] = snapshot;
+            Monitor.PulseAll(_sync);
+        }
+    }
+
+    public bool WaitForSnapshot(
+        ulong completedTicks,
+        TimeSpan timeout,
+        out InitialWorldSnapshot snapshot)
+    {
+        var deadline = Stopwatch.GetTimestamp() + (long)(timeout.TotalSeconds * Stopwatch.Frequency);
+
+        lock (_sync)
+        {
+            while (Array.BinarySearch(_requestedSnapshotTicks, completedTicks) >= 0 &&
+                   !_snapshots.TryGetValue(completedTicks, out snapshot))
+            {
+                var remainingTicks = deadline - Stopwatch.GetTimestamp();
+                if (remainingTicks <= 0)
+                {
+                    snapshot = null!;
+                    return false;
+                }
+
+                Monitor.Wait(_sync, TimeSpan.FromSeconds(remainingTicks / (double)Stopwatch.Frequency));
+            }
+
+            snapshot = null!;
+            return Array.BinarySearch(_requestedSnapshotTicks, completedTicks) >= 0 &&
+                _snapshots.TryGetValue(completedTicks, out snapshot);
+        }
+    }
+
+    public void EndSnapshotRequest()
+    {
+        lock (_sync)
+        {
+            _requestedSnapshotTicks = [];
+            _snapshots.Clear();
         }
     }
 
@@ -868,6 +996,16 @@ internal sealed class OutputSystem(SimulationRuntimeState state) : CallbackSyste
         .Name("Output")
         .After("Resolution")
         .Phase(SpaceBattlePhases.Output)
+        .Reads<SimulationRunStateComponent>()
+        .ReadsFresh<PositionComponent>()
+        .ReadsFresh<SpatialBoundsComponent>()
+        .ReadsFresh<MotionComponent>()
+        .ReadsFresh<HealthComponent>()
+        .ReadsFresh<BehaviorComponent>()
+        .ReadsFresh<TrackingComponent>()
+        .ReadsFresh<WeaponComponent>()
+        .ReadsFresh<AfterburnerComponent>()
+        .ReadsFresh<TargetLockComponent>()
         .Writes<SimulationRunComponent>();
 
     protected override void Execute(TickContext context)
@@ -875,6 +1013,11 @@ internal sealed class OutputSystem(SimulationRuntimeState state) : CallbackSyste
         var completedTicks = state.CompletedTicksForRuntimeTick(context.TickNumber);
         ref var run = ref context.Transaction.OpenMut(state.RunEntityId).Write(SimulationRunEntity.Run);
         run.CompletedTicks = completedTicks;
+        if (state.IsSnapshotRequested(completedTicks))
+        {
+            state.CaptureSnapshot(completedTicks, SpaceBattleHost.ReadSnapshot(context.Transaction));
+        }
+
         state.MarkCompletedTicks(completedTicks);
     }
 }

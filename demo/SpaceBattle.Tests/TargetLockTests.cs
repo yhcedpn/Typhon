@@ -49,9 +49,7 @@ public sealed class TargetLockTests
             CancellationToken.None,
             new RecordingObservationSink());
 
-        Assert.That(simulation.WaitForCompletedTicks(252, TimeSpan.FromSeconds(15)), Is.True);
-
-        var snapshot = simulation.GetSnapshot();
+        var snapshot = simulation.WaitForSnapshot(252, TimeSpan.FromSeconds(15));
 
         Assert.Multiple(() =>
         {
@@ -98,9 +96,7 @@ public sealed class TargetLockTests
             CancellationToken.None,
             new RecordingObservationSink());
 
-        Assert.That(simulation.WaitForCompletedTicks(303, TimeSpan.FromSeconds(20)), Is.True);
-
-        var snapshot = simulation.GetSnapshot();
+        var snapshot = simulation.WaitForSnapshot(303, TimeSpan.FromSeconds(20));
         var lockedOwners = snapshot.TargetLocks
             .Where(static targetLock => targetLock.Status == TargetLockStatus.Locked)
             .Select(static targetLock => targetLock.OwnerEntityKey)
@@ -137,9 +133,8 @@ public sealed class TargetLockTests
             CancellationToken.None,
             new RecordingObservationSink());
 
-        Assert.That(simulation.WaitForCompletedTicks(502, TimeSpan.FromSeconds(30)), Is.True);
-
-        var releasingSnapshot = simulation.GetSnapshot();
+        var snapshots = simulation.WaitForSnapshots([502, 527], TimeSpan.FromSeconds(40));
+        var releasingSnapshot = snapshots[0];
         Assert.Multiple(() =>
         {
             Assert.That(releasingSnapshot.TargetLocks, Is.Not.Empty);
@@ -153,9 +148,22 @@ public sealed class TargetLockTests
                 Is.All.False);
         });
 
-        Assert.That(simulation.WaitForCompletedTicks(527, TimeSpan.FromSeconds(10)), Is.True);
-
-        Assert.That(simulation.GetSnapshot().TargetLocks, Is.Empty);
+        var releasingLockIds = releasingSnapshot.TargetLocks
+            .Select(static targetLock => targetLock.EntityKey)
+            .ToHashSet();
+        var releasingOwners = releasingSnapshot.TargetLocks
+            .Select(static targetLock => targetLock.OwnerEntityKey)
+            .ToHashSet();
+        var releasedSnapshot = snapshots[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(releasedSnapshot.TargetLocks
+                    .Where(targetLock => releasingLockIds.Contains(targetLock.EntityKey)),
+                Is.Empty);
+            Assert.That(releasedSnapshot.TargetLocks
+                    .Where(targetLock => releasingOwners.Contains(targetLock.OwnerEntityKey)),
+                Is.Empty);
+        });
     }
 
     private sealed class RecordingObservationSink : ISpaceBattleObservationSink

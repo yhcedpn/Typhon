@@ -23,13 +23,15 @@ public static class SpaceBattleHost
 
         var databaseAlreadyExists = Directory.Exists(databaseLocation) || File.Exists(databaseLocation);
         using var engine = SpaceBattleDatabase.Open(definition, databaseLocation);
-        return InitializeOrResume(
+        var result = InitializeOrResume(
             engine,
             definition,
             databaseAlreadyExists,
             cancellationToken,
             observationSink,
             out _);
+        PublishInitializationCompleted(result, observationSink);
+        return result;
     }
 
     public static SpaceBattleSimulation Start(
@@ -55,6 +57,20 @@ public static class SpaceBattleHost
                 cancellationToken,
                 observationSink,
                 out var persistedRun);
+
+            if (startupResult.StartupAction == SimulationStartupAction.Initialized)
+            {
+                var reopenStartedAt = Stopwatch.GetTimestamp();
+                engine.Dispose();
+                engine = SpaceBattleDatabase.Open(definition, databaseLocation);
+                startupResult = startupResult with
+                {
+                    InitializationDuration = startupResult.InitializationDuration +
+                        Stopwatch.GetElapsedTime(reopenStartedAt),
+                };
+            }
+
+            PublishInitializationCompleted(startupResult, observationSink);
 
             var simulation = SpaceBattleSimulation.Create(
                 engine,
@@ -168,15 +184,24 @@ public static class SpaceBattleHost
 
         cancellationToken.ThrowIfCancellationRequested();
         bulkLoad.CompleteBulkLoad();
-        engine.WriteTickFence(0);
         stopwatch.Stop();
 
-        var observation = new InitializationCompleted(definition.ShipCount, stopwatch.Elapsed);
-        observationSink.Publish(observation);
         return new SpaceBattleRunResult(
             definition.ShipCount,
             stopwatch.Elapsed,
             SimulationStartupAction.Initialized);
+    }
+
+    private static void PublishInitializationCompleted(
+        SpaceBattleRunResult result,
+        ISpaceBattleObservationSink observationSink)
+    {
+        if (result.StartupAction == SimulationStartupAction.Initialized)
+        {
+            observationSink.Publish(new InitializationCompleted(
+                result.ShipCount,
+                result.InitializationDuration));
+        }
     }
 
     private static PersistedRun? FindPersistedRun(
@@ -265,7 +290,12 @@ public static class SpaceBattleHost
     {
         ArgumentNullException.ThrowIfNull(engine);
         using var transaction = engine.CreateReadOnlyTransaction();
+        return ReadSnapshot(transaction);
+    }
 
+    internal static InitialWorldSnapshot ReadSnapshot(Transaction transaction)
+    {
+        ArgumentNullException.ThrowIfNull(transaction);
         var runEntities = transaction.Query<SimulationRunEntity>().Execute();
         if (runEntities.Count != 1)
         {

@@ -73,7 +73,7 @@ public sealed class RuntimeProgressionTests
     [Test]
     public void Start_KeepsShipsInStagingForTheFullDurationThenAdvancesExactlyOneFixedStep()
     {
-        var definition = CreateDefinition(stagingTicks: 2);
+        var definition = CreateDefinition(stagingTicks: 10);
         var databaseLocation = Path.Combine(_temporaryDirectory, "staging.typhon");
 
         using var simulation = SpaceBattleHost.Start(
@@ -83,20 +83,19 @@ public sealed class RuntimeProgressionTests
             new RecordingObservationSink());
         var initial = simulation.GetSnapshot();
 
-        Assert.That(simulation.WaitForCompletedTicks(2, TimeSpan.FromSeconds(5)), Is.True);
-        var afterStaging = simulation.GetSnapshot();
+        var snapshots = simulation.WaitForSnapshots([10, 11], TimeSpan.FromSeconds(5));
+        var afterStaging = snapshots[0];
 
         Assert.Multiple(() =>
         {
-            Assert.That(afterStaging.Run.CompletedTicks, Is.EqualTo(2));
+            Assert.That(afterStaging.Run.CompletedTicks, Is.EqualTo(10));
             Assert.That(afterStaging.Ships.Select(static ship => ship.Position),
                 Is.EqualTo(initial.Ships.Select(static ship => ship.Position)));
             Assert.That(afterStaging.Ships, Has.All.Matches<ShipSnapshot>(
                 ship => ship.Mode == BehaviorMode.Staging && ship.ModeTicksRemaining == 0));
         });
 
-        Assert.That(simulation.WaitForCompletedTicks(3, TimeSpan.FromSeconds(5)), Is.True);
-        var afterMovement = simulation.GetSnapshot();
+        var afterMovement = snapshots[1];
         var initialShip = afterStaging.Ships[0];
         var movedShip = afterMovement.Ships[0];
         var expectedStep = MovementRules.Advance(
@@ -111,7 +110,7 @@ public sealed class RuntimeProgressionTests
 
         Assert.Multiple(() =>
         {
-            Assert.That(afterMovement.Run.CompletedTicks, Is.EqualTo(3));
+            Assert.That(afterMovement.Run.CompletedTicks, Is.EqualTo(11));
             Assert.That(movedShip.Mode, Is.EqualTo(BehaviorMode.Wandering));
             Assert.That(movedShip.Position, Is.EqualTo(expectedStep.Position));
             Assert.That(directionLengthSquared, Is.EqualTo(1f).Within(0.00001f));
@@ -138,11 +137,8 @@ public sealed class RuntimeProgressionTests
             CancellationToken.None,
             new RecordingObservationSink());
 
-        Assert.That(
-            simulation.WaitForCompletedTicks(252, TimeSpan.FromSeconds(15)),
-            Is.True);
-
-        var trackingShips = simulation.GetSnapshot().Ships
+        var snapshot = simulation.WaitForSnapshot(252, TimeSpan.FromSeconds(15));
+        var trackingShips = snapshot.Ships
             .Where(static ship => ship.Mode == BehaviorMode.Tracking)
             .ToArray();
 
