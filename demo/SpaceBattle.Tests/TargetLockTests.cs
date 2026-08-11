@@ -138,6 +138,46 @@ public sealed class TargetLockTests
     }
 
     [Test]
+    public void Start_WhenShipsAreDamaged_SurvivorsEscapeAndCancelTheirOwnLocks()
+    {
+        SimulationDefinition definition = CreateCombatDefinition(
+            "escape-reaction-test",
+            maximumHealth: 1_000);
+        string databaseLocation = Path.Combine(_temporaryDirectory, "escape-reaction.typhon");
+
+        using SpaceBattleSimulation simulation = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+
+        InitialWorldSnapshot reactionSnapshot = simulation.WaitForSnapshots(
+                Enumerable.Range(299, 12).Select(static tick => (ulong)tick).ToArray(),
+                TimeSpan.FromSeconds(20))
+            .First(snapshot => snapshot.Ships.Any(ship => ship.Mode == BehaviorMode.Escaping));
+        ShipSnapshot[] escapingShips = reactionSnapshot.Ships
+            .Where(static ship => ship.Mode == BehaviorMode.Escaping)
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(escapingShips, Is.Not.Empty);
+            Assert.That(escapingShips, Has.All.Matches<ShipSnapshot>(ship =>
+                ship.Health < definition.MaximumHealth &&
+                ship.ModeTicksRemaining <= BehaviorRules.EscapingDurationTicks &&
+                ship.TrackingTargetIsNull &&
+                !ship.WeaponEnabled &&
+                ship.AfterburnerEnabled &&
+                ship.Motion.Speed == BehaviorRules.EscapingSpeed));
+            Assert.That(reactionSnapshot.TargetLocks
+                    .Where(targetLock => escapingShips.Any(ship => ship.EntityKey == targetLock.OwnerEntityKey)),
+                Has.All.Matches<TargetLockSnapshot>(targetLock =>
+                    targetLock.Status == TargetLockStatus.Releasing &&
+                    targetLock.TicksRemaining == BehaviorRules.LockReleaseDurationTicks));
+        });
+    }
+
+    [Test]
     public void Start_WhenWeaponsKillShips_ReportsEveryKillParticipationForTheSameTick()
     {
         SimulationDefinition definition = CreateCombatDefinition(
@@ -169,6 +209,29 @@ public sealed class TargetLockTests
             Assert.That(participations, Is.Unique);
             Assert.That(resolutionSnapshot.KillParticipations.Select(static participation => participation.TargetEntityKey),
                 Has.All.Matches<long>(targetEntityKey => !liveShipKeys.Contains(targetEntityKey)));
+        });
+
+        HashSet<long> woundedShipKeys = resolutionSnapshot.Ships
+            .Where(static ship => ship.Mode == BehaviorMode.Escaping)
+            .Select(static ship => ship.EntityKey)
+            .ToHashSet();
+        ShipSnapshot[] disengagingParticipants = resolutionSnapshot.KillParticipations
+            .Select(static participation => participation.AttackerEntityKey)
+            .Distinct()
+            .Where(attackerEntityKey => !woundedShipKeys.Contains(attackerEntityKey))
+            .Where(liveShipKeys.Contains)
+            .Select(attackerEntityKey => resolutionSnapshot.Ships.Single(ship => ship.EntityKey == attackerEntityKey))
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(disengagingParticipants, Is.Not.Empty);
+            Assert.That(disengagingParticipants, Has.All.Matches<ShipSnapshot>(ship =>
+                ship.Mode == BehaviorMode.Disengaging &&
+                ship.ModeTicksRemaining == BehaviorRules.DisengagingDurationTicks &&
+                ship.Motion.Speed == BehaviorRules.DisengagingSpeed &&
+                !ship.WeaponEnabled &&
+                !ship.AfterburnerEnabled));
         });
     }
 

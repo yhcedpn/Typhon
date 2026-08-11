@@ -9,14 +9,29 @@ public enum WanderingDecision : byte
     Combat = 3,
 }
 
+public enum EscapeFace : byte
+{
+    NegativeX = 1,
+    PositiveX = 2,
+    NegativeY = 3,
+    PositiveY = 4,
+    NegativeZ = 5,
+    PositiveZ = 6,
+}
+
 public static class BehaviorRules
 {
+    public const int EscapeFaceCount = 6;
     public const ushort WanderingDecisionIntervalTicks = 250;
     public const ushort TrackingDurationTicks = 250;
     public const ushort CombatAcquisitionDurationTicks = 250;
+    public const ushort DisengagingDurationTicks = 75;
+    public const ushort EscapingDurationTicks = 125;
     public const ushort LockAcquisitionDurationTicks = 50;
     public const ushort LockReleaseDurationTicks = 25;
     public const float TrackingSpeed = SimulationDefinition.BaseMaximumSpeed;
+    public const float DisengagingSpeed = SimulationDefinition.BaseMaximumSpeed * 0.5f;
+    public const float EscapingSpeed = SimulationDefinition.BaseMaximumSpeed * 1.5f;
     public const float LockRange = 300f;
     public const float WeaponRange = 250f;
     public const uint WeaponDamage = 200;
@@ -31,6 +46,7 @@ public static class BehaviorRules
     private const ulong WanderingAzimuthPurpose = 5;
     private const ulong WanderingElevationPurpose = 6;
     private const ulong LockTargetCandidatePurpose = 9;
+    private const ulong EscapeFacePurpose = 10;
 
     public static WanderingDecision DecideWandering(
         ulong seed,
@@ -108,6 +124,27 @@ public static class BehaviorRules
             sourceIndex,
             LockTargetCandidatePurpose + (ulong)candidateOrdinal);
     }
+
+    public static EscapeFace SelectEscapeFace(
+        ulong seed,
+        ulong shipId,
+        ulong escapeOrdinal) => (EscapeFace)(DeterministicRandom.UniformIndex(
+            seed,
+            shipId,
+            escapeOrdinal,
+            EscapeFacePurpose,
+            exclusiveUpperBound: EscapeFaceCount) + 1);
+
+    public static MotionSnapshot CreateEscapeMotion(EscapeFace face) => face switch
+    {
+        EscapeFace.NegativeX => new MotionSnapshot(-1f, 0f, 0f, EscapingSpeed),
+        EscapeFace.PositiveX => new MotionSnapshot(1f, 0f, 0f, EscapingSpeed),
+        EscapeFace.NegativeY => new MotionSnapshot(0f, -1f, 0f, EscapingSpeed),
+        EscapeFace.PositiveY => new MotionSnapshot(0f, 1f, 0f, EscapingSpeed),
+        EscapeFace.NegativeZ => new MotionSnapshot(0f, 0f, -1f, EscapingSpeed),
+        EscapeFace.PositiveZ => new MotionSnapshot(0f, 0f, 1f, EscapingSpeed),
+        _ => throw new ArgumentOutOfRangeException(nameof(face)),
+    };
 
     public static ulong PackShipId(EntityId shipId) =>
         ((ulong)shipId.EntityKey << 12) | shipId.ArchetypeId;

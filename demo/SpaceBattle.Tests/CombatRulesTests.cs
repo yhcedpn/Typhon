@@ -83,4 +83,16 @@ public sealed class CombatRulesTests
             Assert.That(result.ParticipatingAttackerCount, Is.EqualTo(2));
         });
     }
+
+    [Test]
+    public void CombatReactionDurations_UseTheAgreedFutureTickWindows()
+    {
+        Assert.Multiple(() =>
+        {
+            Assert.That(BehaviorRules.EscapingDurationTicks, Is.EqualTo(125));
+            Assert.That(BehaviorRules.DisengagingDurationTicks, Is.EqualTo(75));
+            Assert.That(BehaviorRules.EscapingSpeed, Is.EqualTo(75f));
+            Assert.That(BehaviorRules.DisengagingSpeed, Is.EqualTo(25f));
+        });
+    }
 }

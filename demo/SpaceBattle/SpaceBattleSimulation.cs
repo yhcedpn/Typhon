@@ -197,7 +197,7 @@ public sealed class SpaceBattleSimulation : IDisposable
         dag.Add(new TargetingSystem(state));
         dag.Add(new CombatSystem(state.Ships, damageIntentQueues));
         dag.Add(new DamageResolutionSystem(damageIntentQueues, damageResolutionState));
-        dag.Add(new ResolutionSystem(state));
+        dag.Add(new ResolutionSystem(state, damageResolutionState));
         dag.Add(new OutputSystem(state, damageResolutionState));
     }
 
@@ -452,7 +452,8 @@ internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSys
         .Reads<PositionComponent>()
         .Writes<BehaviorComponent>()
         .Writes<TrackingComponent>()
-        .Writes<MotionComponent>();
+        .Writes<MotionComponent>()
+        .Writes<AfterburnerComponent>();
 
     protected override void Execute(TickContext context)
     {
@@ -481,6 +482,27 @@ internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSys
                 case BehaviorMode.Tracking:
                     ProcessTracking(
                         context,
+                        state.Definition,
+                        ship,
+                        shipIdForRandom,
+                        ref behavior,
+                        ref tracking,
+                        ref ship.Write(Ship.Motion));
+                    break;
+                case BehaviorMode.Disengaging:
+                    if (behavior.ModeTicksRemaining == 0)
+                    {
+                        StartWandering(
+                            state.Definition,
+                            shipIdForRandom,
+                            ref behavior,
+                            ref tracking,
+                            ref ship.Write(Ship.Motion));
+                    }
+
+                    break;
+                case BehaviorMode.Escaping:
+                    ProcessEscaping(
                         state.Definition,
                         ship,
                         shipIdForRandom,
@@ -636,7 +658,34 @@ internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSys
         behavior.DecisionOrdinal++;
     }
 
-    private static void SetMotion(ref MotionComponent motion, MotionSnapshot value)
+    private static void ProcessEscaping(
+        SimulationDefinition definition,
+        EntityRef ship,
+        ulong shipIdForRandom,
+        ref BehaviorComponent behavior,
+        ref TrackingComponent tracking,
+        ref MotionComponent motion)
+    {
+        if (behavior.ModeTicksRemaining == 0)
+        {
+            StartWandering(
+                definition,
+                shipIdForRandom,
+                ref behavior,
+                ref tracking,
+                ref motion);
+            if (ship.IsEnabled(Ship.Afterburner))
+            {
+                ship.Disable(Ship.Afterburner);
+            }
+
+            return;
+        }
+
+        motion.Speed = BehaviorRules.EscapingSpeed;
+    }
+
+    internal static void SetMotion(ref MotionComponent motion, MotionSnapshot value)
     {
         motion.DirectionX = value.DirectionX;
         motion.DirectionY = value.DirectionY;
@@ -713,17 +762,18 @@ internal sealed class TargetLockCleanupSystem(SimulationRuntimeState state) : Ca
 
     protected override void Execute(TickContext context)
     {
-        AdvanceCombatDurations(context);
+        AdvanceTimedBehaviorDurations(context);
         AdvanceExistingLocks(context);
     }
 
-    private void AdvanceCombatDurations(TickContext context)
+    private void AdvanceTimedBehaviorDurations(TickContext context)
     {
         foreach (var shipId in context.Transaction.Query<Ship>().Execute())
         {
             var ship = context.Transaction.Open(shipId);
             ref readonly var currentBehavior = ref ship.Read(Ship.Behavior);
-            if ((BehaviorMode)currentBehavior.Mode != BehaviorMode.Combat ||
+            BehaviorMode mode = (BehaviorMode)currentBehavior.Mode;
+            if (mode is not (BehaviorMode.Combat or BehaviorMode.Disengaging or BehaviorMode.Escaping) ||
                 currentBehavior.ModeTicksRemaining == 0)
             {
                 continue;
@@ -731,7 +781,7 @@ internal sealed class TargetLockCleanupSystem(SimulationRuntimeState state) : Ca
 
             var mutableShip = context.Transaction.OpenMut(shipId);
             ref var behavior = ref mutableShip.Write(Ship.Behavior);
-            if (--behavior.ModeTicksRemaining != 0)
+            if (--behavior.ModeTicksRemaining != 0 || mode != BehaviorMode.Combat)
             {
                 continue;
             }
@@ -827,7 +877,7 @@ internal sealed class TargetLockCleanupSystem(SimulationRuntimeState state) : Ca
         }
     }
 
-    private static void BeginRelease(
+    internal static void BeginRelease(
         TickContext context,
         EntityId ownerId,
         ref TargetLockComponent targetLock)
@@ -850,7 +900,7 @@ internal sealed class TargetLockCleanupSystem(SimulationRuntimeState state) : Ca
         }
     }
 
-    private static void DisableWeapon(TickContext context, EntityId ownerId)
+    internal static void DisableWeapon(TickContext context, EntityId ownerId)
     {
         EntityRef owner = context.Transaction.OpenMut(ownerId);
         ref TrackingComponent tracking = ref owner.Write(Ship.Tracking);
@@ -1131,6 +1181,10 @@ internal sealed class DamageResolutionSystem(
                         RecordKillParticipations(damageIntents, groupStart, groupEnd, targetId);
                         context.Transaction.Destroy(targetId);
                     }
+                    else if (resolution.AppliedDamage > 0)
+                    {
+                        damageResolutionState.AddDamagedSurvivor(targetId);
+                    }
                 }
 
                 groupStart = groupEnd;
@@ -1187,10 +1241,20 @@ internal sealed class DamageResolutionState
     public void AddKillParticipation(EntityId attacker, EntityId target)
         => _killParticipations.Add(new KillParticipation(attacker, target));
 
-    public void Clear() => _killParticipations.Clear();
+    public HashSet<EntityId> DamagedSurvivors { get; } = [];
+
+    public void AddDamagedSurvivor(EntityId shipId) => DamagedSurvivors.Add(shipId);
+
+    public void Clear()
+    {
+        _killParticipations.Clear();
+        DamagedSurvivors.Clear();
+    }
 }
 
-internal sealed class ResolutionSystem(SimulationRuntimeState state) : CallbackSystem
+internal sealed class ResolutionSystem(
+    SimulationRuntimeState state,
+    DamageResolutionState damageResolutionState) : CallbackSystem
 {
     protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("Resolution")
@@ -1200,11 +1264,13 @@ internal sealed class ResolutionSystem(SimulationRuntimeState state) : CallbackS
         .Writes<TrackingComponent>()
         .Writes<MotionComponent>()
         .Writes<WeaponComponent>()
+        .Writes<AfterburnerComponent>()
         .Writes<TargetLockComponent>();
 
     protected override void Execute(TickContext context)
     {
         TargetLockCleanupSystem.ClearDeadLocks(context);
+        ApplyCombatReactions(context);
         foreach (EntityId shipId in context.Transaction.Query<Ship>().Execute())
         {
             if (!context.Transaction.IsAlive(shipId))
@@ -1231,6 +1297,87 @@ internal sealed class ResolutionSystem(SimulationRuntimeState state) : CallbackS
                 ref behavior,
                 ref tracking,
                 ref ship.Write(Ship.Motion));
+        }
+    }
+
+    private void ApplyCombatReactions(TickContext context)
+    {
+        foreach (EntityId woundedShipId in damageResolutionState.DamagedSurvivors)
+        {
+            if (context.Transaction.TryOpen(woundedShipId, out _))
+            {
+                EnterEscaping(context, woundedShipId);
+            }
+        }
+
+        foreach (KillParticipation participation in damageResolutionState.KillParticipations)
+        {
+            if (damageResolutionState.DamagedSurvivors.Contains(participation.Attacker) ||
+                !context.Transaction.TryOpen(participation.Attacker, out _))
+            {
+                continue;
+            }
+
+            EnterDisengaging(context, participation.Attacker);
+        }
+    }
+
+    private void EnterEscaping(TickContext context, EntityId shipId)
+    {
+        EntityRef ship = context.Transaction.OpenMut(shipId);
+        ref BehaviorComponent behavior = ref ship.Write(Ship.Behavior);
+        ref TrackingComponent tracking = ref ship.Write(Ship.Tracking);
+        ref MotionComponent motion = ref ship.Write(Ship.Motion);
+        bool wasEscaping = behavior.Mode == (byte)BehaviorMode.Escaping;
+        ulong escapeOrdinal = wasEscaping
+            ? behavior.DecisionOrdinal - 1
+            : behavior.DecisionOrdinal++;
+        behavior.Mode = (byte)BehaviorMode.Escaping;
+        behavior.ModeTicksRemaining = BehaviorRules.EscapingDurationTicks;
+        if (!wasEscaping)
+        {
+            SteeringSystem.SetMotion(
+                ref motion,
+                BehaviorRules.CreateEscapeMotion(BehaviorRules.SelectEscapeFace(
+                    state.Definition.Seed,
+                    BehaviorRules.PackShipId(shipId),
+                    escapeOrdinal)));
+        }
+
+        TargetLockCleanupSystem.DisableWeapon(context, shipId);
+        if (!ship.IsEnabled(Ship.Afterburner))
+        {
+            ship.Enable(Ship.Afterburner);
+        }
+
+        if (!wasEscaping)
+        {
+            ship.Write(Ship.Afterburner).ActivatedTick = checked((ulong)context.TickNumber);
+        }
+
+        foreach (EntityId targetLockId in context.Transaction.Query<TargetLock>().Execute())
+        {
+            EntityRef targetLockEntity = context.Transaction.OpenMut(targetLockId);
+            ref TargetLockComponent targetLock = ref targetLockEntity.Write(TargetLock.Data);
+            if ((EntityId)targetLock.Owner == shipId &&
+                (TargetLockStatus)targetLock.Status != TargetLockStatus.Releasing)
+            {
+                TargetLockCleanupSystem.BeginRelease(context, shipId, ref targetLock);
+            }
+        }
+    }
+
+    private static void EnterDisengaging(TickContext context, EntityId shipId)
+    {
+        EntityRef ship = context.Transaction.OpenMut(shipId);
+        ref BehaviorComponent behavior = ref ship.Write(Ship.Behavior);
+        behavior.Mode = (byte)BehaviorMode.Disengaging;
+        behavior.ModeTicksRemaining = BehaviorRules.DisengagingDurationTicks;
+        ship.Write(Ship.Motion).Speed = BehaviorRules.DisengagingSpeed;
+        TargetLockCleanupSystem.DisableWeapon(context, shipId);
+        if (ship.IsEnabled(Ship.Afterburner))
+        {
+            ship.Disable(Ship.Afterburner);
         }
     }
 }

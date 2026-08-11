@@ -137,4 +137,49 @@ public sealed class BehaviorRulesTests
 
         Assert.That(motion, Is.EqualTo(new MotionSnapshot(0.6f, 0.8f, 0f, 50f)));
     }
+
+    [Test]
+    public void SelectEscapeFace_IsRepeatableAndCoversAllSixWorldFaces()
+    {
+        EscapeFace first = BehaviorRules.SelectEscapeFace(
+            SimulationDefinition.DefaultSeed,
+            shipId: 0xBBAA,
+            escapeOrdinal: 42);
+        HashSet<EscapeFace> faces = Enumerable.Range(0, 10_000)
+            .Select(ordinal => BehaviorRules.SelectEscapeFace(
+                SimulationDefinition.DefaultSeed,
+                shipId: (ulong)ordinal,
+                escapeOrdinal: 42))
+            .ToHashSet();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(BehaviorRules.SelectEscapeFace(
+                SimulationDefinition.DefaultSeed,
+                0xBBAA,
+                42), Is.EqualTo(first));
+            Assert.That(faces, Is.EquivalentTo(Enum.GetValues<EscapeFace>()));
+        });
+    }
+
+    [TestCase(EscapeFace.NegativeX, -1f, 0f, 0f)]
+    [TestCase(EscapeFace.PositiveX, 1f, 0f, 0f)]
+    [TestCase(EscapeFace.NegativeY, 0f, -1f, 0f)]
+    [TestCase(EscapeFace.PositiveY, 0f, 1f, 0f)]
+    [TestCase(EscapeFace.NegativeZ, 0f, 0f, -1f)]
+    [TestCase(EscapeFace.PositiveZ, 0f, 0f, 1f)]
+    public void CreateEscapeMotion_AimsPerpendicularlyAtTheSelectedFace(
+        EscapeFace face,
+        float expectedX,
+        float expectedY,
+        float expectedZ)
+    {
+        MotionSnapshot motion = BehaviorRules.CreateEscapeMotion(face);
+
+        Assert.That(motion, Is.EqualTo(new MotionSnapshot(
+            expectedX,
+            expectedY,
+            expectedZ,
+            BehaviorRules.EscapingSpeed)));
+    }
 }
