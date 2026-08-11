@@ -100,6 +100,111 @@ public sealed class PauseRecoveryTests
         Assert.That(resumed.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
     }
 
+    [Test]
+    public void RuntimeDiagnostics_RebuildAcrossPauseAndResumeWithoutChangingMembership()
+    {
+        var definition = CreateDefinition();
+        var databaseLocation = Path.Combine(_temporaryDirectory, "runtime-state.typhon");
+        using var cancellation = new CancellationTokenSource();
+        SpaceBattleRuntimeDiagnosticsSnapshot pausedDiagnostics;
+
+        using (var simulation = SpaceBattleHost.Start(
+                   definition,
+                   databaseLocation,
+                   cancellation.Token,
+                   new RecordingObservationSink()))
+        {
+            Assert.That(simulation.WaitForCompletedTicks(1, TimeSpan.FromSeconds(5)), Is.True);
+            var runningDiagnostics = simulation.GetRuntimeDiagnostics();
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(runningDiagnostics.ViewMembershipCount, Is.EqualTo(definition.ShipCount));
+                Assert.That(runningDiagnostics.ShipRosterCount, Is.EqualTo(definition.ShipCount));
+                Assert.That(runningDiagnostics.TickWorksetCount, Is.EqualTo(definition.ShipCount));
+                Assert.That(runningDiagnostics.DerivedAliveShipCount, Is.EqualTo(definition.ShipCount));
+                Assert.That(runningDiagnostics.DerivedActiveLockCount, Is.EqualTo(0));
+                Assert.That(runningDiagnostics.ConsumerProcessingCounts["State"], Is.EqualTo(definition.ShipCount));
+                Assert.That(runningDiagnostics.ConsumerProcessingCounts["Combat"], Is.EqualTo(definition.ShipCount));
+            });
+
+            cancellation.Cancel();
+            Assert.That(simulation.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
+            pausedDiagnostics = simulation.GetRuntimeDiagnostics();
+        }
+
+        using var resumed = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+        var resumedDiagnostics = resumed.GetRuntimeDiagnostics();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resumedDiagnostics.ViewMembershipCount, Is.EqualTo(pausedDiagnostics.ViewMembershipCount));
+            Assert.That(resumedDiagnostics.ShipRosterCount, Is.EqualTo(pausedDiagnostics.ShipRosterCount));
+            Assert.That(resumedDiagnostics.TickWorksetCount, Is.EqualTo(pausedDiagnostics.TickWorksetCount));
+            Assert.That(resumedDiagnostics.DerivedAliveShipCount, Is.EqualTo(pausedDiagnostics.DerivedAliveShipCount));
+            Assert.That(resumedDiagnostics.DerivedActiveLockCount, Is.EqualTo(pausedDiagnostics.DerivedActiveLockCount));
+        });
+
+        var nextTick = checked(pausedDiagnostics.CompletedTicks + 1);
+        Assert.That(resumed.WaitForCompletedTicks(nextTick, TimeSpan.FromSeconds(5)), Is.True);
+        var afterResumeDiagnostics = resumed.GetRuntimeDiagnostics();
+        Assert.Multiple(() =>
+        {
+            Assert.That(afterResumeDiagnostics.ViewMembershipCount, Is.EqualTo(definition.ShipCount));
+            Assert.That(afterResumeDiagnostics.ShipRosterCount, Is.EqualTo(definition.ShipCount));
+            Assert.That(afterResumeDiagnostics.DerivedAliveShipCount, Is.EqualTo(definition.ShipCount));
+            Assert.That(afterResumeDiagnostics.ConsumerProcessingCounts["State"], Is.EqualTo(definition.ShipCount));
+        });
+
+        resumed.RequestPause();
+        Assert.That(resumed.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
+    }
+
+    [Test]
+    public void RuntimeDiagnostics_IndexesTargetLocksByOwnerAndTargetAtPauseBoundary()
+    {
+        var definition = new SimulationDefinition(
+            runName: "runtime-lock-diagnostics-test",
+            shipCount: 64,
+            seed: SimulationDefinition.DefaultSeed,
+            rulesetVersion: 1,
+            worldSize: 100f,
+            maximumHealth: 1_000,
+            stagingTicks: 0,
+            spatialCellSize: 100f,
+            spatialMargin: 20f);
+        var databaseLocation = Path.Combine(_temporaryDirectory, "runtime-lock-diagnostics.typhon");
+
+        using var simulation = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+        InitialWorldSnapshot snapshot = simulation.WaitForSnapshot(252, TimeSpan.FromSeconds(20));
+        simulation.RequestPause();
+        Assert.That(simulation.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
+
+        SpaceBattleRuntimeDiagnosticsSnapshot diagnostics = simulation.GetRuntimeDiagnostics();
+        IReadOnlyDictionary<long, int> ownerCounts = snapshot.TargetLocks
+            .GroupBy(static targetLock => targetLock.OwnerEntityKey)
+            .ToDictionary(static group => group.Key, static group => group.Count());
+        IReadOnlyDictionary<long, int> targetCounts = snapshot.TargetLocks
+            .GroupBy(static targetLock => targetLock.TargetEntityKey)
+            .ToDictionary(static group => group.Key, static group => group.Count());
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(diagnostics.OwnerLockIndex, Is.EqualTo(ownerCounts));
+            Assert.That(diagnostics.TargetLockIndex, Is.EqualTo(targetCounts));
+            Assert.That(diagnostics.DerivedActiveLockCount, Is.EqualTo(snapshot.TargetLocks.Count));
+            Assert.That(diagnostics.DerivedAliveShipCount, Is.EqualTo(snapshot.Ships.Count));
+        });
+    }
+
     private static SimulationDefinition CreateDefinition() => new(
         runName: "pause-recovery-test",
         shipCount: 4,
