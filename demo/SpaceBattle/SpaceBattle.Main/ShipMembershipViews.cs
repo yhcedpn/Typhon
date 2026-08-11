@@ -115,6 +115,11 @@ public sealed class ShipMembershipViews : IDisposable
     public void RefreshForRuntime(Transaction transaction)
     {
         Refresh(transaction);
+        ClearDeltas();
+    }
+
+    internal void ClearDeltas()
+    {
         RuntimeShips.ClearDelta();
         CombatShips.ClearDelta();
     }

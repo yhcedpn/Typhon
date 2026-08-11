@@ -183,6 +183,32 @@ public sealed class PauseRecoveryTests
     }
 
     [Test]
+    public void RuntimeDiagnostics_ExposeStableRosterAndCurrentTickWorksetKeys()
+    {
+        var definition = CreateDefinition();
+        var databaseLocation = Path.Combine(_temporaryDirectory, "roster-workset.typhon");
+
+        using var simulation = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+        Assert.That(simulation.WaitForCompletedTicks(1, TimeSpan.FromSeconds(5)), Is.True);
+
+        var expectedKeys = simulation.GetSnapshot().Ships
+            .Select(static ship => ship.EntityKey)
+            .Order()
+            .ToArray();
+        var diagnostics = simulation.GetRuntimeDiagnostics();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(diagnostics.ShipRosterEntityKeys, Is.EqualTo(expectedKeys));
+            Assert.That(diagnostics.TickWorksetEntityKeys, Is.EqualTo(expectedKeys));
+        });
+    }
+
+    [Test]
     public void RuntimeDiagnostics_IndexesTargetLocksByOwnerAndTargetAtPauseBoundary()
     {
         var definition = new SimulationDefinition(

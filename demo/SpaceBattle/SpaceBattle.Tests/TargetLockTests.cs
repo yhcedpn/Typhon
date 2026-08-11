@@ -138,6 +138,78 @@ public sealed class TargetLockTests
     }
 
     [Test]
+    public void Start_AfterDestroyedShipRefreshesRosterAndWorksetToAuthoritativeShips()
+    {
+        SimulationDefinition definition = CreateCombatDefinition(
+            "roster-destroy-refresh-test",
+            maximumHealth: 200);
+        string databaseLocation = Path.Combine(_temporaryDirectory, "roster-destroy-refresh.typhon");
+
+        using SpaceBattleSimulation simulation = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+
+        Assert.That(
+            SpinWait.SpinUntil(
+                () => simulation.GetRuntimeDiagnostics().RuntimeShipViewRemovedCount > 0,
+                TimeSpan.FromSeconds(30)),
+            Is.True);
+        simulation.RequestPause();
+        Assert.That(simulation.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
+
+        InitialWorldSnapshot snapshot = simulation.GetSnapshot();
+        SpaceBattleRuntimeDiagnosticsSnapshot diagnostics = simulation.GetRuntimeDiagnostics();
+        long[] expectedKeys = snapshot.Ships
+            .Select(static ship => ship.EntityKey)
+            .Order()
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(snapshot.Ships.Count, Is.LessThan(definition.ShipCount));
+            Assert.That(diagnostics.ViewMembershipCount, Is.EqualTo(snapshot.Ships.Count));
+            Assert.That(diagnostics.CombatViewMembershipCount, Is.EqualTo(snapshot.Ships.Count));
+            Assert.That(diagnostics.ShipRosterCount, Is.EqualTo(snapshot.Ships.Count));
+            Assert.That(diagnostics.TickWorksetCount, Is.EqualTo(snapshot.Ships.Count));
+            Assert.That(diagnostics.ShipRosterEntityKeys, Is.EqualTo(expectedKeys));
+            Assert.That(diagnostics.TickWorksetEntityKeys, Is.EqualTo(expectedKeys));
+        });
+    }
+
+    [Test]
+    public void Start_WhenTheLastCombatShipIsDestroyed_DoesNotLeaveItInRosterOrWorkset()
+    {
+        SimulationDefinition definition = CreateCombatDefinition(
+            "terminal-roster-destroy-test",
+            maximumHealth: 200,
+            shipCount: 2);
+        string databaseLocation = Path.Combine(_temporaryDirectory, "terminal-roster-destroy.typhon");
+
+        using SpaceBattleSimulation simulation = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+        Assert.That(simulation.WaitForTerminal(TimeSpan.FromSeconds(30)), Is.True);
+
+        InitialWorldSnapshot snapshot = simulation.GetSnapshot();
+        SpaceBattleRuntimeDiagnosticsSnapshot diagnostics = simulation.GetRuntimeDiagnostics();
+        long[] expectedKeys = snapshot.Ships
+            .Select(static ship => ship.EntityKey)
+            .Order()
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(snapshot.Run.Status, Is.EqualTo(SimulationRunStatus.Completed));
+            Assert.That(diagnostics.ShipRosterEntityKeys, Is.EqualTo(expectedKeys));
+            Assert.That(diagnostics.TickWorksetEntityKeys, Is.EqualTo(expectedKeys));
+        });
+    }
+
+    [Test]
     public void Start_WhenShipsAreDamaged_SurvivorsEscapeAndCancelTheirOwnLocks()
     {
         SimulationDefinition definition = CreateCombatDefinition(
@@ -284,9 +356,10 @@ public sealed class TargetLockTests
 
     private static SimulationDefinition CreateCombatDefinition(
         string runName,
-        uint maximumHealth = 1_000) => new(
+        uint maximumHealth = 1_000,
+        int shipCount = 64) => new(
         runName: runName,
-        shipCount: 64,
+        shipCount,
         seed: SimulationDefinition.DefaultSeed,
         rulesetVersion: 1,
         worldSize: 100f,

@@ -20,6 +20,10 @@ public sealed record SpaceBattleRuntimeDiagnosticsSnapshot(
     long CombatShipViewRemovedCount,
     IReadOnlyDictionary<string, int> ConsumerProcessingCounts)
 {
+    public IReadOnlyList<long> ShipRosterEntityKeys { get; internal set; } = Array.Empty<long>();
+
+    public IReadOnlyList<long> TickWorksetEntityKeys { get; internal set; } = Array.Empty<long>();
+
     public int OwnerLockIndexCount => OwnerLockIndex.Count;
 
     public int TargetLockIndexCount => TargetLockIndex.Count;
@@ -40,8 +44,11 @@ public sealed record SpaceBattleRuntimeDiagnosticsSnapshot(
         long combatShipViewAddedCount,
         long runtimeShipViewRemovedCount,
         long combatShipViewRemovedCount,
+        IReadOnlyList<long> shipRosterEntityKeys,
+        IReadOnlyList<long> tickWorksetEntityKeys,
         IReadOnlyDictionary<string, int> consumerProcessingCounts)
-        => new(
+    {
+        var snapshot = new SpaceBattleRuntimeDiagnosticsSnapshot(
             completedTicks,
             viewMembershipCount,
             combatViewMembershipCount,
@@ -58,4 +65,8 @@ public sealed record SpaceBattleRuntimeDiagnosticsSnapshot(
             runtimeShipViewRemovedCount,
             combatShipViewRemovedCount,
             new ReadOnlyDictionary<string, int>(new Dictionary<string, int>(consumerProcessingCounts)));
+        snapshot.ShipRosterEntityKeys = new ReadOnlyCollection<long>(shipRosterEntityKeys.ToArray());
+        snapshot.TickWorksetEntityKeys = new ReadOnlyCollection<long>(tickWorksetEntityKeys.ToArray());
+        return snapshot;
+    }
 }

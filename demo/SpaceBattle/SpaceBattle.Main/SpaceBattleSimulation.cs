@@ -223,23 +223,20 @@ public sealed class SpaceBattleSimulation : IDisposable
             engine,
             runEntityId,
             startupFenceTick: 0);
-        uint aliveShipCount;
+        uint aliveShipCount = checked((uint)shipViews.RuntimeShips.Count);
+        SimulationRuntimeState state = new(definition, runEntityId, completedTicks, aliveShipCount, shipViews);
         try
         {
             using Transaction transaction = engine.CreateQuickTransaction();
-            aliveShipCount = checked((uint)transaction.Query<Ship>().Execute().Count);
+            state.InitializeShipRoster(transaction);
+            state.RebuildLockDerivedState(transaction, resetTickWorkset: true);
         }
         catch
         {
-            shipViews.Dispose();
+            state.Dispose();
             throw;
         }
 
-        SimulationRuntimeState state = new(definition, runEntityId, completedTicks, aliveShipCount, shipViews);
-        using (Transaction transaction = engine.CreateQuickTransaction())
-        {
-            state.RebuildDerivedState(transaction, resetTickWorkset: true);
-        }
         SpaceBattleObservationPublisher observationPublisher = new(
             engine,
             observationSink);
@@ -424,15 +421,114 @@ internal static class ShipRoster
         .OrderBy(static id => id.EntityKey)
         .ToArray();
 
-    public static Dictionary<long, int> IndexByEntityKey(IReadOnlyList<EntityId> roster)
+    public static int IndexOf(IReadOnlyList<EntityId> roster, EntityId shipId)
     {
-        var indexes = new Dictionary<long, int>(roster.Count);
-        for (var index = 0; index < roster.Count; index++)
+        var low = 0;
+        var high = roster.Count - 1;
+        while (low <= high)
         {
-            indexes.Add(roster[index].EntityKey, index);
+            var middle = low + ((high - low) / 2);
+            var comparison = roster[middle].EntityKey.CompareTo(shipId.EntityKey);
+            if (comparison == 0)
+            {
+                return middle;
+            }
+
+            if (comparison < 0)
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle - 1;
+            }
         }
 
-        return indexes;
+        return -1;
+    }
+
+    public static EntityId[] ApplyDelta(
+        EntityId[] roster,
+        IReadOnlyList<EntityId> added,
+        IReadOnlyList<EntityId> removed)
+    {
+        if (added.Count == 0 && removed.Count == 0)
+        {
+            return roster;
+        }
+
+        HashSet<long> removedKeys = removed.Count == 0 ? null : new HashSet<long>(removed.Count);
+        foreach (EntityId shipId in removed)
+        {
+            removedKeys?.Add(shipId.EntityKey);
+        }
+
+        var addedShips = new List<EntityId>(added.Count);
+        var addedKeys = new HashSet<long>(added.Count);
+        foreach (EntityId shipId in added)
+        {
+            if (addedKeys.Add(shipId.EntityKey))
+            {
+                addedShips.Add(shipId);
+            }
+        }
+
+        addedShips.Sort(static (left, right) => left.EntityKey.CompareTo(right.EntityKey));
+        var nextRoster = new EntityId[roster.Length + addedShips.Count];
+        var rosterIndex = 0;
+        var addedIndex = 0;
+        var nextIndex = 0;
+        while (rosterIndex < roster.Length || addedIndex < addedShips.Count)
+        {
+            while (rosterIndex < roster.Length && removedKeys?.Contains(roster[rosterIndex].EntityKey) == true)
+            {
+                rosterIndex++;
+            }
+
+            if (rosterIndex == roster.Length)
+            {
+                while (addedIndex < addedShips.Count)
+                {
+                    nextRoster[nextIndex++] = addedShips[addedIndex++];
+                }
+
+                continue;
+            }
+
+            if (addedIndex == addedShips.Count)
+            {
+                nextRoster[nextIndex++] = roster[rosterIndex++];
+                continue;
+            }
+
+            var rosterShip = roster[rosterIndex];
+            var addedShip = addedShips[addedIndex];
+            var comparison = rosterShip.EntityKey.CompareTo(addedShip.EntityKey);
+            if (comparison < 0)
+            {
+                nextRoster[nextIndex++] = rosterShip;
+                rosterIndex++;
+            }
+            else if (comparison > 0)
+            {
+                nextRoster[nextIndex++] = addedShip;
+                addedIndex++;
+            }
+            else
+            {
+                nextRoster[nextIndex++] = rosterShip;
+                rosterIndex++;
+                addedIndex++;
+            }
+        }
+
+        if (nextIndex == roster.Length && nextRoster.AsSpan(0, nextIndex).SequenceEqual(roster))
+        {
+            return roster;
+        }
+
+        Array.Resize(ref nextRoster, nextIndex);
+        return nextRoster;
     }
 }
 
@@ -546,6 +642,8 @@ internal sealed class SimulationRuntimeState : IDisposable
     {
         lock (_sync)
         {
+            long[] shipRosterEntityKeys = _shipRoster.Select(static ship => ship.EntityKey).ToArray();
+            long[] tickWorksetEntityKeys = _tickWorkset.Select(static ship => ship.EntityKey).ToArray();
             return SpaceBattleRuntimeDiagnosticsSnapshot.Create(
                 _completedTicks,
                 Ships.Count,
@@ -562,11 +660,13 @@ internal sealed class SimulationRuntimeState : IDisposable
                 ShipViews.CombatAddedCount,
                 ShipViews.RuntimeRemovedCount,
                 ShipViews.CombatRemovedCount,
+                shipRosterEntityKeys,
+                tickWorksetEntityKeys,
                 _consumerProcessingCounts);
         }
     }
 
-    public void RebuildDerivedState(Transaction transaction, bool resetTickWorkset)
+    public void InitializeShipRoster(Transaction transaction)
     {
         ArgumentNullException.ThrowIfNull(transaction);
         List<EntityId> aliveShipIds = new(Ships.Count);
@@ -578,7 +678,55 @@ internal sealed class SimulationRuntimeState : IDisposable
             }
         }
 
-        EntityId[] shipRoster = global::SpaceBattle.ShipRoster.Ordered(aliveShipIds);
+        lock (_sync)
+        {
+            PublishShipRoster(global::SpaceBattle.ShipRoster.Ordered(aliveShipIds));
+        }
+    }
+
+    public void RefreshShipViews(Transaction transaction)
+    {
+        ArgumentNullException.ThrowIfNull(transaction);
+        ShipViews.Refresh(transaction);
+        try
+        {
+            lock (_sync)
+            {
+                IReadOnlyList<EntityId> added = ShipViews.RuntimeShips.Added;
+                IReadOnlyList<EntityId> liveAdded = Array.Empty<EntityId>();
+                if (added.Count != 0)
+                {
+                    var liveAddedList = new List<EntityId>(added.Count);
+                    foreach (EntityId shipId in added)
+                    {
+                        if (transaction.IsAlive(shipId))
+                        {
+                            liveAddedList.Add(shipId);
+                        }
+                    }
+
+                    liveAdded = liveAddedList;
+                }
+
+                EntityId[] nextRoster = global::SpaceBattle.ShipRoster.ApplyDelta(
+                    _shipRoster,
+                    liveAdded,
+                    ShipViews.RuntimeShips.Removed);
+                if (!ReferenceEquals(nextRoster, _shipRoster))
+                {
+                    PublishShipRoster(nextRoster);
+                }
+            }
+        }
+        finally
+        {
+            ShipViews.ClearDeltas();
+        }
+    }
+
+    public void RebuildLockDerivedState(Transaction transaction, bool resetTickWorkset)
+    {
+        ArgumentNullException.ThrowIfNull(transaction);
         Dictionary<long, int> ownerLockIndex = [];
         Dictionary<long, int> targetLockIndex = [];
         int activeLockCount = 0;
@@ -594,19 +742,23 @@ internal sealed class SimulationRuntimeState : IDisposable
 
         lock (_sync)
         {
-            _shipRoster = shipRoster;
-            _shipRosterReadOnly = Array.AsReadOnly(shipRoster);
             if (resetTickWorkset)
             {
-                _tickWorkset = shipRoster.ToArray();
-                _tickWorksetReadOnly = Array.AsReadOnly(_tickWorkset);
+                _tickWorkset = _shipRoster;
+                _tickWorksetReadOnly = _shipRosterReadOnly;
             }
 
             _ownerLockIndex = ownerLockIndex;
             _targetLockIndex = targetLockIndex;
             _derivedActiveLockCount = activeLockCount;
-            _aliveShipCount = checked((uint)shipRoster.Length);
         }
+    }
+
+    private void PublishShipRoster(EntityId[] shipRoster)
+    {
+        _shipRoster = shipRoster;
+        _shipRosterReadOnly = Array.AsReadOnly(shipRoster);
+        _aliveShipCount = checked((uint)shipRoster.Length);
     }
 
     public Dictionary<long, int> CopyOwnerLockCounts()
@@ -671,7 +823,7 @@ internal sealed class SimulationRuntimeState : IDisposable
 
         try
         {
-            RebuildDerivedState(transaction, resetTickWorkset: true);
+            RebuildLockDerivedState(transaction, resetTickWorkset: true);
             return true;
         }
         catch
@@ -723,11 +875,27 @@ internal sealed class SimulationRuntimeState : IDisposable
         }
     }
 
-    public uint ApplyDestroyedShips(int destroyedShipCount)
+    public uint ApplyDestroyedShips(
+        int destroyedShipCount,
+        IReadOnlyList<EntityId> destroyedShips)
     {
         lock (_sync)
         {
             _aliveShipCount = checked(_aliveShipCount - (uint)destroyedShipCount);
+            if (destroyedShips.Count != 0)
+            {
+                EntityId[] nextRoster = global::SpaceBattle.ShipRoster.ApplyDelta(
+                    _shipRoster,
+                    Array.Empty<EntityId>(),
+                    destroyedShips);
+                if (!ReferenceEquals(nextRoster, _shipRoster))
+                {
+                    PublishShipRoster(nextRoster);
+                    _tickWorkset = nextRoster;
+                    _tickWorksetReadOnly = _shipRosterReadOnly;
+                }
+            }
+
             return _aliveShipCount;
         }
     }
@@ -947,7 +1115,7 @@ internal sealed class ShipViewRefreshSystem(SimulationRuntimeState state) : Call
         .ShouldRun(() => state.IsRunning)
         .Reads<ShipRunMembershipComponent>();
 
-    protected override void Execute(TickContext context) => state.ShipViews.RefreshForRuntime(context.Transaction);
+    protected override void Execute(TickContext context) => state.RefreshShipViews(context.Transaction);
 }
 
 internal sealed class StateSystem(SimulationRuntimeState state) : CallbackSystem
@@ -1164,15 +1332,17 @@ internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSys
         IReadOnlyList<EntityId> roster,
         IReadOnlyList<TrackingStart> trackingStarts)
     {
-        var rosterIndexes = ShipRoster.IndexByEntityKey(roster);
-
         foreach (var trackingStart in trackingStarts)
         {
             var ship = context.Transaction.OpenMut(trackingStart.ShipId);
             ref var behavior = ref ship.Write(Ship.Behavior);
             ref var tracking = ref ship.Write(Ship.Tracking);
             ref var motion = ref ship.Write(Ship.Motion);
-            var sourceIndex = rosterIndexes[trackingStart.ShipId.EntityKey];
+            var sourceIndex = ShipRoster.IndexOf(roster, trackingStart.ShipId);
+            if (sourceIndex < 0)
+            {
+                continue;
+            }
             var targetIndex = BehaviorRules.SelectTrackingTargetIndex(
                 definition.Seed,
                 trackingStart.ShipIdForRandom,
@@ -1338,7 +1508,7 @@ internal sealed class TargetLockCleanupSystem(SimulationRuntimeState state) : Ca
     {
         int processedCount = AdvanceTimedBehaviorDurations(context);
         AdvanceExistingLocks(context);
-        state.RebuildDerivedState(context.Transaction, resetTickWorkset: false);
+        state.RebuildLockDerivedState(context.Transaction, resetTickWorkset: false);
         state.RecordConsumerProcessed("TargetLockCleanup", processedCount);
     }
 
@@ -1546,7 +1716,6 @@ internal sealed class TargetingSystem(SimulationRuntimeState state) : CallbackSy
     {
         Dictionary<long, int> activeLockCounts = state.CopyOwnerLockCounts();
         IReadOnlyList<EntityId> roster = state.TickWorkset;
-        var rosterIndexes = ShipRoster.IndexByEntityKey(roster);
         int processedCount = 0;
 
         foreach (var shipId in roster)
@@ -1571,10 +1740,16 @@ internal sealed class TargetingSystem(SimulationRuntimeState state) : CallbackSy
             }
 
             var decisionOrdinal = behavior.DecisionOrdinal++;
+            var sourceIndex = ShipRoster.IndexOf(roster, shipId);
+            if (sourceIndex < 0)
+            {
+                continue;
+            }
+
             var targetId = FindInRangeCandidate(
                 context,
                 roster,
-                rosterIndexes[shipId.EntityKey],
+                sourceIndex,
                 shipId,
                 state.Definition.Seed,
                 decisionOrdinal);
@@ -1776,7 +1951,7 @@ internal sealed class DamageResolutionSystem(
                     if (resolution.IsDestroyed)
                     {
                         RecordKillParticipations(damageIntents, groupStart, groupEnd, targetId);
-                        damageResolutionState.RecordDestroyedShip();
+                        damageResolutionState.RecordDestroyedShip(targetId);
                         context.Transaction.Destroy(targetId);
                     }
                     else if (resolution.AppliedDamage > 0)
@@ -1833,8 +2008,11 @@ internal readonly record struct KillParticipation(EntityId Attacker, EntityId Ta
 internal sealed class DamageResolutionState
 {
     private readonly List<KillParticipation> _killParticipations = [];
+    private readonly List<EntityId> _destroyedShips = [];
 
     public IReadOnlyList<KillParticipation> KillParticipations => _killParticipations;
+
+    public IReadOnlyList<EntityId> DestroyedShips => _destroyedShips;
 
     public void AddKillParticipation(EntityId attacker, EntityId target)
         => _killParticipations.Add(new KillParticipation(attacker, target));
@@ -1852,7 +2030,11 @@ internal sealed class DamageResolutionState
 
     public void AddDamagedSurvivor(EntityId shipId) => DamagedSurvivors.Add(shipId);
 
-    public void RecordDestroyedShip() => DestroyedShipCount++;
+    public void RecordDestroyedShip(EntityId shipId)
+    {
+        _destroyedShips.Add(shipId);
+        DestroyedShipCount++;
+    }
 
     public void RecordShot(bool hit)
     {
@@ -1866,6 +2048,7 @@ internal sealed class DamageResolutionState
     public void Clear()
     {
         _killParticipations.Clear();
+        _destroyedShips.Clear();
         DamagedSurvivors.Clear();
         DestroyedShipCount = 0;
         Interlocked.Exchange(ref _shotsFiredThisTick, 0);
@@ -2041,7 +2224,9 @@ internal sealed class OutputSystem(
             ref SimulationRunComponent run = ref context.Transaction.OpenMut(state.RunEntityId)
                 .Write(SimulationRunEntity.Run);
             run.CompletedTicks = completedTicks;
-            uint aliveShipCount = state.ApplyDestroyedShips(damageResolutionState.DestroyedShipCount);
+            uint aliveShipCount = state.ApplyDestroyedShips(
+                damageResolutionState.DestroyedShipCount,
+                damageResolutionState.DestroyedShips);
             run.AliveShipCount = aliveShipCount;
             if (aliveShipCount <= 1 || completedTicks >= state.Definition.MaximumCompletedTicks)
             {
@@ -2065,7 +2250,7 @@ internal sealed class OutputSystem(
                     SpaceBattleHost.ReadSnapshot(context.Transaction, damageResolutionState.KillParticipations));
             }
 
-            state.RebuildDerivedState(context.Transaction, resetTickWorkset: false);
+            state.RebuildLockDerivedState(context.Transaction, resetTickWorkset: false);
             SpaceBattleModeCounts modeCounts = ReadModeCounts(context, state.TickWorkset);
             int activeLockCount = state.DerivedActiveLockCount;
             EntityRef runEntity = context.Transaction.Open(state.RunEntityId);

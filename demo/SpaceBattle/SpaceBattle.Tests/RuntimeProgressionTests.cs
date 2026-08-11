@@ -116,6 +116,7 @@ public sealed class RuntimeProgressionTests
         {
             Assert.That(afterMovement.Run.CompletedTicks, Is.EqualTo(11));
             Assert.That(movedShip.Mode, Is.EqualTo(BehaviorMode.Wandering));
+            Assert.That(movedShip.ModeTicksRemaining, Is.EqualTo(BehaviorRules.WanderingDecisionIntervalTicks));
             Assert.That(movedShip.Position, Is.EqualTo(expectedStep.Position));
             Assert.That(directionLengthSquared, Is.EqualTo(1f).Within(0.00001f));
             Assert.That(movedShip.Motion.Speed, Is.InRange(0f, SimulationDefinition.MaximumWanderingSpeed));

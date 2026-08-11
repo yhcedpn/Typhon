@@ -110,10 +110,14 @@ public sealed class ShipMembershipViewTests
         }
 
         using ShipMembershipViews views = ShipMembershipViews.RebuildAndCreate(engine, runEntityId, startupFenceTick: 0);
-        EntityId spawnedShip;
+        EntityId[] spawnedShips = new EntityId[2];
         using (Transaction transaction = engine.CreateQuickTransaction())
         {
-            spawnedShip = SpawnShip(transaction, runEntityId.EntityKey);
+            for (var index = 0; index < spawnedShips.Length; index++)
+            {
+                spawnedShips[index] = SpawnShip(transaction, runEntityId.EntityKey);
+            }
+
             transaction.Commit();
         }
 
@@ -123,14 +127,18 @@ public sealed class ShipMembershipViewTests
             views.Refresh(refresh);
         }
 
-        AssertViewDelta(views.RuntimeShips, definition.ShipCount + 1, added: 1, removed: 0);
+        AssertViewDelta(views.RuntimeShips, definition.ShipCount + 2, added: 2, removed: 0);
         views.RuntimeShips.ClearDelta();
-        AssertViewDelta(views.CombatShips, definition.ShipCount + 1, added: 1, removed: 0);
+        AssertViewDelta(views.CombatShips, definition.ShipCount + 2, added: 2, removed: 0);
         views.CombatShips.ClearDelta();
 
         using (Transaction transaction = engine.CreateQuickTransaction())
         {
-            transaction.Destroy(spawnedShip);
+            foreach (EntityId spawnedShip in spawnedShips)
+            {
+                transaction.Destroy(spawnedShip);
+            }
+
             transaction.Commit();
         }
 
@@ -140,9 +148,9 @@ public sealed class ShipMembershipViewTests
             views.Refresh(refresh);
         }
 
-        AssertViewDelta(views.RuntimeShips, definition.ShipCount, added: 0, removed: 1);
+        AssertViewDelta(views.RuntimeShips, definition.ShipCount, added: 0, removed: 2);
         views.RuntimeShips.ClearDelta();
-        AssertViewDelta(views.CombatShips, definition.ShipCount, added: 0, removed: 1);
+        AssertViewDelta(views.CombatShips, definition.ShipCount, added: 0, removed: 2);
     }
 
     [Test]
