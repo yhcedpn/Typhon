@@ -133,11 +133,13 @@ public sealed class TerminalOutcomeTests
     {
         using var engine = SpaceBattleDatabase.Open(definition, databaseLocation);
         using var transaction = engine.CreateQuickTransaction(DurabilityMode.Immediate);
+        var runId = transaction.Query<SimulationRunEntity>().Execute().Single();
         foreach (EntityId shipId in transaction.Query<Ship>().Execute())
         {
             transaction.Destroy(shipId);
         }
 
+        transaction.OpenMut(runId).Write(SimulationRunEntity.Run).AliveShipCount = 0;
         transaction.Commit();
     }
 

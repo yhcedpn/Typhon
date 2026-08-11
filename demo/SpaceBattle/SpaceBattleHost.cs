@@ -103,7 +103,8 @@ public static class SpaceBattleHost
         {
             persistedRun = existingRun.Value;
             ValidateRunIdentity(definition, persistedRun);
-            return ResumeRunningRun(engine, persistedRun);
+            SpaceBattleRecoveryValidation.ValidateCurrent(engine, definition, persistedRun.EntityId);
+            return ResumeRunningRun(engine, definition, persistedRun);
         }
 
         var stopwatch = Stopwatch.StartNew();
@@ -266,6 +267,7 @@ public static class SpaceBattleHost
 
     private static SpaceBattleRunResult ResumeRunningRun(
         DatabaseEngine engine,
+        SimulationDefinition definition,
         PersistedRun persistedRun)
     {
         if (persistedRun.Status != SimulationRunStatus.Running)
@@ -273,7 +275,7 @@ public static class SpaceBattleHost
             throw new InvalidOperationException($"SimulationRun 状态 {persistedRun.Status} 不可恢复。");
         }
 
-        SpaceBattleCheckpoint.Restore(engine, persistedRun.EntityId, persistedRun.CompletedTicks);
+        SpaceBattleCheckpoint.Restore(engine, definition, persistedRun.EntityId, persistedRun.CompletedTicks);
         using var transaction = engine.CreateQuickTransaction(DurabilityMode.Immediate);
         ref var runState = ref transaction.OpenMut(persistedRun.EntityId).Write(SimulationRunEntity.State);
         runState.ProcessSegment = checked(runState.ProcessSegment + 1);
