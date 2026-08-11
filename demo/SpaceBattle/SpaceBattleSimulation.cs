@@ -124,6 +124,7 @@ public sealed class SpaceBattleSimulation : IDisposable
                 SpaceBattlePhases.State,
                 SpaceBattlePhases.Steering,
                 SpaceBattlePhases.Movement,
+                SpaceBattlePhases.TargetLockCleanup,
                 SpaceBattlePhases.Targeting,
                 SpaceBattlePhases.Combat,
                 SpaceBattlePhases.Resolution,
@@ -131,6 +132,7 @@ public sealed class SpaceBattleSimulation : IDisposable
         dag.Add(new StateSystem());
         dag.Add(new SteeringSystem(state));
         dag.Add(new MovementSystem(state));
+        dag.Add(new TargetLockCleanupSystem(state));
         dag.Add(new TargetingSystem(state));
         dag.Add(new CombatSystem());
         dag.Add(new ResolutionSystem(state));
@@ -143,6 +145,7 @@ internal static class SpaceBattlePhases
     public static readonly Phase State = new("State");
     public static readonly Phase Steering = new("Steering");
     public static readonly Phase Movement = new("Movement");
+    public static readonly Phase TargetLockCleanup = new("TargetLockCleanup");
     public static readonly Phase Targeting = new("Targeting");
     public static readonly Phase Combat = new("Combat");
     public static readonly Phase Resolution = new("Resolution");
@@ -531,21 +534,192 @@ internal sealed class MovementSystem(SimulationRuntimeState state) : CallbackSys
     }
 }
 
+internal sealed class TargetLockCleanupSystem(SimulationRuntimeState state) : CallbackSystem
+{
+    protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
+        .Name("TargetLockCleanup")
+        .After("Movement")
+        .Phase(SpaceBattlePhases.TargetLockCleanup)
+        .Reads<PositionComponent>()
+        .ReadsFresh<BehaviorComponent>()
+        .ReadsFresh<TargetLockComponent>()
+        .Writes<BehaviorComponent>()
+        .Writes<TrackingComponent>()
+        .Writes<MotionComponent>()
+        .Writes<WeaponComponent>()
+        .Writes<TargetLockComponent>();
+
+    protected override void Execute(TickContext context)
+    {
+        AdvanceCombatDurations(context);
+        AdvanceExistingLocks(context);
+    }
+
+    private void AdvanceCombatDurations(TickContext context)
+    {
+        foreach (var shipId in context.Transaction.Query<Ship>().Execute())
+        {
+            var ship = context.Transaction.Open(shipId);
+            ref readonly var currentBehavior = ref ship.Read(Ship.Behavior);
+            if ((BehaviorMode)currentBehavior.Mode != BehaviorMode.Combat ||
+                currentBehavior.ModeTicksRemaining == 0)
+            {
+                continue;
+            }
+
+            var mutableShip = context.Transaction.OpenMut(shipId);
+            ref var behavior = ref mutableShip.Write(Ship.Behavior);
+            if (--behavior.ModeTicksRemaining != 0)
+            {
+                continue;
+            }
+
+            ref var tracking = ref mutableShip.Write(Ship.Tracking);
+            ref var motion = ref mutableShip.Write(Ship.Motion);
+            SteeringSystem.StartWandering(
+                state.Definition,
+                BehaviorRules.PackShipId(shipId),
+                ref behavior,
+                ref tracking,
+                ref motion);
+        }
+    }
+
+    private static void AdvanceExistingLocks(TickContext context)
+    {
+        foreach (var targetLockId in context.Transaction.Query<TargetLock>().Execute())
+        {
+            var targetLockEntity = context.Transaction.OpenMut(targetLockId);
+            ref var targetLock = ref targetLockEntity.Write(TargetLock.Data);
+            var ownerId = (EntityId)targetLock.Owner;
+            var targetId = (EntityId)targetLock.Target;
+            if (!context.Transaction.TryOpen(ownerId, out var owner))
+            {
+                context.Transaction.Destroy(targetLockId);
+                continue;
+            }
+
+            if (!context.Transaction.TryOpen(targetId, out var target))
+            {
+                DisableWeapon(context, ownerId);
+                context.Transaction.Destroy(targetLockId);
+                continue;
+            }
+
+            if (!IsWithinLockRange(owner, target))
+            {
+                if ((TargetLockStatus)targetLock.Status == TargetLockStatus.Locked)
+                {
+                    ref var ownerBehavior = ref context.Transaction.OpenMut(ownerId).Write(Ship.Behavior);
+                    if ((BehaviorMode)ownerBehavior.Mode == BehaviorMode.Combat)
+                    {
+                        ownerBehavior.ModeTicksRemaining = BehaviorRules.CombatAcquisitionDurationTicks + 1;
+                    }
+                }
+
+                DisableWeapon(context, ownerId);
+                context.Transaction.Destroy(targetLockId);
+                continue;
+            }
+
+            switch ((TargetLockStatus)targetLock.Status)
+            {
+                case TargetLockStatus.Releasing:
+                    DisableWeapon(context, ownerId);
+                    if (targetLock.TicksRemaining == 0 || --targetLock.TicksRemaining == 0)
+                    {
+                        context.Transaction.Destroy(targetLockId);
+                        continue;
+                    }
+
+                    break;
+                case TargetLockStatus.Acquiring:
+                    if ((BehaviorMode)owner.Read(Ship.Behavior).Mode != BehaviorMode.Combat)
+                    {
+                        BeginRelease(context, ownerId, ref targetLock);
+                        break;
+                    }
+
+                    if (targetLock.TicksRemaining == 0 || --targetLock.TicksRemaining == 0)
+                    {
+                        targetLock.Status = (byte)TargetLockStatus.Locked;
+                        EnableWeapon(context, ownerId);
+                    }
+
+                    break;
+                case TargetLockStatus.Locked:
+                    if ((BehaviorMode)owner.Read(Ship.Behavior).Mode != BehaviorMode.Combat)
+                    {
+                        BeginRelease(context, ownerId, ref targetLock);
+                    }
+                    else
+                    {
+                        EnableWeapon(context, ownerId);
+                    }
+
+                    break;
+                default:
+                    throw new InvalidOperationException("未知的目标锁定状态。");
+            }
+
+        }
+    }
+
+    private static void BeginRelease(
+        TickContext context,
+        EntityId ownerId,
+        ref TargetLockComponent targetLock)
+    {
+        targetLock.Status = (byte)TargetLockStatus.Releasing;
+        targetLock.TicksRemaining = BehaviorRules.LockReleaseDurationTicks;
+        DisableWeapon(context, ownerId);
+    }
+
+    private static void EnableWeapon(TickContext context, EntityId ownerId)
+    {
+        var owner = context.Transaction.OpenMut(ownerId);
+        if (!owner.IsEnabled(Ship.Weapon))
+        {
+            owner.Enable(Ship.Weapon);
+        }
+    }
+
+    private static void DisableWeapon(TickContext context, EntityId ownerId)
+    {
+        var owner = context.Transaction.OpenMut(ownerId);
+        if (owner.IsEnabled(Ship.Weapon))
+        {
+            owner.Disable(Ship.Weapon);
+        }
+    }
+
+    internal static bool IsWithinLockRange(EntityRef source, EntityRef target)
+    {
+        ref readonly var sourcePosition = ref source.Read(Ship.Position);
+        ref readonly var targetPosition = ref target.Read(Ship.Position);
+        var deltaX = targetPosition.X - sourcePosition.X;
+        var deltaY = targetPosition.Y - sourcePosition.Y;
+        var deltaZ = targetPosition.Z - sourcePosition.Z;
+        return (deltaX * deltaX) + (deltaY * deltaY) + (deltaZ * deltaZ)
+            <= BehaviorRules.LockRange * BehaviorRules.LockRange;
+    }
+}
+
 internal sealed class TargetingSystem(SimulationRuntimeState state) : CallbackSystem
 {
     protected override void Configure(SystemBuilder builder) => SpaceBattleSystemPolicies.Apply(builder)
         .Name("Targeting")
-        .After("Movement")
+        .After("TargetLockCleanup")
         .Phase(SpaceBattlePhases.Targeting)
         .Reads<PositionComponent>()
         .ReadsFresh<BehaviorComponent>()
-        .Reads<TargetLockComponent>()
+        .ReadsFresh<TargetLockComponent>()
         .Writes<BehaviorComponent>()
         .Writes<TargetLockComponent>();
 
     protected override void Execute(TickContext context)
     {
-        var activeLockCounts = AdvanceExistingLocks(context);
+        var activeLockCounts = CountOccupiedLocks(context);
         var roster = ShipRoster.Ordered(context.Transaction.Query<Ship>().Execute());
         var rosterIndexes = ShipRoster.IndexByEntityKey(roster);
 
@@ -561,19 +735,6 @@ internal sealed class TargetingSystem(SimulationRuntimeState state) : CallbackSy
             ref var behavior = ref ship.Write(Ship.Behavior);
             if ((BehaviorMode)behavior.Mode != BehaviorMode.Combat)
             {
-                continue;
-            }
-
-            if (behavior.ModeTicksRemaining > 0 && --behavior.ModeTicksRemaining == 0)
-            {
-                ref var tracking = ref ship.Write(Ship.Tracking);
-                ref var motion = ref ship.Write(Ship.Motion);
-                SteeringSystem.StartWandering(
-                    state.Definition,
-                    BehaviorRules.PackShipId(shipId),
-                    ref behavior,
-                    ref tracking,
-                    ref motion);
                 continue;
             }
 
@@ -603,49 +764,13 @@ internal sealed class TargetingSystem(SimulationRuntimeState state) : CallbackSy
         }
     }
 
-    private static Dictionary<long, int> AdvanceExistingLocks(TickContext context)
+    private static Dictionary<long, int> CountOccupiedLocks(TickContext context)
     {
         var activeLockCounts = new Dictionary<long, int>();
         foreach (var targetLockId in context.Transaction.Query<TargetLock>().Execute())
         {
-            var targetLockEntity = context.Transaction.OpenMut(targetLockId);
-            ref var targetLock = ref targetLockEntity.Write(TargetLock.Data);
+            var targetLock = context.Transaction.Open(targetLockId).Read(TargetLock.Data);
             var ownerId = (EntityId)targetLock.Owner;
-            var targetId = (EntityId)targetLock.Target;
-            if (!context.Transaction.TryOpen(ownerId, out var owner) ||
-                !context.Transaction.TryOpen(targetId, out var target))
-            {
-                context.Transaction.Destroy(targetLockId);
-                continue;
-            }
-
-            if (!IsWithinLockRange(owner, target))
-            {
-                if ((TargetLockStatus)targetLock.Status == TargetLockStatus.Locked)
-                {
-                    ref var ownerBehavior = ref context.Transaction.OpenMut(ownerId).Write(Ship.Behavior);
-                    if ((BehaviorMode)ownerBehavior.Mode == BehaviorMode.Combat)
-                    {
-                        ownerBehavior.ModeTicksRemaining = BehaviorRules.CombatAcquisitionDurationTicks + 1;
-                    }
-                }
-
-                context.Transaction.Destroy(targetLockId);
-                continue;
-            }
-
-            if ((TargetLockStatus)targetLock.Status == TargetLockStatus.Acquiring)
-            {
-                if (targetLock.TicksRemaining == 0)
-                {
-                    targetLock.Status = (byte)TargetLockStatus.Locked;
-                }
-                else
-                {
-                    targetLock.TicksRemaining--;
-                }
-            }
-
             activeLockCounts[ownerId.EntityKey] = activeLockCounts.GetValueOrDefault(ownerId.EntityKey) + 1;
         }
 
@@ -673,24 +798,13 @@ internal sealed class TargetingSystem(SimulationRuntimeState state) : CallbackSy
                 sourceIndex,
                 candidateOrdinal);
             var candidate = context.Transaction.Open(roster[candidateIndex]);
-            if (IsWithinLockRange(source, candidate))
+            if (TargetLockCleanupSystem.IsWithinLockRange(source, candidate))
             {
                 return roster[candidateIndex];
             }
         }
 
         return EntityId.Null;
-    }
-
-    private static bool IsWithinLockRange(EntityRef source, EntityRef target)
-    {
-        ref readonly var sourcePosition = ref source.Read(Ship.Position);
-        ref readonly var targetPosition = ref target.Read(Ship.Position);
-        var deltaX = targetPosition.X - sourcePosition.X;
-        var deltaY = targetPosition.Y - sourcePosition.Y;
-        var deltaZ = targetPosition.Z - sourcePosition.Z;
-        return (deltaX * deltaX) + (deltaY * deltaY) + (deltaZ * deltaZ)
-            <= BehaviorRules.LockRange * BehaviorRules.LockRange;
     }
 }
 

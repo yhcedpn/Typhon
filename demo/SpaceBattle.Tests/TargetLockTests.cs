@@ -77,6 +77,87 @@ public sealed class TargetLockTests
         }
     }
 
+    [Test]
+    public void Start_WhenAcquisitionCompletes_LockedTargetAuthorizesItsOwnerWeapon()
+    {
+        var definition = new SimulationDefinition(
+            runName: "target-lock-authorization-test",
+            shipCount: 64,
+            seed: SimulationDefinition.DefaultSeed,
+            rulesetVersion: 1,
+            worldSize: 100f,
+            maximumHealth: 1_000,
+            stagingTicks: 0,
+            spatialCellSize: 100f,
+            spatialMargin: 20f);
+        var databaseLocation = Path.Combine(_temporaryDirectory, "authorization.typhon");
+
+        using var simulation = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+
+        Assert.That(simulation.WaitForCompletedTicks(303, TimeSpan.FromSeconds(20)), Is.True);
+
+        var snapshot = simulation.GetSnapshot();
+        var lockedOwners = snapshot.TargetLocks
+            .Where(static targetLock => targetLock.Status == TargetLockStatus.Locked)
+            .Select(static targetLock => targetLock.OwnerEntityKey)
+            .ToHashSet();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(lockedOwners, Is.Not.Empty);
+            Assert.That(snapshot.Ships
+                    .Where(ship => lockedOwners.Contains(ship.EntityKey))
+                    .Select(static ship => ship.WeaponEnabled),
+                Is.All.True);
+        });
+    }
+
+    [Test]
+    public void Start_WhenCombatEnds_ReleasesLocksBeforeFreeingTheirSlots()
+    {
+        var definition = new SimulationDefinition(
+            runName: "target-lock-release-test",
+            shipCount: 64,
+            seed: SimulationDefinition.DefaultSeed,
+            rulesetVersion: 1,
+            worldSize: 100f,
+            maximumHealth: 1_000,
+            stagingTicks: 0,
+            spatialCellSize: 100f,
+            spatialMargin: 20f);
+        var databaseLocation = Path.Combine(_temporaryDirectory, "release.typhon");
+
+        using var simulation = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+
+        Assert.That(simulation.WaitForCompletedTicks(502, TimeSpan.FromSeconds(30)), Is.True);
+
+        var releasingSnapshot = simulation.GetSnapshot();
+        Assert.Multiple(() =>
+        {
+            Assert.That(releasingSnapshot.TargetLocks, Is.Not.Empty);
+            Assert.That(releasingSnapshot.TargetLocks, Has.All.Matches<TargetLockSnapshot>(
+                targetLock => targetLock.Status == TargetLockStatus.Releasing &&
+                    targetLock.TicksRemaining == BehaviorRules.LockReleaseDurationTicks));
+            Assert.That(releasingSnapshot.Ships
+                    .Where(ship => releasingSnapshot.TargetLocks.Any(targetLock =>
+                        targetLock.OwnerEntityKey == ship.EntityKey))
+                    .Select(static ship => ship.WeaponEnabled),
+                Is.All.False);
+        });
+
+        Assert.That(simulation.WaitForCompletedTicks(527, TimeSpan.FromSeconds(10)), Is.True);
+
+        Assert.That(simulation.GetSnapshot().TargetLocks, Is.Empty);
+    }
+
     private sealed class RecordingObservationSink : ISpaceBattleObservationSink
     {
         public void Publish(SpaceBattleObservation observation)

@@ -15,6 +15,7 @@ public static class BehaviorRules
     public const ushort TrackingDurationTicks = 250;
     public const ushort CombatAcquisitionDurationTicks = 250;
     public const ushort LockAcquisitionDurationTicks = 50;
+    public const ushort LockReleaseDurationTicks = 25;
     public const float TrackingSpeed = SimulationDefinition.BaseMaximumSpeed;
     public const float LockRange = 300f;
     public const int MaximumLockCandidatesPerAttempt = 64;
