@@ -154,6 +154,13 @@ public sealed class SpaceBattleSimulation : IDisposable
         return _state.GetDiagnosticsSnapshot();
     }
 
+    /// <summary>获取 PhaseTimingCollector 收集到的样本快照（仅供 benchmark 使用）。</summary>
+    internal IReadOnlyList<TickPhaseSample> GetPhaseTimingSamples()
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        return _state.PhaseTiming.Samples;
+    }
+
     public InitialWorldSnapshot WaitForSnapshot(ulong completedTicks, TimeSpan timeout)
         => WaitForSnapshots([completedTicks], timeout)[0];
 
@@ -240,6 +247,7 @@ public sealed class SpaceBattleSimulation : IDisposable
         {
             using Transaction transaction = engine.CreateQuickTransaction();
             state.InitializeShipRoster(transaction);
+            state.InitializeModeCounts(transaction);
             state.RebuildTargetLockIndexes(transaction);
         }
         catch
@@ -260,7 +268,7 @@ public sealed class SpaceBattleSimulation : IDisposable
                 new RuntimeOptions
                 {
                     BaseTickRate = SimulationDefinition.FixedTickRate,
-                    WorkerCount = SpaceBattleProductionSettings.AutomaticWorkerCount,
+                    WorkerCount = SpaceBattleProductionSettings.TestWorkerCountOverride ?? SpaceBattleProductionSettings.AutomaticWorkerCount,
                     Overload = new OverloadOptions
                     {
                         MinTickRateHz = SimulationDefinition.FixedTickRate,
@@ -560,6 +568,13 @@ internal sealed class SimulationRuntimeState : IDisposable
     private ulong _deaths;
     private uint _aliveShipCount;
     private int _derivedActiveLockCount;
+    private int _modeCountStaging;
+    private int _modeCountWandering;
+    private int _modeCountTracking;
+    private int _modeCountCombat;
+    private int _modeCountDisengaging;
+    private int _modeCountEscaping;
+    private readonly HashSet<long> _destroyedShipKeys = [];
     private int _isRunning = 1;
     private int _isTerminal;
     private bool _pauseRequested;
@@ -567,6 +582,7 @@ internal sealed class SimulationRuntimeState : IDisposable
     private bool _tickInProgress;
     private ulong[] _requestedSnapshotTicks = [];
     private readonly Dictionary<ulong, InitialWorldSnapshot> _snapshots = new();
+    internal PhaseTimingCollector PhaseTiming { get; } = new();
 
     private readonly record struct TargetLockIndexMutation(
         EntityId TargetLockId,
@@ -636,6 +652,17 @@ internal sealed class SimulationRuntimeState : IDisposable
         }
     }
 
+    public uint AliveShipCount
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _aliveShipCount;
+            }
+        }
+    }
+
     public void Dispose()
     {
         ShipViews.Dispose();
@@ -649,6 +676,13 @@ internal sealed class SimulationRuntimeState : IDisposable
             _pendingTargetLockMutations.Clear();
             _consumerProcessingCounts.Clear();
             _derivedActiveLockCount = 0;
+            _modeCountStaging = 0;
+            _modeCountWandering = 0;
+            _modeCountTracking = 0;
+            _modeCountCombat = 0;
+            _modeCountDisengaging = 0;
+            _modeCountEscaping = 0;
+            _destroyedShipKeys.Clear();
         }
     }
 
@@ -698,6 +732,90 @@ internal sealed class SimulationRuntimeState : IDisposable
             PublishShipRoster(shipRoster);
             _tickWorkset = shipRoster;
             _tickWorksetReadOnly = _shipRosterReadOnly;
+        }
+    }
+
+    public void InitializeModeCounts(Transaction transaction)
+    {
+        ArgumentNullException.ThrowIfNull(transaction);
+        int staging = 0, wandering = 0, tracking = 0, combat = 0, disengaging = 0, escaping = 0;
+        foreach (EntityId shipId in Ships.GetEntityEnumerator())
+        {
+            if (!transaction.IsAlive(shipId))
+            {
+                continue;
+            }
+
+            var mode = (BehaviorMode)transaction.Open(shipId).Read(Ship.Behavior).Mode;
+            switch (mode)
+            {
+                case BehaviorMode.Staging: staging++; break;
+                case BehaviorMode.Wandering: wandering++; break;
+                case BehaviorMode.Tracking: tracking++; break;
+                case BehaviorMode.Combat: combat++; break;
+                case BehaviorMode.Disengaging: disengaging++; break;
+                case BehaviorMode.Escaping: escaping++; break;
+            }
+        }
+
+        lock (_sync)
+        {
+            _modeCountStaging = staging;
+            _modeCountWandering = wandering;
+            _modeCountTracking = tracking;
+            _modeCountCombat = combat;
+            _modeCountDisengaging = disengaging;
+            _modeCountEscaping = escaping;
+            _destroyedShipKeys.Clear();
+        }
+    }
+
+    public void RecordModeTransition(BehaviorMode oldMode, BehaviorMode newMode)
+    {
+        lock (_sync)
+        {
+            DecrementModeCount(oldMode);
+            IncrementModeCount(newMode);
+        }
+    }
+
+    private void IncrementModeCount(BehaviorMode mode)
+    {
+        switch (mode)
+        {
+            case BehaviorMode.Staging: _modeCountStaging++; break;
+            case BehaviorMode.Wandering: _modeCountWandering++; break;
+            case BehaviorMode.Tracking: _modeCountTracking++; break;
+            case BehaviorMode.Combat: _modeCountCombat++; break;
+            case BehaviorMode.Disengaging: _modeCountDisengaging++; break;
+            case BehaviorMode.Escaping: _modeCountEscaping++; break;
+        }
+    }
+
+    private void DecrementModeCount(BehaviorMode mode)
+    {
+        switch (mode)
+        {
+            case BehaviorMode.Staging: _modeCountStaging--; break;
+            case BehaviorMode.Wandering: _modeCountWandering--; break;
+            case BehaviorMode.Tracking: _modeCountTracking--; break;
+            case BehaviorMode.Combat: _modeCountCombat--; break;
+            case BehaviorMode.Disengaging: _modeCountDisengaging--; break;
+            case BehaviorMode.Escaping: _modeCountEscaping--; break;
+        }
+    }
+
+    public SpaceBattleModeCounts GetDerivedModeCounts()
+    {
+        lock (_sync)
+        {
+            return new SpaceBattleModeCounts(
+                _modeCountStaging,
+                _modeCountWandering,
+                _modeCountTracking,
+                _modeCountCombat,
+                _modeCountDisengaging,
+                _modeCountEscaping);
         }
     }
 
@@ -966,11 +1084,19 @@ internal sealed class SimulationRuntimeState : IDisposable
 
     public uint ApplyDestroyedShips(
         int destroyedShipCount,
-        IReadOnlyList<EntityId> destroyedShips)
+        IReadOnlyList<EntityId> destroyedShips,
+        IReadOnlyList<BehaviorMode> destroyedShipModes)
     {
         lock (_sync)
         {
             _aliveShipCount = checked(_aliveShipCount - (uint)destroyedShipCount);
+
+            for (int i = 0; i < destroyedShipModes.Count; i++)
+            {
+                DecrementModeCount(destroyedShipModes[i]);
+                _destroyedShipKeys.Add(destroyedShips[i].EntityKey);
+            }
+
             if (destroyedShips.Count != 0)
             {
                 EntityId[] nextRoster = global::SpaceBattle.ShipRoster.ApplyDelta(
@@ -986,6 +1112,22 @@ internal sealed class SimulationRuntimeState : IDisposable
             }
 
             return _aliveShipCount;
+        }
+    }
+
+    public bool IsDestroyedShip(long entityKey)
+    {
+        lock (_sync)
+        {
+            return _destroyedShipKeys.Contains(entityKey);
+        }
+    }
+
+    public void ClearDestroyedShipKeys()
+    {
+        lock (_sync)
+        {
+            _destroyedShipKeys.Clear();
         }
     }
 
@@ -1204,7 +1346,12 @@ internal sealed class ShipViewRefreshSystem(SimulationRuntimeState state) : Call
         .ShouldRun(() => state.IsRunning)
         .Reads<ShipRunMembershipComponent>();
 
-    protected override void Execute(TickContext context) => state.RefreshShipViews(context.Transaction);
+    protected override void Execute(TickContext context)
+    {
+        state.PhaseTiming.BeginPhase(PhaseTimingCollector.ShipViewRefresh);
+        state.RefreshShipViews(context.Transaction);
+        state.PhaseTiming.EndPhase(PhaseTimingCollector.ShipViewRefresh);
+    }
 }
 
 internal sealed class StateSystem(SimulationRuntimeState state) : CallbackSystem
@@ -1218,10 +1365,15 @@ internal sealed class StateSystem(SimulationRuntimeState state) : CallbackSystem
 
     protected override void Execute(TickContext context)
     {
+        state.PhaseTiming.BeginTick();
+        state.PhaseTiming.BeginPhase(PhaseTimingCollector.State);
         if (!state.BeginTick(context.Transaction))
         {
+            state.PhaseTiming.EndPhase(PhaseTimingCollector.State);
             return;
         }
+
+        state.ClearDestroyedShipKeys();
 
         int processedCount = 0;
         foreach (var shipId in state.TickWorkset)
@@ -1247,9 +1399,11 @@ internal sealed class StateSystem(SimulationRuntimeState state) : CallbackSystem
 
             behavior.Mode = (byte)BehaviorMode.Wandering;
             behavior.DecisionOrdinal++;
+            state.RecordModeTransition(BehaviorMode.Staging, BehaviorMode.Wandering);
         }
 
         state.RecordConsumerProcessed("State", processedCount);
+        state.PhaseTiming.EndPhase(PhaseTimingCollector.State);
     }
 }
 
@@ -1269,6 +1423,7 @@ internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSys
 
     protected override void Execute(TickContext context)
     {
+        state.PhaseTiming.BeginPhase(PhaseTimingCollector.Steering);
         IReadOnlyList<EntityId> shipIds = state.TickWorkset;
         List<TrackingStart> trackingStarts = null;
         int processedCount = 0;
@@ -1285,8 +1440,9 @@ internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSys
             ref var behavior = ref ship.Write(Ship.Behavior);
             ref var tracking = ref ship.Write(Ship.Tracking);
             var shipIdForRandom = BehaviorRules.PackShipId(shipId);
+            var oldMode = (BehaviorMode)behavior.Mode;
 
-            switch ((BehaviorMode)behavior.Mode)
+            switch (oldMode)
             {
                 case BehaviorMode.Wandering:
                     ProcessWandering(
@@ -1330,14 +1486,31 @@ internal sealed class SteeringSystem(SimulationRuntimeState state) : CallbackSys
                         ref ship.Write(Ship.Motion));
                     break;
             }
+
+            var newMode = (BehaviorMode)behavior.Mode;
+            if (newMode != oldMode)
+            {
+                state.RecordModeTransition(oldMode, newMode);
+            }
         }
 
         if (trackingStarts is not null)
         {
             StartTracking(context, state.Definition, state.ShipRoster, trackingStarts);
+            // 派生统计：StartTracking 中目标选择失败时改回 Wandering
+            foreach (var trackingStart in trackingStarts)
+            {
+                var ship = context.Transaction.OpenMut(trackingStart.ShipId);
+                var finalMode = (BehaviorMode)ship.Read(Ship.Behavior).Mode;
+                if (finalMode == BehaviorMode.Wandering)
+                {
+                    state.RecordModeTransition(BehaviorMode.Tracking, BehaviorMode.Wandering);
+                }
+            }
         }
 
         state.RecordConsumerProcessed("Steering", processedCount);
+        state.PhaseTiming.EndPhase(PhaseTimingCollector.Steering);
     }
 
     private static void ProcessWandering(
@@ -1533,6 +1706,7 @@ internal sealed class MovementSystem(SimulationRuntimeState state) : CallbackSys
 
     protected override void Execute(TickContext context)
     {
+        state.PhaseTiming.BeginPhase(PhaseTimingCollector.Movement);
         int processedCount = 0;
         foreach (var shipId in state.TickWorkset)
         {
@@ -1574,6 +1748,7 @@ internal sealed class MovementSystem(SimulationRuntimeState state) : CallbackSys
         }
 
         state.RecordConsumerProcessed("Movement", processedCount);
+        state.PhaseTiming.EndPhase(PhaseTimingCollector.Movement);
     }
 }
 
@@ -1595,9 +1770,11 @@ internal sealed class TargetLockCleanupSystem(SimulationRuntimeState state) : Ca
 
     protected override void Execute(TickContext context)
     {
+        state.PhaseTiming.BeginPhase(PhaseTimingCollector.TargetLockCleanup);
         int processedCount = AdvanceTimedBehaviorDurations(context);
         AdvanceExistingLocks(context, state);
         state.RecordConsumerProcessed("TargetLockCleanup", processedCount);
+        state.PhaseTiming.EndPhase(PhaseTimingCollector.TargetLockCleanup);
     }
 
     private int AdvanceTimedBehaviorDurations(TickContext context)
@@ -1635,6 +1812,7 @@ internal sealed class TargetLockCleanupSystem(SimulationRuntimeState state) : Ca
                 ref behavior,
                 ref tracking,
                 ref motion);
+            state.RecordModeTransition(BehaviorMode.Combat, BehaviorMode.Wandering);
         }
 
         return processedCount;
@@ -1829,6 +2007,7 @@ internal sealed class TargetingSystem(SimulationRuntimeState state) : CallbackSy
 
     protected override void Execute(TickContext context)
     {
+        state.PhaseTiming.BeginPhase(PhaseTimingCollector.Targeting);
         Dictionary<long, int> activeLockCounts = state.CopyOwnerLockCounts();
         IReadOnlyList<EntityId> roster = state.TickWorkset;
         int processedCount = 0;
@@ -1896,6 +2075,7 @@ internal sealed class TargetingSystem(SimulationRuntimeState state) : CallbackSy
         }
 
         state.RecordConsumerProcessed("Targeting", processedCount);
+        state.PhaseTiming.EndPhase(PhaseTimingCollector.Targeting);
     }
 
     private static EntityId FindInRangeCandidate(
@@ -1957,6 +2137,7 @@ internal sealed class CombatSystem(
 
     protected override void Execute(TickContext context)
     {
+        state.PhaseTiming.BeginParallelPhase();
         state.RecordConsumerProcessed("Combat", context.Entities.Count);
         EntityAccessor accessor = context.Accessor;
         EventQueue<DamageIntent> damageIntentQueue = damageIntentQueues[context.WorkerId];
@@ -1987,6 +2168,8 @@ internal sealed class CombatSystem(
                 damageIntentQueue.Push(new DamageIntent(attackerId, targetId));
             }
         }
+
+        state.PhaseTiming.EndParallelPhase(PhaseTimingCollector.Combat);
     }
 }
 
@@ -2012,6 +2195,7 @@ internal sealed class DamageResolutionSystem(
 
     protected override void Execute(TickContext context)
     {
+        state.PhaseTiming.BeginResolutionPhase();
         damageResolutionState.Clear();
         int intentCount = 0;
         foreach (EventQueue<DamageIntent> queue in damageIntentQueues)
@@ -2059,6 +2243,7 @@ internal sealed class DamageResolutionSystem(
                 {
                     EntityRef target = context.Transaction.OpenMut(targetId);
                     ref HealthComponent health = ref target.Write(Ship.Health);
+                    ref readonly BehaviorComponent targetBehavior = ref target.Read(Ship.Behavior);
                     DamageResolution resolution = DamageResolutionRules.Resolve(
                         health.Current,
                         groupEnd - groupStart,
@@ -2067,7 +2252,7 @@ internal sealed class DamageResolutionSystem(
                     if (resolution.IsDestroyed)
                     {
                         RecordKillParticipations(damageIntents, groupStart, groupEnd, targetId);
-                        damageResolutionState.RecordDestroyedShip(targetId);
+                        damageResolutionState.RecordDestroyedShip(targetId, (BehaviorMode)targetBehavior.Mode);
                         context.Transaction.Destroy(targetId);
                     }
                     else if (resolution.AppliedDamage > 0)
@@ -2082,6 +2267,15 @@ internal sealed class DamageResolutionSystem(
         finally
         {
             ArrayPool<DamageIntent>.Shared.Return(damageIntents);
+        }
+
+        // 将本 tick 的死亡及时传播到 workset、roster 与派生统计（AC2）
+        if (damageResolutionState.DestroyedShipCount > 0)
+        {
+            state.ApplyDestroyedShips(
+                damageResolutionState.DestroyedShipCount,
+                damageResolutionState.DestroyedShips,
+                damageResolutionState.DestroyedShipModes);
         }
     }
 
@@ -2125,10 +2319,13 @@ internal sealed class DamageResolutionState
 {
     private readonly List<KillParticipation> _killParticipations = [];
     private readonly List<EntityId> _destroyedShips = [];
+    private readonly List<BehaviorMode> _destroyedShipModes = [];
 
     public IReadOnlyList<KillParticipation> KillParticipations => _killParticipations;
 
     public IReadOnlyList<EntityId> DestroyedShips => _destroyedShips;
+
+    public IReadOnlyList<BehaviorMode> DestroyedShipModes => _destroyedShipModes;
 
     public void AddKillParticipation(EntityId attacker, EntityId target)
         => _killParticipations.Add(new KillParticipation(attacker, target));
@@ -2146,9 +2343,10 @@ internal sealed class DamageResolutionState
 
     public void AddDamagedSurvivor(EntityId shipId) => DamagedSurvivors.Add(shipId);
 
-    public void RecordDestroyedShip(EntityId shipId)
+    public void RecordDestroyedShip(EntityId shipId, BehaviorMode destroyedMode)
     {
         _destroyedShips.Add(shipId);
+        _destroyedShipModes.Add(destroyedMode);
         DestroyedShipCount++;
     }
 
@@ -2165,6 +2363,7 @@ internal sealed class DamageResolutionState
     {
         _killParticipations.Clear();
         _destroyedShips.Clear();
+        _destroyedShipModes.Clear();
         DamagedSurvivors.Clear();
         DestroyedShipCount = 0;
         Interlocked.Exchange(ref _shotsFiredThisTick, 0);
@@ -2190,6 +2389,7 @@ internal sealed class ResolutionSystem(
 
     protected override void Execute(TickContext context)
     {
+        state.PhaseTiming.BeginResolutionPhase();
         TargetLockCleanupSystem.ClearDeadLocks(context, state, damageResolutionState.DestroyedShips);
         ApplyCombatReactions(context);
         int processedCount = 0;
@@ -2221,9 +2421,11 @@ internal sealed class ResolutionSystem(
                 ref behavior,
                 ref tracking,
                 ref ship.Write(Ship.Motion));
+            state.RecordModeTransition(BehaviorMode.Tracking, BehaviorMode.Wandering);
         }
 
         state.RecordConsumerProcessed("Resolution", processedCount);
+        state.PhaseTiming.EndResolutionPhase();
     }
 
     private void ApplyCombatReactions(TickContext context)
@@ -2254,7 +2456,8 @@ internal sealed class ResolutionSystem(
         ref BehaviorComponent behavior = ref ship.Write(Ship.Behavior);
         ref TrackingComponent tracking = ref ship.Write(Ship.Tracking);
         ref MotionComponent motion = ref ship.Write(Ship.Motion);
-        bool wasEscaping = behavior.Mode == (byte)BehaviorMode.Escaping;
+        BehaviorMode oldMode = (BehaviorMode)behavior.Mode;
+        bool wasEscaping = oldMode == BehaviorMode.Escaping;
         ulong escapeOrdinal = wasEscaping
             ? behavior.DecisionOrdinal - 1
             : behavior.DecisionOrdinal++;
@@ -2268,6 +2471,7 @@ internal sealed class ResolutionSystem(
                     state.Definition.Seed,
                     BehaviorRules.PackShipId(shipId),
                     escapeOrdinal)));
+            state.RecordModeTransition(oldMode, BehaviorMode.Escaping);
         }
 
         TargetLockCleanupSystem.DisableWeapon(context, shipId);
@@ -2298,12 +2502,14 @@ internal sealed class ResolutionSystem(
         }
     }
 
-    private static void EnterDisengaging(TickContext context, EntityId shipId)
+    private void EnterDisengaging(TickContext context, EntityId shipId)
     {
         EntityRef ship = context.Transaction.OpenMut(shipId);
         ref BehaviorComponent behavior = ref ship.Write(Ship.Behavior);
+        var oldMode = (BehaviorMode)behavior.Mode;
         behavior.Mode = (byte)BehaviorMode.Disengaging;
         behavior.ModeTicksRemaining = BehaviorRules.DisengagingDurationTicks;
+        state.RecordModeTransition(oldMode, BehaviorMode.Disengaging);
         ship.Write(Ship.Motion).Speed = BehaviorRules.DisengagingSpeed;
         TargetLockCleanupSystem.DisableWeapon(context, shipId);
         if (ship.IsEnabled(Ship.Afterburner))
@@ -2337,6 +2543,7 @@ internal sealed class OutputSystem(
 
     protected override void Execute(TickContext context)
     {
+        state.PhaseTiming.BeginPhase(PhaseTimingCollector.Output);
         ulong completedTicks = 0;
         bool tickCompleted = false;
         try
@@ -2345,9 +2552,7 @@ internal sealed class OutputSystem(
             ref SimulationRunComponent run = ref context.Transaction.OpenMut(state.RunEntityId)
                 .Write(SimulationRunEntity.Run);
             run.CompletedTicks = completedTicks;
-            uint aliveShipCount = state.ApplyDestroyedShips(
-                damageResolutionState.DestroyedShipCount,
-                damageResolutionState.DestroyedShips);
+            uint aliveShipCount = state.AliveShipCount;
             run.AliveShipCount = aliveShipCount;
             if (aliveShipCount <= 1 || completedTicks >= state.Definition.MaximumCompletedTicks)
             {
@@ -2371,7 +2576,7 @@ internal sealed class OutputSystem(
                     SpaceBattleHost.ReadSnapshot(context.Transaction, damageResolutionState.KillParticipations));
             }
 
-            SpaceBattleModeCounts modeCounts = ReadModeCounts(context, state.TickWorkset);
+            SpaceBattleModeCounts modeCounts = state.GetDerivedModeCounts();
             int activeLockCount = state.DerivedActiveLockCount;
             EntityRef runEntity = context.Transaction.Open(state.RunEntityId);
             ref readonly SimulationRunStateComponent runState = ref runEntity.Read(SimulationRunEntity.State);
@@ -2402,6 +2607,8 @@ internal sealed class OutputSystem(
 
             state.RecordConsumerProcessed("Output", modeCounts.Total);
             state.MarkCompletedTicks(completedTicks);
+            state.PhaseTiming.EndPhase(PhaseTimingCollector.Output);
+            state.PhaseTiming.EndTick(completedTicks);
             tickCompleted = true;
         }
         finally
@@ -2452,59 +2659,6 @@ internal sealed class OutputSystem(
         }
 
         return new TerminalShipState(aliveShipCount, survivor);
-    }
-
-    private static SpaceBattleModeCounts ReadModeCounts(
-        TickContext context,
-        IReadOnlyList<EntityId> tickWorkset)
-    {
-        int staging = 0;
-        int wandering = 0;
-        int tracking = 0;
-        int combat = 0;
-        int disengaging = 0;
-        int escaping = 0;
-
-        foreach (EntityId shipId in tickWorkset)
-        {
-            if (!context.Transaction.IsAlive(shipId))
-            {
-                continue;
-            }
-
-            BehaviorMode mode = (BehaviorMode)context.Transaction.Open(shipId).Read(Ship.Behavior).Mode;
-            switch (mode)
-            {
-                case BehaviorMode.Staging:
-                    staging++;
-                    break;
-                case BehaviorMode.Wandering:
-                    wandering++;
-                    break;
-                case BehaviorMode.Tracking:
-                    tracking++;
-                    break;
-                case BehaviorMode.Combat:
-                    combat++;
-                    break;
-                case BehaviorMode.Disengaging:
-                    disengaging++;
-                    break;
-                case BehaviorMode.Escaping:
-                    escaping++;
-                    break;
-                default:
-                    throw new InvalidOperationException($"无法为非法行为模式 {mode} 采样战况。");
-            }
-        }
-
-        return new SpaceBattleModeCounts(
-            staging,
-            wandering,
-            tracking,
-            combat,
-            disengaging,
-            escaping);
     }
 
     private readonly record struct TerminalShipState(uint AliveShipCount, EntityId Winner);

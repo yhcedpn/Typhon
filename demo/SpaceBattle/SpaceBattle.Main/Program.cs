@@ -7,8 +7,13 @@ internal static class Program
     private const string RunName = "default";
     private const bool EnableDeepProfiling = false;
 
-    public static int Main()
+    public static int Main(string[] args)
     {
+        if (args is ["benchmark"])
+        {
+            return RunBenchmark();
+        }
+
         var databaseLocation = Path.Combine(AppContext.BaseDirectory, $"{RunName}.typhon");
         ConfigureDeepProfiling(databaseLocation);
         using var cancellation = new CancellationTokenSource();
@@ -125,6 +130,94 @@ internal static class Program
                         (bottleneck is null ? string.Empty : $"（{bottleneck.Path}）"));
                     break;
             }
+        }
+    }
+
+    private static int RunBenchmark()
+    {
+        // 基准模式下不使用 deep profiling
+        var databaseLocation = Path.Combine(AppContext.BaseDirectory, "benchmark.typhon");
+        if (Directory.Exists(databaseLocation))
+        {
+            Directory.Delete(databaseLocation, recursive: true);
+        }
+
+        var reportPath = Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..", "..",
+            "benchmark", "reports",
+            $"performance-report-{DateTime.UtcNow:yyyyMMdd-HHmmss}.md");
+
+        Directory.CreateDirectory(Path.GetDirectoryName(reportPath)!);
+
+        using var reportWriter = new StreamWriter(reportPath, append: false);
+        var consoleWriter = new DualTextWriter(Console.Out, reportWriter);
+
+        Console.WriteLine($"性能报告将写入: {reportPath}");
+        Console.WriteLine();
+
+        try
+        {
+            var result = BenchmarkDriver.Run(databaseLocation, consoleWriter);
+
+            if (result.Samples.Count == 0)
+            {
+                Console.Error.WriteLine("基准测试失败：未收集到样本。");
+                return 1;
+            }
+
+            Console.WriteLine();
+            Console.WriteLine($"基准测试完成。报告已保存至: {reportPath}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"基准测试异常：{ex}");
+            return 1;
+        }
+        finally
+        {
+            // 清理数据库
+            if (Directory.Exists(databaseLocation))
+            {
+                try { Directory.Delete(databaseLocation, recursive: true); }
+                catch { /* 清理非关键 */ }
+            }
+        }
+    }
+
+    /// <summary>同时写入两个 TextWriter 的包装器。</summary>
+    private sealed class DualTextWriter(TextWriter primary, TextWriter secondary) : TextWriter
+    {
+        public override System.Text.Encoding Encoding => primary.Encoding;
+
+        public override void Write(char value)
+        {
+            primary.Write(value);
+            secondary.Write(value);
+        }
+
+        public override void Write(string value)
+        {
+            primary.Write(value);
+            secondary.Write(value);
+        }
+
+        public override void WriteLine(string value)
+        {
+            primary.WriteLine(value);
+            secondary.WriteLine(value);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                primary.Dispose();
+                secondary.Dispose();
+            }
+
+            base.Dispose(disposing);
         }
     }
 }

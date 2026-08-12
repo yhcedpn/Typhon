@@ -481,6 +481,200 @@ public sealed class TargetLockTests
             targetLock.TargetEntityKey == lockToBreak.TargetEntityKey));
     }
 
+    [Test]
+    // AC3: 端到端场景覆盖实体创建/销毁、行为模式变化、锁清理、同 tick 同时伤害结算和终态确认。
+    public void ComprehensiveEndToEnd_CoversCreationDestructionModeLocksDamageAndTerminal()
+    {
+        SimulationDefinition definition = new(
+            runName: "ac3-comprehensive-e2e",
+            shipCount: 8,
+            seed: SimulationDefinition.DefaultSeed,
+            rulesetVersion: 1,
+            worldSize: 300f,
+            maximumHealth: 800,
+            stagingTicks: 0,
+            spatialCellSize: 100f,
+            spatialMargin: 20f,
+            maximumCompletedTicks: 4_000);
+        string databaseLocation = Path.Combine(_temporaryDirectory, "ac3-comprehensive-e2e.typhon");
+
+        using SpaceBattleSimulation simulation = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+
+        // 阶段 1：初始创建后所有飞船处于 Wandering 模式（staging=0）
+        InitialWorldSnapshot initialSnapshot = simulation.GetSnapshot();
+        Assert.Multiple(() =>
+        {
+            Assert.That(initialSnapshot.Run.CompletedTicks, Is.Zero);
+            Assert.That(initialSnapshot.Ships, Has.Count.EqualTo(definition.ShipCount));
+            Assert.That(initialSnapshot.Ships, Has.All.Matches<ShipSnapshot>(ship =>
+                ship.Mode == BehaviorMode.Staging &&
+                ship.ModeTicksRemaining == 0));
+            Assert.That(initialSnapshot.TargetLocks, Is.Empty);
+            Assert.That(initialSnapshot.KillParticipations, Is.Empty);
+        });
+
+        // 阶段 2：第一个 tick 后，飞船进入 Wandering
+        InitialWorldSnapshot tick1Snapshot = simulation.WaitForSnapshot(1, TimeSpan.FromSeconds(5));
+        Assert.Multiple(() =>
+        {
+            Assert.That(tick1Snapshot.Ships, Has.Count.EqualTo(definition.ShipCount));
+            Assert.That(tick1Snapshot.Ships, Has.All.Matches<ShipSnapshot>(ship =>
+                ship.Mode == BehaviorMode.Wandering));
+        });
+
+        // 阶段 3：Tracking 或 Combat 阶段 — 验证至少部分飞船已离开 Wandering
+        // 使用 WaitForSnapshots 滚动查找第一个有 Tracking/Combat 飞船的快照
+        IReadOnlyList<InitialWorldSnapshot> transitionSnapshots = simulation.WaitForSnapshots(
+            [202, 227, 252, 277, 302, 327, 352, 377, 402, 427, 452, 477, 502, 527],
+            TimeSpan.FromSeconds(25));
+        InitialWorldSnapshot trackingOrCombatSnapshot = transitionSnapshots
+            .First(snapshot => snapshot.Ships.Any(ship =>
+                ship.Mode is BehaviorMode.Tracking or BehaviorMode.Combat));
+        Assert.Multiple(() =>
+        {
+            Assert.That(trackingOrCombatSnapshot.Ships, Has.Count.EqualTo(definition.ShipCount),
+                "在 tracking/combat 阶段所有飞船应仍然存活");
+            Assert.That(trackingOrCombatSnapshot.Ships, Has.Some.Matches<ShipSnapshot>(ship =>
+                ship.Mode is BehaviorMode.Tracking or BehaviorMode.Combat),
+                "至少应有部分飞船进入 Tracking 或 Combat");
+        });
+
+        // 阶段 4：持有 Acquiring 锁的阶段
+        InitialWorldSnapshot acquiringLockSnapshot = transitionSnapshots
+            .First(snapshot => snapshot.TargetLocks.Any(targetLock =>
+                targetLock.Status == TargetLockStatus.Acquiring));
+        Assert.Multiple(() =>
+        {
+            Assert.That(acquiringLockSnapshot.TargetLocks, Is.Not.Empty);
+            Assert.That(acquiringLockSnapshot.TargetLocks, Has.All.Matches<TargetLockSnapshot>(targetLock =>
+                targetLock.Status is TargetLockStatus.Acquiring or TargetLockStatus.Releasing));
+        });
+
+        // 阶段 5：Locked 锁和武器可用 — 滚动查找第一个 Locked 快照
+        InitialWorldSnapshot lockedSnapshot = transitionSnapshots
+            .Concat(simulation.WaitForSnapshots(
+                [552, 553, 554, 555, 556, 557, 558, 559, 560, 561, 562, 563, 564, 565,
+                 566, 567, 568, 569, 570, 571, 572, 573, 574, 575],
+                TimeSpan.FromSeconds(25)))
+            .FirstOrDefault(snapshot => snapshot.TargetLocks.Any(targetLock =>
+                targetLock.Status == TargetLockStatus.Locked));
+        if (lockedSnapshot != null)
+        {
+            Assert.Multiple(() =>
+            {
+                Assert.That(lockedSnapshot.Ships
+                        .Where(ship => lockedSnapshot.TargetLocks
+                            .Any(targetLock =>
+                                targetLock.OwnerEntityKey == ship.EntityKey &&
+                                targetLock.Status == TargetLockStatus.Locked))
+                        .Select(static ship => ship.WeaponEnabled),
+                    Has.All.True);
+            });
+        }
+
+        // 阶段 6：伤害结算和击杀 — 查找第一个有击杀的快照
+        IReadOnlyList<InitialWorldSnapshot> damageSearchSnapshots = simulation.WaitForSnapshots(
+            [580, 590, 600, 610, 620, 630, 640, 650, 660, 670],
+            TimeSpan.FromSeconds(30));
+        InitialWorldSnapshot damageSnapshot = damageSearchSnapshots
+            .FirstOrDefault(snapshot => snapshot.KillParticipations.Count > 0);
+        if (damageSnapshot != null)
+        {
+            HashSet<long> liveKeys = damageSnapshot.Ships
+                .Select(static ship => ship.EntityKey)
+                .ToHashSet();
+
+            Assert.Multiple(() =>
+            {
+                // 击杀参与记录完整
+                Assert.That(damageSnapshot.KillParticipations, Is.Not.Empty);
+                Assert.That(damageSnapshot.KillParticipations, Is.Unique);
+                Assert.That(damageSnapshot.KillParticipations
+                        .Select(static participation => participation.TargetEntityKey),
+                    Has.All.Matches<long>(targetKey => !liveKeys.Contains(targetKey)),
+                    "所有击杀目标都不在存活飞船中（同 tick 死亡）");
+                Assert.That(damageSnapshot.Ships,
+                    Has.All.Matches<ShipSnapshot>(ship => ship.Health > 0),
+                    "没有存活飞船生命值为 0");
+
+                // 锁清理 — 每个目标锁都指向存活飞船
+                Assert.That(damageSnapshot.TargetLocks,
+                    Has.All.Matches<TargetLockSnapshot>(targetLock =>
+                        liveKeys.Contains(targetLock.OwnerEntityKey) &&
+                        liveKeys.Contains(targetLock.TargetEntityKey)),
+                    "所有目标锁必须指向存活飞船（死者锁已清理）");
+
+                // 存活飞船数量减少
+                Assert.That(damageSnapshot.Ships.Count, Is.LessThan(definition.ShipCount));
+            });
+
+            // 受伤存活者应切换到 Escaping
+            ShipSnapshot[] escapingShips = damageSnapshot.Ships
+                .Where(static ship => ship.Mode == BehaviorMode.Escaping)
+                .ToArray();
+            if (escapingShips.Length > 0)
+            {
+                Assert.That(escapingShips, Has.All.Matches<ShipSnapshot>(ship =>
+                    ship.ModeTicksRemaining <= BehaviorRules.EscapingDurationTicks &&
+                    ship.TrackingTargetIsNull &&
+                    !ship.WeaponEnabled &&
+                    ship.AfterburnerEnabled));
+            }
+
+            // 未受伤的击杀参与者应切换到 Disengaging
+            HashSet<long> escapingKeys = escapingShips
+                .Select(static ship => ship.EntityKey)
+                .ToHashSet();
+            ShipSnapshot[] disengagingParticipants = damageSnapshot.KillParticipations
+                .Select(static participation => participation.AttackerEntityKey)
+                .Distinct()
+                .Where(attackerKey => !escapingKeys.Contains(attackerKey) && liveKeys.Contains(attackerKey))
+                .Select(attackerKey => damageSnapshot.Ships.Single(ship => ship.EntityKey == attackerKey))
+                .ToArray();
+            Assert.That(disengagingParticipants, Has.All.Matches<ShipSnapshot>(ship =>
+                ship.Mode == BehaviorMode.Disengaging &&
+                ship.ModeTicksRemaining == BehaviorRules.DisengagingDurationTicks &&
+                ship.Motion.Speed == BehaviorRules.DisengagingSpeed &&
+                !ship.WeaponEnabled &&
+                !ship.AfterburnerEnabled));
+        }
+
+        // 阶段 7：终态确认（4_000 tick 上限 = 160s 理论值，但 combat 应提前结束）
+        Assert.That(simulation.WaitForTerminal(TimeSpan.FromSeconds(180)), Is.True);
+
+        InitialWorldSnapshot terminalSnapshot = simulation.GetSnapshot();
+        Assert.Multiple(() =>
+        {
+            Assert.That(terminalSnapshot.Run.Status,
+                Is.AnyOf(SimulationRunStatus.Completed, SimulationRunStatus.TimedOut));
+            Assert.That(terminalSnapshot.Run.Outcome,
+                Is.AnyOf(SimulationRunOutcome.Winner, SimulationRunOutcome.Draw, SimulationRunOutcome.TimedOut));
+
+            if (terminalSnapshot.Run.Status == SimulationRunStatus.Completed)
+            {
+                if (terminalSnapshot.Run.Outcome == SimulationRunOutcome.Winner)
+                {
+                    Assert.That(terminalSnapshot.Run.AliveShipCount, Is.EqualTo(1));
+                    Assert.That(terminalSnapshot.Run.WinnerEntityKey, Is.Not.Null);
+                    Assert.That(terminalSnapshot.Ships, Has.Count.EqualTo(1));
+                }
+                else
+                {
+                    Assert.That(terminalSnapshot.Run.AliveShipCount, Is.Zero);
+                    Assert.That(terminalSnapshot.Run.WinnerEntityKey, Is.Null);
+                    Assert.That(terminalSnapshot.Ships, Is.Empty);
+                }
+            }
+
+            // 终态没有活跃锁
+            Assert.That(terminalSnapshot.TargetLocks, Is.Empty);
+        });
+    }
+
     private static void SetShipPosition(
         SimulationDefinition definition,
         string databaseLocation,

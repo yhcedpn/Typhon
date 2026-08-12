@@ -251,6 +251,252 @@ public sealed class PauseRecoveryTests
         AssertLockIndexesMatch(resumed.GetSnapshot(), resumed.GetRuntimeDiagnostics());
     }
 
+    [Test]
+    // AC1: 恢复后的 membership、稳定 roster、owner/target 锁索引和派生统计与权威 Ship/Target Lock 快照一致。
+    public void AfterResume_DiagnosticsMatchAuthoritativeSnapshot()
+    {
+        var definition = new SimulationDefinition(
+            runName: "ac1-diagnostics-match",
+            shipCount: 8,
+            seed: SimulationDefinition.DefaultSeed,
+            rulesetVersion: 1,
+            worldSize: 200f,
+            maximumHealth: 1_000,
+            stagingTicks: 0,
+            spatialCellSize: 100f,
+            spatialMargin: 20f);
+        var databaseLocation = Path.Combine(_temporaryDirectory, "ac1-diagnostics-match.typhon");
+
+        // 第一阶段：运行并暂停
+        using (var first = SpaceBattleHost.Start(
+                   definition,
+                   databaseLocation,
+                   CancellationToken.None,
+                   new RecordingObservationSink()))
+        {
+            // 运行到 ships 开始交互的阶段
+            first.WaitForSnapshot(203, TimeSpan.FromSeconds(20));
+            first.RequestPause();
+            Assert.That(first.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
+        }
+
+        // 第二阶段：恢复
+        using var resumed = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+
+        Assert.That(resumed.StartupResult.StartupAction, Is.EqualTo(SimulationStartupAction.Resumed));
+
+        // 恢复后立即获取诊断和快照（零个 tick 前进）
+        InitialWorldSnapshot resumeSnapshot = resumed.GetSnapshot();
+        SpaceBattleRuntimeDiagnosticsSnapshot resumeDiagnostics = resumed.GetRuntimeDiagnostics();
+
+        long[] expectedRosterKeys = resumeSnapshot.Ships
+            .Select(static ship => ship.EntityKey)
+            .Order()
+            .ToArray();
+        long[] expectedWorksetKeys = expectedRosterKeys;
+
+        // 恢复后的 owner/target 锁索引必须与权威 snapshot 一致
+        IReadOnlyDictionary<long, int> authoritativeOwnerCounts = resumeSnapshot.TargetLocks
+            .GroupBy(static targetLock => targetLock.OwnerEntityKey)
+            .ToDictionary(static group => group.Key, static group => group.Count());
+        IReadOnlyDictionary<long, int> authoritativeTargetCounts = resumeSnapshot.TargetLocks
+            .GroupBy(static targetLock => targetLock.TargetEntityKey)
+            .ToDictionary(static group => group.Key, static group => group.Count());
+
+        Assert.Multiple(() =>
+        {
+            // membership 一致性
+            Assert.That(resumeDiagnostics.ViewMembershipCount, Is.EqualTo(resumeSnapshot.Ships.Count),
+                "ViewMembershipCount 必须与权威飞船快照一致");
+            Assert.That(resumeDiagnostics.CombatViewMembershipCount, Is.EqualTo(resumeSnapshot.Ships.Count),
+                "CombatViewMembershipCount 必须与权威飞船快照一致");
+
+            // 稳定 roster 和 workset
+            Assert.That(resumeDiagnostics.ShipRosterCount, Is.EqualTo(resumeSnapshot.Ships.Count),
+                "ShipRosterCount 必须与权威飞船快照一致");
+            Assert.That(resumeDiagnostics.TickWorksetCount, Is.EqualTo(resumeSnapshot.Ships.Count),
+                "TickWorksetCount 必须与权威飞船快照一致");
+            Assert.That(resumeDiagnostics.ShipRosterEntityKeys, Is.EqualTo(expectedRosterKeys),
+                "ShipRosterEntityKeys 必须与权威飞船 entity key 列表一致");
+            Assert.That(resumeDiagnostics.TickWorksetEntityKeys, Is.EqualTo(expectedWorksetKeys),
+                "TickWorksetEntityKeys 必须与权威飞船 entity key 列表一致");
+
+            // owner/target 锁索引
+            Assert.That(resumeDiagnostics.OwnerLockIndex, Is.EqualTo(authoritativeOwnerCounts),
+                "OwnerLockIndex 必须与权威目标锁 owner 分布一致");
+            Assert.That(resumeDiagnostics.TargetLockIndex, Is.EqualTo(authoritativeTargetCounts),
+                "TargetLockIndex 必须与权威目标锁 target 分布一致");
+
+            // 派生统计
+            Assert.That(resumeDiagnostics.DerivedAliveShipCount, Is.EqualTo((int)resumeSnapshot.Run.AliveShipCount),
+                "DerivedAliveShipCount 必须与权威存活飞船数一致");
+            Assert.That(resumeDiagnostics.DerivedActiveLockCount, Is.EqualTo(resumeSnapshot.TargetLocks.Count),
+                "DerivedActiveLockCount 必须与权威目标锁总数一致");
+        });
+    }
+
+    [Test]
+    // AC2: 恢复后首个 refresh 没有历史重复 delta，首个 simulation tick 的消费者处理集合与权威 membership 一致。
+    public void AfterResume_FirstRefreshHasNoHistoricalDelta_AndFirstTickConsumerMatchesMembership()
+    {
+        var definition = new SimulationDefinition(
+            runName: "ac2-first-refresh",
+            shipCount: 6,
+            seed: SimulationDefinition.DefaultSeed,
+            rulesetVersion: 1,
+            worldSize: 200f,
+            maximumHealth: 1_000,
+            stagingTicks: 0,
+            spatialCellSize: 100f,
+            spatialMargin: 20f);
+        var databaseLocation = Path.Combine(_temporaryDirectory, "ac2-first-refresh.typhon");
+
+        // 第一阶段：运行并暂停（产生一些目标锁活动）
+        using (var first = SpaceBattleHost.Start(
+                   definition,
+                   databaseLocation,
+                   CancellationToken.None,
+                   new RecordingObservationSink()))
+        {
+            first.WaitForSnapshot(203, TimeSpan.FromSeconds(20));
+            first.RequestPause();
+            Assert.That(first.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
+        }
+
+        // 第二阶段：恢复
+        using var resumed = SpaceBattleHost.Start(
+            definition,
+            databaseLocation,
+            CancellationToken.None,
+            new RecordingObservationSink());
+        Assert.That(resumed.StartupResult.StartupAction, Is.EqualTo(SimulationStartupAction.Resumed));
+
+        // 恢复后立即检查：RefreshCount = 0（刚重建），AddedCount = 0（历史 delta 已清除）
+        var diagnosticsAfterResume = resumed.GetRuntimeDiagnostics();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(diagnosticsAfterResume.RuntimeShipViewAddedCount, Is.Zero,
+                "恢复后首个 refresh 前 RuntimeShipViewAddedCount 必须是零（无历史重复 delta）");
+            Assert.That(diagnosticsAfterResume.CombatShipViewAddedCount, Is.Zero,
+                "恢复后首个 refresh 前 CombatShipViewAddedCount 必须是零");
+            Assert.That(diagnosticsAfterResume.RuntimeShipViewRefreshCount, Is.Zero,
+                "恢复后重建的 view 的 refresh 计数必须从零开始");
+            Assert.That(diagnosticsAfterResume.CombatShipViewRefreshCount, Is.Zero,
+                "恢复后重建的 combat view 的 refresh 计数必须从零开始");
+        });
+
+        // 运行第一个 tick 让 ShipViewRefreshSystem 执行 Refresh
+        ulong firstTick = checked(diagnosticsAfterResume.CompletedTicks + 1);
+        Assert.That(resumed.WaitForCompletedTicks(firstTick, TimeSpan.FromSeconds(10)), Is.True);
+
+        var diagnosticsAfterFirstTick = resumed.GetRuntimeDiagnostics();
+        var snapshotAfterFirstTick = resumed.GetSnapshot();
+        int authoritativeShipCount = snapshotAfterFirstTick.Ships.Count;
+
+        Assert.Multiple(() =>
+        {
+            // 第一个 refresh 没有 added（无新实体，历史 delta 不重复）
+            Assert.That(diagnosticsAfterFirstTick.RuntimeShipViewAddedCount, Is.Zero,
+                "首个 refresh 后 RuntimeShipViewAddedCount 仍为零（无新实体 spawn）");
+            Assert.That(diagnosticsAfterFirstTick.CombatShipViewAddedCount, Is.Zero,
+                "首个 refresh 后 CombatShipViewAddedCount 仍为零");
+            Assert.That(diagnosticsAfterFirstTick.RuntimeShipViewRefreshCount, Is.EqualTo(1),
+                "首个 refresh 后 RuntimeShipViewRefreshCount 应为 1");
+
+            // 消费者处理集合与权威 membership 一致
+            Assert.That(diagnosticsAfterFirstTick.ConsumerProcessingCounts["State"],
+                Is.EqualTo(authoritativeShipCount),
+                "State 消费者处理数量必须等于权威飞船数量");
+            Assert.That(diagnosticsAfterFirstTick.ConsumerProcessingCounts["Combat"],
+                Is.EqualTo(authoritativeShipCount),
+                "Combat 消费者处理数量必须等于权威飞船数量");
+        });
+    }
+
+    [Test]
+    // AC6: 重复启动、暂停、恢复与关闭不会泄漏 view 注册、delta buffer 或其他 runtime workset 资源。
+    public void RepeatedPauseResumeCycles_DoNotLeakViewsOrDeltaBuffers()
+    {
+        var definition = new SimulationDefinition(
+            runName: "ac6-no-leak",
+            shipCount: 4,
+            seed: SimulationDefinition.DefaultSeed,
+            rulesetVersion: 1,
+            worldSize: 200f,
+            maximumHealth: 1_000,
+            stagingTicks: 0,
+            spatialCellSize: 100f,
+            spatialMargin: 20f,
+            maximumCompletedTicks: 200);
+        var databaseLocation = Path.Combine(_temporaryDirectory, "ac6-no-leak.typhon");
+
+        const int cycleCount = 4;
+
+        for (var cycle = 0; cycle < cycleCount; cycle++)
+        {
+            using var simulation = SpaceBattleHost.Start(
+                definition,
+                databaseLocation,
+                CancellationToken.None,
+                new RecordingObservationSink());
+
+            if (simulation.StartupResult.StartupAction == SimulationStartupAction.Initialized)
+            {
+                // 首次初始化后运行几个 tick 然后暂停
+                Assert.That(simulation.WaitForCompletedTicks(3, TimeSpan.FromSeconds(5)), Is.True);
+            }
+            else
+            {
+                // 恢复后运行几个 tick 然后暂停
+                Assert.That(simulation.WaitForCompletedTicks(3, TimeSpan.FromSeconds(5)), Is.True);
+            }
+
+            simulation.RequestPause();
+            Assert.That(simulation.WaitForPause(TimeSpan.FromSeconds(5)), Is.True);
+
+            var diagnostics = simulation.GetRuntimeDiagnostics();
+            var snapshot = simulation.GetSnapshot();
+
+            Assert.Multiple(() =>
+            {
+                // view 注册数量必须与当前权威船只数一致（无累积泄漏）
+                Assert.That(diagnostics.ViewMembershipCount, Is.EqualTo(snapshot.Ships.Count),
+                    $"循环 {cycle}：ViewMembershipCount 泄漏");
+
+                // roster 和 workset 大小必须匹配
+                Assert.That(diagnostics.ShipRosterCount, Is.EqualTo(snapshot.Ships.Count),
+                    $"循环 {cycle}：ShipRosterCount 泄漏");
+                Assert.That(diagnostics.TickWorksetCount, Is.EqualTo(snapshot.Ships.Count),
+                    $"循环 {cycle}：TickWorksetCount 泄漏");
+
+                // delta buffer 不累积：如果没有任何 spawn/destroy 操作，AddedCount 从头开始
+                // 首次初始化后可能有瞬时 add（但在 pause 时已清除），恢复后从零开始
+                if (cycle > 0)
+                {
+                    Assert.That(diagnostics.RuntimeShipViewAddedCount, Is.Zero,
+                        $"循环 {cycle}：RuntimeShipViewAddedCount 在循环间不应累积");
+                }
+            });
+
+            // simulation 退出时 Dispose 应正确清理
+        }
+
+        // 终态验证：数据库中的运行仍然正确
+        var finalSnapshot = SpaceBattleHost.ReadSnapshot(definition, databaseLocation);
+        Assert.Multiple(() =>
+        {
+            Assert.That(finalSnapshot.RunCount, Is.EqualTo(1),
+                "多次暂停恢复后不应产生第二个 SimulationRun");
+            Assert.That(finalSnapshot.Run.Status, Is.EqualTo(SimulationRunStatus.Running),
+                "模拟应在暂停状态下结束");
+        });
+    }
+
     private static void AssertLockIndexesMatch(
         InitialWorldSnapshot snapshot,
         SpaceBattleRuntimeDiagnosticsSnapshot diagnostics)

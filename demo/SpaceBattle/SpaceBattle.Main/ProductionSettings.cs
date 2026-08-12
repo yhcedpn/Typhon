@@ -7,9 +7,11 @@ public static class SpaceBattleProductionSettings
     public const int AutomaticWorkerCount = -1;
     public const int DisabledQueueGrowthEscalationTicks = 0;
 
-    public static int EffectiveWorkerCount => AutomaticWorkerCount == -1
+    public static int? TestWorkerCountOverride { get; set; }
+
+    public static int EffectiveWorkerCount => TestWorkerCountOverride ?? (AutomaticWorkerCount == -1
         ? Math.Max(1, Environment.ProcessorCount - 4)
-        : AutomaticWorkerCount;
+        : AutomaticWorkerCount);
 
     public static int MaximumSupportedShipCount => BehaviorRules.DamageIntentQueueCapacity;
 
