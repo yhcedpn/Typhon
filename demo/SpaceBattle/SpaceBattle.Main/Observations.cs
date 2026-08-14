@@ -18,6 +18,18 @@ public sealed record InitializationCompleted(
     public TimeSpan Duration => BootstrapDuration;
 }
 
+public sealed record SimulationTickCompleted(
+    long TickNumber,
+    int ShipCount,
+    TimeSpan Duration,
+    SpaceBattleSnapshot PublishedSnapshot) : SpaceBattleObservation;
+
+public sealed record SimulationCompleted(
+    long CompletedTicks,
+    int RemainingShips,
+    TickPerformanceSnapshot TickPerformance,
+    SpaceBattleSnapshot PublishedSnapshot) : SpaceBattleObservation;
+
 public sealed record TickPerformanceSnapshot(
     int SampleCount,
     double P50Milliseconds,
@@ -29,7 +41,14 @@ public sealed record SpaceBattleRunResult(
     string DatabaseDirectory,
     int ShipCount,
     TimeSpan BootstrapDuration,
-    TickPerformanceSnapshot TickPerformance);
+    TickPerformanceSnapshot TickPerformance)
+{
+    public long CompletedTicks { get; init; }
+
+    public int RemainingShips { get; init; }
+
+    public SpaceBattleSnapshot PublishedSnapshot { get; init; }
+}
 
 public readonly record struct ShipSnapshot(
     long EntityKey,

@@ -34,7 +34,7 @@ public sealed class BootstrapTests
     [Test]
     public void DefaultBootstrap_PersistsExactlyFiftyThousandShips()
     {
-        SpaceBattleHost.Run(SimulationDefinition.Default, _root, CancellationToken.None, new RecordingSink());
+        SpaceBattleHost.BootstrapOnly(SimulationDefinition.Default, _root, CancellationToken.None, new RecordingSink());
 
         Assert.That(SpaceBattleHost.ReadShipCount(SimulationDefinition.Default, _root), Is.EqualTo(50_000));
     }
@@ -66,7 +66,7 @@ public sealed class BootstrapTests
     public void Bootstrap_CreatesTheConfiguredShipsInTheExpectedInitialState()
     {
         var definition = CreateDefinition(shipCount: 32);
-        var result = SpaceBattleHost.Run(definition, _root, CancellationToken.None, new RecordingSink());
+        var result = SpaceBattleHost.BootstrapOnly(definition, _root, CancellationToken.None, new RecordingSink());
         var snapshot = SpaceBattleHost.ReadSnapshot(definition, _root);
 
         Assert.Multiple(() =>
@@ -107,8 +107,8 @@ public sealed class BootstrapTests
         var firstRoot = Path.Combine(_root, "first");
         var secondRoot = Path.Combine(_root, "second");
 
-        SpaceBattleHost.Run(definition, firstRoot, CancellationToken.None, new RecordingSink());
-        SpaceBattleHost.Run(definition, secondRoot, CancellationToken.None, new RecordingSink());
+        SpaceBattleHost.BootstrapOnly(definition, firstRoot, CancellationToken.None, new RecordingSink());
+        SpaceBattleHost.BootstrapOnly(definition, secondRoot, CancellationToken.None, new RecordingSink());
 
         var first = SpaceBattleHost.ReadSnapshot(definition, firstRoot);
         var second = SpaceBattleHost.ReadSnapshot(definition, secondRoot);
@@ -125,12 +125,12 @@ public sealed class BootstrapTests
         var adjacentFile = Path.Combine(adjacentDirectory, "keep.txt");
         File.WriteAllText(adjacentFile, "keep");
 
-        var first = SpaceBattleHost.Run(definition, _root, CancellationToken.None, new RecordingSink());
+        var first = SpaceBattleHost.BootstrapOnly(definition, _root, CancellationToken.None, new RecordingSink());
         var marker = Path.Combine(first.DatabaseDirectory, "must-be-replaced");
         File.WriteAllText(marker, "old");
 
         var secondDefinition = definition with { Seed = 2 };
-        var second = SpaceBattleHost.Run(secondDefinition, _root, CancellationToken.None, new RecordingSink());
+        var second = SpaceBattleHost.BootstrapOnly(secondDefinition, _root, CancellationToken.None, new RecordingSink());
 
         Assert.Multiple(() =>
         {

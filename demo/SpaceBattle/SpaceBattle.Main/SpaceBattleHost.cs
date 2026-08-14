@@ -7,37 +7,21 @@ namespace SpaceBattle;
 internal static class SpaceBattleHost
 {
     private const int ProgressBatchSize = 2_048;
+    private const int MaximumWorkerCount = 8;
 
     public static SpaceBattleRunResult Run(
         SimulationDefinition definition,
         string databaseRoot,
         CancellationToken cancellationToken,
         ISpaceBattleObservationSink observationSink)
-    {
-        ArgumentNullException.ThrowIfNull(definition);
-        ArgumentException.ThrowIfNullOrWhiteSpace(databaseRoot);
-        ArgumentNullException.ThrowIfNull(observationSink);
-        definition.Validate();
-        cancellationToken.ThrowIfCancellationRequested();
+        => RunCore(definition, databaseRoot, cancellationToken, observationSink, runSimulation: true);
 
-        SpaceBattlePaths.ReplaceDatabaseDirectory(databaseRoot);
-        var databaseDirectory = SpaceBattlePaths.DatabaseDirectory(databaseRoot);
-        using var engine = SpaceBattleDatabase.Open(definition, databaseDirectory);
-        var timing = new TickTiming();
-        var bootstrapStartedAt = Stopwatch.GetTimestamp();
-
-        Bootstrap(engine, definition, cancellationToken, observationSink);
-
-        var bootstrapDuration = Stopwatch.GetElapsedTime(bootstrapStartedAt);
-        timing.RecordBootstrap(bootstrapDuration);
-        var result = new SpaceBattleRunResult(
-            databaseDirectory,
-            definition.ShipCount,
-            bootstrapDuration,
-            timing.Snapshot());
-        observationSink.Publish(new InitializationCompleted(definition.ShipCount, bootstrapDuration));
-        return result;
-    }
+    public static SpaceBattleRunResult BootstrapOnly(
+        SimulationDefinition definition,
+        string databaseRoot,
+        CancellationToken cancellationToken,
+        ISpaceBattleObservationSink observationSink)
+        => RunCore(definition, databaseRoot, cancellationToken, observationSink, runSimulation: false);
 
     public static SpaceBattleSnapshot ReadSnapshot(
         SimulationDefinition definition,
@@ -69,6 +53,33 @@ internal static class SpaceBattleHost
         return new SpaceBattleSnapshot(ships);
     }
 
+    public static IReadOnlyList<long> QueryShipKeysInAabb(
+        SimulationDefinition definition,
+        string databaseRoot,
+        AABB3F bounds)
+    {
+        ArgumentNullException.ThrowIfNull(definition);
+        ArgumentException.ThrowIfNullOrWhiteSpace(databaseRoot);
+        definition.Validate();
+
+        var databaseDirectory = SpaceBattlePaths.DatabaseDirectory(databaseRoot);
+        using var engine = SpaceBattleDatabase.Open(definition, databaseDirectory);
+        using var transaction = engine.CreateReadOnlyTransaction();
+        var ids = transaction.QueryExact<Ship>()
+            .WhereInAABB<Hull>(
+                bounds.MinX,
+                bounds.MinY,
+                bounds.MinZ,
+                bounds.MaxX,
+                bounds.MaxY,
+                bounds.MaxZ)
+            .Execute()
+            .Select(static id => id.EntityKey)
+            .ToArray();
+        Array.Sort(ids);
+        return ids;
+    }
+
     public static int ReadShipCount(
         SimulationDefinition definition,
         string databaseRoot)
@@ -79,6 +90,157 @@ internal static class SpaceBattleHost
 
         var databaseDirectory = SpaceBattlePaths.DatabaseDirectory(databaseRoot);
         using var engine = SpaceBattleDatabase.Open(definition, databaseDirectory);
+        using var transaction = engine.CreateReadOnlyTransaction();
+        return transaction.QueryExact<Ship>().Count();
+    }
+
+    public static void ForceCheckpoint(
+        SimulationDefinition definition,
+        string databaseRoot)
+    {
+        ArgumentNullException.ThrowIfNull(definition);
+        ArgumentException.ThrowIfNullOrWhiteSpace(databaseRoot);
+        definition.Validate();
+
+        var databaseDirectory = SpaceBattlePaths.DatabaseDirectory(databaseRoot);
+        using var engine = SpaceBattleDatabase.Open(definition, databaseDirectory);
+        engine.ForceCheckpoint();
+    }
+
+    private static SpaceBattleRunResult RunCore(
+        SimulationDefinition definition,
+        string databaseRoot,
+        CancellationToken cancellationToken,
+        ISpaceBattleObservationSink observationSink,
+        bool runSimulation)
+    {
+        ArgumentNullException.ThrowIfNull(definition);
+        ArgumentException.ThrowIfNullOrWhiteSpace(databaseRoot);
+        ArgumentNullException.ThrowIfNull(observationSink);
+        definition.Validate();
+        cancellationToken.ThrowIfCancellationRequested();
+
+        SpaceBattlePaths.ReplaceDatabaseDirectory(databaseRoot);
+        var databaseDirectory = SpaceBattlePaths.DatabaseDirectory(databaseRoot);
+        using var engine = SpaceBattleDatabase.Open(definition, databaseDirectory);
+        var timing = new TickTiming();
+        var bootstrapStartedAt = Stopwatch.GetTimestamp();
+
+        Bootstrap(engine, definition, cancellationToken, observationSink);
+
+        var bootstrapDuration = Stopwatch.GetElapsedTime(bootstrapStartedAt);
+        timing.RecordBootstrap(bootstrapDuration);
+        observationSink.Publish(new InitializationCompleted(definition.ShipCount, bootstrapDuration));
+
+        if (!runSimulation)
+        {
+            return new SpaceBattleRunResult(
+                databaseDirectory,
+                definition.ShipCount,
+                bootstrapDuration,
+                timing.Snapshot())
+            {
+                RemainingShips = definition.ShipCount,
+            };
+        }
+
+        var workerCount = ResolveWorkerCount();
+        using var state = new SpaceBattleSimulationState(engine, definition, observationSink, workerCount);
+        var runtimeOptions = new RuntimeOptions
+        {
+            BaseTickRate = SimulationDefinition.FixedTickRate,
+            WorkerCount = workerCount,
+            EnableParallelFence = true,
+            AdaptiveFenceCost = false,
+            SystemExceptionPolicy = SystemExceptionPolicy.AbortTickAndStop,
+            Overload = new OverloadOptions
+            {
+                MinTickRateHz = SimulationDefinition.FixedTickRate,
+            },
+        };
+
+        using (var runtime = TyphonRuntime.Create(
+                   engine,
+                   schedule => BuildSchedule(schedule, state, timing),
+                   runtimeOptions))
+        {
+            runtime.Start();
+            using var runtimeAborted = new CancellationTokenSource();
+            runtime.OnTickAborted += (_, outcome) =>
+            {
+                runtimeAborted.Cancel();
+            };
+            using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, runtimeAborted.Token);
+            try
+            {
+                WaitForCompletion(state, definition.MaximumCompletedTicks, linkedCancellation.Token);
+            }
+            finally
+            {
+                runtime.Shutdown();
+            }
+        }
+
+        var publishedSnapshot = state.BuildPublishedSnapshot();
+        var tickPerformance = timing.Snapshot();
+        var remainingShips = ReadShipCountFromOpenEngine(engine);
+        var result = new SpaceBattleRunResult(
+            databaseDirectory,
+            definition.ShipCount,
+            bootstrapDuration,
+            tickPerformance)
+        {
+            CompletedTicks = state.CompletedTicks,
+            RemainingShips = remainingShips,
+            PublishedSnapshot = publishedSnapshot,
+        };
+        observationSink.Publish(new SimulationCompleted(
+            result.CompletedTicks,
+            remainingShips,
+            tickPerformance,
+            publishedSnapshot));
+        return result;
+    }
+
+    private static void BuildSchedule(
+        RuntimeSchedule schedule,
+        SpaceBattleSimulationState state,
+        TickTiming timing)
+    {
+        var dag = schedule.PublicTrack.DeclareDag("SpaceBattle")
+            .Phases(
+                SpaceBattlePhases.Publish,
+                SpaceBattlePhases.Behavior,
+                SpaceBattlePhases.Damage,
+                SpaceBattlePhases.Movement,
+                SpaceBattlePhases.Reap,
+                SpaceBattlePhases.Observe);
+        dag.Add(new FramePrepareSystem(state));
+        dag.Add(new PublishSystem(state));
+        dag.Add(new BehaviorSystem(state));
+        dag.Add(new DamageSystem(state));
+        dag.Add(new MovementSystem(state));
+        dag.Add(new ReapSystem(state));
+        dag.Add(new ObserveSystem(state, timing));
+    }
+
+    private static void WaitForCompletion(
+        SpaceBattleSimulationState state,
+        ulong maximumTicks,
+        CancellationToken cancellationToken)
+    {
+        while ((ulong)state.CompletedTicks < maximumTicks)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Thread.Sleep(1);
+        }
+    }
+
+    private static int ResolveWorkerCount() =>
+        Math.Max(1, Math.Min(MaximumWorkerCount, Environment.ProcessorCount - 4));
+
+    private static int ReadShipCountFromOpenEngine(DatabaseEngine engine)
+    {
         using var transaction = engine.CreateReadOnlyTransaction();
         return transaction.QueryExact<Ship>().Count();
     }
