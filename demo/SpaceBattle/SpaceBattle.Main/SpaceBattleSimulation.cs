@@ -28,11 +28,14 @@ internal sealed class SpaceBattleSimulationState : IDisposable
     private long _preparedTick = -1;
     private int _generation;
     private int _publishedShipCount;
+    private int _publishedAliveShipCount;
     private long _tickStartedAt;
+    private long _lastCompletedTickStartedAt;
     private bool _disposed;
     private readonly AcquisitionTransactionSlot[] _acquisitionTransactions;
     private long _acquisitionTransactionsCreated;
     private long _acquisitionTransactionsDisposed;
+    private int _lastCompletedRemainingShips;
     private long _completedTicks;
     public SpaceBattleSimulationState(
         DatabaseEngine engine,
@@ -99,11 +102,15 @@ internal sealed class SpaceBattleSimulationState : IDisposable
 
     public long CompletedTicks => Interlocked.Read(ref _completedTicks);
     public long TickStartedAt => Volatile.Read(ref _tickStartedAt);
+    public bool IsTickInFlight => Volatile.Read(ref _tickStartedAt) != Volatile.Read(ref _lastCompletedTickStartedAt);
 
 
     public int CurrentGeneration => Volatile.Read(ref _generation);
 
     public int PublishedShipCount => Volatile.Read(ref _publishedShipCount);
+    public int PublishedAliveShipCount => Volatile.Read(ref _publishedAliveShipCount);
+
+    public int LastCompletedRemainingShips => Volatile.Read(ref _lastCompletedRemainingShips);
     public long AcquisitionTransactionsCreated => Interlocked.Read(ref _acquisitionTransactionsCreated);
     public long AcquisitionTransactionsDisposed => Interlocked.Read(ref _acquisitionTransactionsDisposed);
 
@@ -207,6 +214,36 @@ internal sealed class SpaceBattleSimulationState : IDisposable
             ReleaseAcquisitionTransaction(workerId);
         }
     }
+    public int ReleaseAllAcquisitionTransactions()
+    {
+        var released = 0;
+        foreach (var slot in _acquisitionTransactions)
+        {
+            var transaction = Interlocked.Exchange(ref slot.Transaction, null);
+            if (transaction is null)
+            {
+                continue;
+            }
+
+            slot.OwnerThreadId = 0;
+            slot.CreatedTick = -1;
+            slot.LastUsedTick = -1;
+            try
+            {
+                transaction.Dispose();
+            }
+            catch (Exception)
+            {
+                // runtime 已停止，单个事务清理失败不能阻止其他 worker-owned 事务释放。
+            }
+
+            Interlocked.Increment(ref _acquisitionTransactionsDisposed);
+            released++;
+        }
+
+        return released;
+    }
+
 
     private sealed class AcquisitionTransactionSlot
     {
@@ -256,6 +293,7 @@ internal sealed class SpaceBattleSimulationState : IDisposable
             _preparedTick = tickNumber;
             _generation++;
             _publishedShipCount = 0;
+            _publishedAliveShipCount = 0;
             ClearIncomingDamage();
             Array.Clear(_reapCounts);
             _tickStartedAt = Stopwatch.GetTimestamp();
@@ -287,12 +325,29 @@ internal sealed class SpaceBattleSimulationState : IDisposable
         {
             throw new InvalidOperationException($"SpaceBattle EntityKey {key} 超出快照容量。");
         }
-
         var index = (int)key;
+
+        var wasPublished = Volatile.Read(ref _frameGenerations[index]) == CurrentGeneration;
+        var previousHealth = _frames[index].Vitals.CurrentHealth;
         _entityIds[index] = entityId;
         _frames[index] = frame;
         Volatile.Write(ref _frameGenerations[index], CurrentGeneration);
-        Interlocked.Increment(ref _publishedShipCount);
+        if (!wasPublished)
+        {
+            Interlocked.Increment(ref _publishedShipCount);
+            if (frame.Vitals.CurrentHealth > 0)
+            {
+                Interlocked.Increment(ref _publishedAliveShipCount);
+            }
+        }
+        else if (previousHealth > 0 && frame.Vitals.CurrentHealth == 0)
+        {
+            Interlocked.Decrement(ref _publishedAliveShipCount);
+        }
+        else if (previousHealth == 0 && frame.Vitals.CurrentHealth > 0)
+        {
+            Interlocked.Increment(ref _publishedAliveShipCount);
+        }
     }
     public bool TryGetFrameIndex(long entityKey, out int index)
     {
@@ -427,10 +482,19 @@ internal sealed class SpaceBattleSimulationState : IDisposable
             return;
         }
 
+        var previousHealth = _frames[index].Vitals.CurrentHealth;
         _frames[index] = _frames[index] with
         {
             Vitals = new Vitals { CurrentHealth = health },
         };
+        if (previousHealth > 0 && health == 0)
+        {
+            Interlocked.Decrement(ref _publishedAliveShipCount);
+        }
+        else if (previousHealth == 0 && health > 0)
+        {
+            Interlocked.Increment(ref _publishedAliveShipCount);
+        }
     }
 
     public void MarkForReap(int workerId, long entityKey)
@@ -527,12 +591,15 @@ internal sealed class SpaceBattleSimulationState : IDisposable
     public void CompleteTick(long tickNumber)
     {
         var duration = Stopwatch.GetElapsedTime(_tickStartedAt);
-        Interlocked.Increment(ref _completedTicks);
+        var remainingShips = PublishedAliveShipCount;
+        Volatile.Write(ref _lastCompletedRemainingShips, remainingShips);
         _observationSink.Publish(new SimulationTickCompleted(
             tickNumber,
             PublishedShipCount,
             duration,
             tickNumber + 1 == (long)_definition.MaximumCompletedTicks ? BuildPublishedSnapshot() : null));
+        Volatile.Write(ref _lastCompletedTickStartedAt, _tickStartedAt);
+        Interlocked.Increment(ref _completedTicks);
     }
 
     public TickPerformanceSnapshot GetTimingSnapshot(TickTiming timing) => timing.Snapshot();
@@ -545,10 +612,7 @@ internal sealed class SpaceBattleSimulationState : IDisposable
         }
 
         _disposed = true;
-        for (var workerId = 0; workerId < _acquisitionTransactions.Length; workerId++)
-        {
-            ReleaseAcquisitionTransactionIfOwnedByCurrentThread(workerId);
-        }
+        ReleaseAllAcquisitionTransactions();
 
         Accessor.Dispose();
     }

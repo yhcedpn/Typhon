@@ -1,8 +1,20 @@
+using Typhon.Engine;
+
 namespace SpaceBattle;
 
 public interface ISpaceBattleObservationSink
 {
     void Publish(SpaceBattleObservation observation);
+}
+
+public enum SpaceBattleTerminationReason : byte
+{
+    Draw = 0,
+    Winner = 1,
+    TickLimit = 2,
+    Cancelled = 3,
+    Fatal = 4,
+    BootstrapOnly = 5,
 }
 
 public abstract record SpaceBattleObservation;
@@ -28,7 +40,16 @@ public sealed record SimulationCompleted(
     long CompletedTicks,
     int RemainingShips,
     TickPerformanceSnapshot TickPerformance,
-    SpaceBattleSnapshot PublishedSnapshot) : SpaceBattleObservation;
+    SpaceBattleSnapshot PublishedSnapshot) : SpaceBattleObservation
+{
+    public SpaceBattleTerminationReason TerminationReason { get; init; }
+
+    public string FailedSystemName { get; init; }
+
+    public Exception FatalException { get; init; }
+
+    public TickOutcome? FatalOutcome { get; init; }
+}
 
 public sealed record TickPerformanceSnapshot(
     int SampleCount,
@@ -47,7 +68,23 @@ public sealed record SpaceBattleRunResult(
 
     public int RemainingShips { get; init; }
 
-    public SpaceBattleSnapshot PublishedSnapshot { get; init; }
+    public SpaceBattleSnapshot PublishedSnapshot { get; init; } = new([]);
+
+    public SpaceBattleTerminationReason TerminationReason { get; init; }
+
+    public string FailedSystemName { get; init; }
+
+    public Exception FatalException { get; init; }
+
+    public TickOutcome? FatalOutcome { get; init; }
+
+    public bool IsCancelled => TerminationReason == SpaceBattleTerminationReason.Cancelled;
+
+    public bool IsFatal => TerminationReason == SpaceBattleTerminationReason.Fatal;
+
+    public int ExitCode => IsFatal ? 1 : 0;
+
+    public string FatalExceptionText => FatalException?.ToString();
 }
 
 public readonly record struct ShipSnapshot(

@@ -118,28 +118,62 @@ internal static class SpaceBattleHost
         ArgumentException.ThrowIfNullOrWhiteSpace(databaseRoot);
         ArgumentNullException.ThrowIfNull(observationSink);
         definition.Validate();
-        cancellationToken.ThrowIfCancellationRequested();
+
+        var databaseDirectory = SpaceBattlePaths.DatabaseDirectory(databaseRoot);
+        if (cancellationToken.IsCancellationRequested)
+        {
+            var cancelled = CreateCancelledResult(databaseDirectory, definition);
+            if (runSimulation)
+            {
+                PublishSimulationCompleted(observationSink, cancelled);
+            }
+
+            return cancelled;
+        }
 
         SpaceBattlePaths.ReplaceDatabaseDirectory(databaseRoot);
-        var databaseDirectory = SpaceBattlePaths.DatabaseDirectory(databaseRoot);
         using var engine = SpaceBattleDatabase.Open(definition, databaseDirectory);
         var timing = new TickTiming();
         var bootstrapStartedAt = Stopwatch.GetTimestamp();
 
-        Bootstrap(engine, definition, cancellationToken, observationSink);
+        try
+        {
+            Bootstrap(engine, definition, cancellationToken, observationSink);
+        }
+        catch (OperationCanceledException)
+        {
+            var bootstrapDuration = Stopwatch.GetElapsedTime(bootstrapStartedAt);
+            timing.RecordBootstrap(bootstrapDuration);
+            var cancelled = new SpaceBattleRunResult(
+                databaseDirectory,
+                definition.ShipCount,
+                bootstrapDuration,
+                timing.Snapshot())
+            {
+                TerminationReason = SpaceBattleTerminationReason.Cancelled,
+                RemainingShips = ReadShipCountFromOpenEngine(engine),
+            };
+            if (runSimulation)
+            {
+                PublishSimulationCompleted(observationSink, cancelled);
+            }
 
-        var bootstrapDuration = Stopwatch.GetElapsedTime(bootstrapStartedAt);
-        timing.RecordBootstrap(bootstrapDuration);
-        observationSink.Publish(new InitializationCompleted(definition.ShipCount, bootstrapDuration));
+            return cancelled;
+        }
+
+        var bootstrapDurationCompleted = Stopwatch.GetElapsedTime(bootstrapStartedAt);
+        timing.RecordBootstrap(bootstrapDurationCompleted);
+        observationSink.Publish(new InitializationCompleted(definition.ShipCount, bootstrapDurationCompleted));
 
         if (!runSimulation)
         {
             return new SpaceBattleRunResult(
                 databaseDirectory,
                 definition.ShipCount,
-                bootstrapDuration,
+                bootstrapDurationCompleted,
                 timing.Snapshot())
             {
+                TerminationReason = SpaceBattleTerminationReason.BootstrapOnly,
                 RemainingShips = definition.ShipCount,
             };
         }
@@ -159,47 +193,127 @@ internal static class SpaceBattleHost
             },
         };
 
+        TickOutcome? fatalOutcome = null;
+        var fatalGate = new object();
+        var runtimeStopped = 0;
+        long cancellationRequestedAtCompletedTicks = -1;
+        long cancellationRequestedAtRuntimeTick = -1;
+        TickOutcome? ReadFatalOutcome()
+        {
+            lock (fatalGate)
+            {
+                return fatalOutcome;
+            }
+        }
         using (var runtime = TyphonRuntime.Create(
                    engine,
                    schedule => BuildSchedule(schedule, state, timing),
                    runtimeOptions))
         {
-            runtime.Start();
-            using var runtimeAborted = new CancellationTokenSource();
-            runtime.OnTickAborted += (_, outcome) =>
+            runtime.OnTickAborted += (abortedRuntime, outcome) =>
             {
-                runtimeAborted.Cancel();
+                if (Interlocked.Exchange(ref runtimeStopped, 1) == 0)
+                {
+                    try
+                    {
+                        abortedRuntime.FatalStop();
+                    }
+                    catch (Exception)
+                    {
+                        // fatal stop 本身失败时仍保留原始 system exception 供宿主返回。
+                    }
+                }
+
+                lock (fatalGate)
+                {
+                    fatalOutcome = outcome;
+                }
             };
-            using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, runtimeAborted.Token);
+            using var cancellationRegistration = cancellationToken.Register(() =>
+            {
+                Interlocked.CompareExchange(
+                    ref cancellationRequestedAtCompletedTicks,
+                    state.CompletedTicks,
+                    -1);
+                Interlocked.CompareExchange(
+                    ref cancellationRequestedAtRuntimeTick,
+                    runtime.CurrentTickNumber,
+                    -1);
+            });
+
+
+            runtime.Start();
+            SpaceBattleTerminationReason requestedTermination;
             try
             {
-                WaitForCompletion(state, definition.MaximumCompletedTicks, linkedCancellation.Token);
+                requestedTermination = WaitForCompletion(
+                    state,
+                    runtime,
+                    definition.MaximumCompletedTicks,
+                    cancellationToken,
+                    ReadFatalOutcome,
+                    () => Volatile.Read(ref cancellationRequestedAtCompletedTicks),
+                    () => Volatile.Read(ref cancellationRequestedAtRuntimeTick));
             }
             finally
             {
-                runtime.Shutdown();
-            }
-        }
+                var observedFatal = ReadFatalOutcome();
+                if (!observedFatal.HasValue)
+                {
+                    WaitForInFlightTick(
+                        state,
+                        runtime,
+                        state.CompletedTicks,
+                        runtime.CurrentTickNumber,
+                        ReadFatalOutcome);
+                    observedFatal = ReadFatalOutcome();
+                }
 
-        var publishedSnapshot = state.BuildPublishedSnapshot();
-        var tickPerformance = timing.Snapshot();
-        var remainingShips = ReadShipCountFromOpenEngine(engine);
-        var result = new SpaceBattleRunResult(
-            databaseDirectory,
-            definition.ShipCount,
-            bootstrapDuration,
-            tickPerformance)
-        {
-            CompletedTicks = state.CompletedTicks,
-            RemainingShips = remainingShips,
-            PublishedSnapshot = publishedSnapshot,
-        };
-        observationSink.Publish(new SimulationCompleted(
-            result.CompletedTicks,
-            remainingShips,
-            tickPerformance,
-            publishedSnapshot));
-        return result;
+                if (observedFatal.HasValue)
+                {
+                    if (Interlocked.Exchange(ref runtimeStopped, 1) == 0)
+                    {
+                        runtime.FatalStop();
+                    }
+                }
+                else if (Interlocked.Exchange(ref runtimeStopped, 1) == 0)
+                {
+                    runtime.Shutdown();
+                }
+            }
+
+            TickOutcome? finalFatalOutcome;
+            lock (fatalGate)
+            {
+                finalFatalOutcome = fatalOutcome;
+            }
+
+            var remainingShips = ReadShipCountFromOpenEngine(engine);
+            state.ReleaseAllAcquisitionTransactions();
+            var termination = ResolveTerminationReason(
+                requestedTermination,
+                state.CompletedTicks,
+                remainingShips,
+                definition.MaximumCompletedTicks,
+                definition.ShipCount,
+                finalFatalOutcome);
+            var result = new SpaceBattleRunResult(
+                databaseDirectory,
+                definition.ShipCount,
+                bootstrapDurationCompleted,
+                timing.Snapshot())
+            {
+                CompletedTicks = state.CompletedTicks,
+                RemainingShips = remainingShips,
+                PublishedSnapshot = state.BuildPublishedSnapshot(),
+                TerminationReason = termination,
+                FatalOutcome = finalFatalOutcome,
+                FailedSystemName = finalFatalOutcome?.FailedSystemName,
+                FatalException = finalFatalOutcome?.FailedSystemException,
+            };
+            PublishSimulationCompleted(observationSink, result);
+            return result;
+        }
     }
 
     private static void BuildSchedule(
@@ -226,17 +340,175 @@ internal static class SpaceBattleHost
         dag.Add(new ObserveSystem(state, timing));
     }
 
-    private static void WaitForCompletion(
+    private static SpaceBattleTerminationReason WaitForCompletion(
         SpaceBattleSimulationState state,
+        TyphonRuntime runtime,
         ulong maximumTicks,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<TickOutcome?> readFatalOutcome,
+        Func<long> readCancellationCompletedTicks,
+        Func<long> readCancellationRuntimeTick)
     {
-        while ((ulong)state.CompletedTicks < maximumTicks)
+        var observedCompletedTicks = state.CompletedTicks;
+        while (true)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            if (readFatalOutcome().HasValue)
+            {
+                return SpaceBattleTerminationReason.Fatal;
+            }
+
+            var completedTicks = state.CompletedTicks;
+            if (completedTicks != observedCompletedTicks)
+            {
+                observedCompletedTicks = completedTicks;
+                var boundaryTermination = ResolveBoundaryTermination(
+                    completedTicks,
+                    state.LastCompletedRemainingShips,
+                    state.ShipCount,
+                    maximumTicks);
+                if (boundaryTermination.HasValue)
+                {
+                    return boundaryTermination.Value;
+                }
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                var completedTicksAtRequest = readCancellationCompletedTicks();
+                var runtimeTickAtRequest = readCancellationRuntimeTick();
+                WaitForInFlightTick(
+                    state,
+                    runtime,
+                    completedTicksAtRequest >= 0 ? completedTicksAtRequest : completedTicks,
+                    runtimeTickAtRequest >= 0 ? runtimeTickAtRequest : runtime.CurrentTickNumber,
+                    readFatalOutcome);
+                return readFatalOutcome().HasValue
+                    ? SpaceBattleTerminationReason.Fatal
+                    : SpaceBattleTerminationReason.Cancelled;
+            }
             Thread.Sleep(1);
         }
     }
+
+    private static void WaitForInFlightTick(
+        SpaceBattleSimulationState state,
+        TyphonRuntime runtime,
+        long completedTicksAtRequest,
+        long runtimeTickAtRequest,
+        Func<TickOutcome?> readFatalOutcome)
+    {
+        var targetCompletedTicks = completedTicksAtRequest;
+        if (state.IsTickInFlight && runtimeTickAtRequest >= completedTicksAtRequest)
+        {
+            targetCompletedTicks = runtimeTickAtRequest + 1;
+        }
+
+        while (true)
+        {
+            if (readFatalOutcome().HasValue)
+            {
+                return;
+            }
+
+            var stateCompletedTicks = state.CompletedTicks;
+            var targetOutcomeTick = targetCompletedTicks - 1;
+            if (stateCompletedTicks >= targetCompletedTicks &&
+                (targetOutcomeTick < 0 || runtime.LastTickOutcome.TickNumber >= targetOutcomeTick))
+            {
+                return;
+            }
+
+            if (targetCompletedTicks == 0)
+            {
+                return;
+            }
+
+            Thread.Sleep(1);
+        }
+    }
+
+    private static SpaceBattleTerminationReason ResolveTerminationReason(
+        SpaceBattleTerminationReason requestedTermination,
+        long completedTicks,
+        int remainingShips,
+        ulong maximumTicks,
+        int initialShipCount,
+        TickOutcome? fatalOutcome)
+    {
+        if (fatalOutcome.HasValue)
+        {
+            return SpaceBattleTerminationReason.Fatal;
+        }
+
+        var battleTermination = ResolveBoundaryTermination(
+            completedTicks,
+            remainingShips,
+            initialShipCount,
+            maximumTicks);
+        if (battleTermination.HasValue)
+        {
+            return battleTermination.Value;
+        }
+
+        return requestedTermination;
+
+    }
+    private static SpaceBattleTerminationReason? ResolveBoundaryTermination(
+        long completedTicks,
+        int remainingShips,
+        int initialShipCount,
+        ulong maximumTicks)
+    {
+        if (completedTicks <= 0)
+        {
+            return null;
+        }
+
+        if (remainingShips == 0)
+        {
+            return SpaceBattleTerminationReason.Draw;
+        }
+
+        if (remainingShips == 1 && initialShipCount > 1)
+        {
+            return SpaceBattleTerminationReason.Winner;
+        }
+
+        return (ulong)completedTicks >= maximumTicks
+            ? SpaceBattleTerminationReason.TickLimit
+            : null;
+    }
+
+    private static SpaceBattleRunResult CreateCancelledResult(
+        string databaseDirectory,
+        SimulationDefinition definition) =>
+        new(
+            databaseDirectory,
+            definition.ShipCount,
+            TimeSpan.Zero,
+            new TickPerformanceSnapshot(0, 0, 0, 0, 0))
+        {
+            TerminationReason = SpaceBattleTerminationReason.Cancelled,
+            PublishedSnapshot = new SpaceBattleSnapshot([]),
+        };
+
+    private static void PublishSimulationCompleted(
+        ISpaceBattleObservationSink observationSink,
+        SpaceBattleRunResult result)
+    {
+        observationSink.Publish(new SimulationCompleted(
+            result.CompletedTicks,
+            result.RemainingShips,
+            result.TickPerformance,
+            result.PublishedSnapshot)
+        {
+            TerminationReason = result.TerminationReason,
+            FailedSystemName = result.FailedSystemName,
+            FatalException = result.FatalException,
+            FatalOutcome = result.FatalOutcome,
+        });
+    }
+
     private static int ResolveWorkerCount() =>
         Math.Max(1, Math.Min(MaximumWorkerCount, Environment.ProcessorCount - 4));
 
