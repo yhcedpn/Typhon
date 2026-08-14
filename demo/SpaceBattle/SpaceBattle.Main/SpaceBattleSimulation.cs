@@ -13,13 +13,21 @@ internal sealed class SpaceBattleSimulationState : IDisposable
     private readonly int[] _reapGenerations;
     private readonly EntityId[] _entityIds;
     private readonly ShipSnapshot[] _frames;
-    private readonly EntityId[] _reapBuffer;
+    private readonly uint[][] _incomingDamageLanes;
+    private readonly long[][] _incomingDamageTouchedKeys;
+    private readonly int[][] _incomingDamageTouchedGenerations;
+    private readonly int[] _incomingDamageTouchedCounts;
+    private readonly EntityId[][] _reapBuffers;
+    private readonly int[] _reapCounts;
+    private readonly long[] _directTargetingQueries;
+    private readonly long[] _batchedTargetingQueries;
+    private readonly long[] _gatherTargetingCandidates;
+    private readonly long[] _exactTargetingDistanceTests;
     private readonly SimulationDefinition _definition;
     private readonly ISpaceBattleObservationSink _observationSink;
     private long _preparedTick = -1;
     private int _generation;
     private int _publishedShipCount;
-    private int _pendingReapCount;
     private long _tickStartedAt;
     private bool _disposed;
     private readonly AcquisitionTransactionSlot[] _acquisitionTransactions;
@@ -43,8 +51,24 @@ internal sealed class SpaceBattleSimulationState : IDisposable
         _reapGenerations = new int[capacity];
         _entityIds = new EntityId[capacity];
         _frames = new ShipSnapshot[capacity];
-        _reapBuffer = new EntityId[capacity];
+        _incomingDamageLanes = new uint[workerCount][];
+        _incomingDamageTouchedKeys = new long[workerCount][];
+        _incomingDamageTouchedGenerations = new int[workerCount][];
+        _incomingDamageTouchedCounts = new int[workerCount];
+        _reapBuffers = new EntityId[workerCount][];
+        _reapCounts = new int[workerCount];
+        _directTargetingQueries = new long[workerCount];
+        _batchedTargetingQueries = new long[workerCount];
+        _gatherTargetingCandidates = new long[workerCount];
+        _exactTargetingDistanceTests = new long[workerCount];
         _acquisitionTransactions = new AcquisitionTransactionSlot[workerCount];
+        for (var workerId = 0; workerId < workerCount; workerId++)
+        {
+            _incomingDamageLanes[workerId] = new uint[capacity];
+            _incomingDamageTouchedKeys[workerId] = new long[capacity];
+            _incomingDamageTouchedGenerations[workerId] = new int[capacity];
+            _reapBuffers[workerId] = new EntityId[capacity];
+        }
         for (var workerId = 0; workerId < workerCount; workerId++)
         {
             _acquisitionTransactions[workerId] = new AcquisitionTransactionSlot();
@@ -81,8 +105,15 @@ internal sealed class SpaceBattleSimulationState : IDisposable
 
     public int PublishedShipCount => Volatile.Read(ref _publishedShipCount);
     public long AcquisitionTransactionsCreated => Interlocked.Read(ref _acquisitionTransactionsCreated);
-
     public long AcquisitionTransactionsDisposed => Interlocked.Read(ref _acquisitionTransactionsDisposed);
+
+    public long DirectTargetingQueryCount => Sum(_directTargetingQueries);
+
+    public long BatchedTargetingQueryCount => Sum(_batchedTargetingQueries);
+
+    public long GatherTargetingCandidateCount => Sum(_gatherTargetingCandidates);
+
+    public long ExactTargetingDistanceTestCount => Sum(_exactTargetingDistanceTests);
 
     public int ActiveAcquisitionTransactions
     {
@@ -184,6 +215,30 @@ internal sealed class SpaceBattleSimulationState : IDisposable
         public long LastUsedTick = -1;
         public int OwnerThreadId;
     }
+    public void RecordTargetingMetrics(int workerId, in TargetingQueryMetrics metrics)
+    {
+        if ((uint)workerId >= (uint)WorkerCount)
+        {
+            throw new ArgumentOutOfRangeException(nameof(workerId));
+        }
+
+        _directTargetingQueries[workerId] += metrics.DirectQueryCount;
+        _batchedTargetingQueries[workerId] += metrics.BatchedQueryCount;
+        _gatherTargetingCandidates[workerId] += metrics.GatherCandidateCount;
+        _exactTargetingDistanceTests[workerId] += metrics.ExactDistanceTestCount;
+    }
+
+    private static long Sum(long[] values)
+    {
+        var total = 0L;
+        foreach (var value in values)
+        {
+            total += value;
+        }
+
+        return total;
+    }
+
     public void PrepareTick(long tickNumber)
     {
         lock (_tickGate)
@@ -201,7 +256,8 @@ internal sealed class SpaceBattleSimulationState : IDisposable
             _preparedTick = tickNumber;
             _generation++;
             _publishedShipCount = 0;
-            _pendingReapCount = 0;
+            ClearIncomingDamage();
+            Array.Clear(_reapCounts);
             _tickStartedAt = Stopwatch.GetTimestamp();
             Accessor.Attach(Engine, WorkerCount);
         }
@@ -264,36 +320,193 @@ internal sealed class SpaceBattleSimulationState : IDisposable
 
     public bool WasModified(int index) => Volatile.Read(ref _modifiedGenerations[index]) == CurrentGeneration;
 
-    public void MarkForReap(long entityKey)
+    public void RecordIncomingDamage(int workerId, long targetEntityKey, uint damage)
+    {
+        if ((uint)workerId >= (uint)WorkerCount)
+        {
+            throw new ArgumentOutOfRangeException(nameof(workerId));
+        }
+
+        if (damage == 0 || !TryGetEntityIndex(targetEntityKey, out var index))
+        {
+            return;
+        }
+
+        var touchedGenerations = _incomingDamageTouchedGenerations[workerId];
+        if (touchedGenerations[index] != CurrentGeneration)
+        {
+            touchedGenerations[index] = CurrentGeneration;
+            var touchedCount = _incomingDamageTouchedCounts[workerId];
+            var touchedKeys = _incomingDamageTouchedKeys[workerId];
+            if ((uint)touchedCount >= (uint)touchedKeys.Length)
+            {
+                throw new InvalidOperationException("SpaceBattle incoming damage touched-key 缓冲区不足。");
+            }
+
+            touchedKeys[touchedCount] = targetEntityKey;
+            _incomingDamageTouchedCounts[workerId] = touchedCount + 1;
+        }
+
+        var lane = _incomingDamageLanes[workerId];
+        lane[index] = unchecked(lane[index] + damage);
+    }
+
+    public uint ReadIncomingDamage(int workerId, long targetEntityKey)
+    {
+        if ((uint)workerId >= (uint)WorkerCount)
+        {
+            throw new ArgumentOutOfRangeException(nameof(workerId));
+        }
+
+        return TryGetEntityIndex(targetEntityKey, out var index)
+            ? _incomingDamageLanes[workerId][index]
+            : 0u;
+    }
+
+    public int IncomingDamageTouchedCount(int workerId)
+    {
+        if ((uint)workerId >= (uint)WorkerCount)
+        {
+            throw new ArgumentOutOfRangeException(nameof(workerId));
+        }
+
+        return _incomingDamageTouchedCounts[workerId];
+    }
+
+    public ReadOnlySpan<long> IncomingDamageTouchedKeys(int workerId)
+    {
+        if ((uint)workerId >= (uint)WorkerCount)
+        {
+            throw new ArgumentOutOfRangeException(nameof(workerId));
+        }
+
+        return _incomingDamageTouchedKeys[workerId].AsSpan(0, _incomingDamageTouchedCounts[workerId]);
+    }
+
+    public uint ReduceIncomingDamage(long targetEntityKey)
+    {
+        if (!TryGetEntityIndex(targetEntityKey, out var index))
+        {
+            return 0u;
+        }
+
+        var total = 0u;
+        for (var workerId = 0; workerId < WorkerCount; workerId++)
+        {
+            total = unchecked(total + _incomingDamageLanes[workerId][index]);
+        }
+
+        return total;
+    }
+
+    public void ClearIncomingDamage()
+    {
+        for (var workerId = 0; workerId < WorkerCount; workerId++)
+        {
+            var lane = _incomingDamageLanes[workerId];
+            var touchedKeys = _incomingDamageTouchedKeys[workerId];
+            var touchedGenerations = _incomingDamageTouchedGenerations[workerId];
+            var touchedCount = _incomingDamageTouchedCounts[workerId];
+            for (var index = 0; index < touchedCount; index++)
+            {
+                if (TryGetEntityIndex(touchedKeys[index], out var entityIndex))
+                {
+                    lane[entityIndex] = 0;
+                    touchedGenerations[entityIndex] = 0;
+                }
+            }
+
+            _incomingDamageTouchedCounts[workerId] = 0;
+        }
+    }
+
+    public void UpdateFrameHealth(long entityKey, uint health)
     {
         if (!TryGetFrameIndex(entityKey, out var index))
         {
             return;
         }
 
-        if (Interlocked.CompareExchange(ref _reapGenerations[index], CurrentGeneration, CurrentGeneration) == CurrentGeneration)
+        _frames[index] = _frames[index] with
+        {
+            Vitals = new Vitals { CurrentHealth = health },
+        };
+    }
+
+    public void MarkForReap(int workerId, long entityKey)
+    {
+        if ((uint)workerId >= (uint)WorkerCount)
+        {
+            throw new ArgumentOutOfRangeException(nameof(workerId));
+        }
+
+        if (!TryGetFrameIndex(entityKey, out var index) ||
+            _reapGenerations[index] == CurrentGeneration)
         {
             return;
         }
 
         _reapGenerations[index] = CurrentGeneration;
-        var reapIndex = Interlocked.Increment(ref _pendingReapCount) - 1;
-        _reapBuffer[reapIndex] = _entityIds[index];
+        var reapCount = _reapCounts[workerId];
+        var reapBuffer = _reapBuffers[workerId];
+        if ((uint)reapCount >= (uint)reapBuffer.Length)
+        {
+            throw new InvalidOperationException("SpaceBattle per-worker 死亡缓冲区不足。");
+        }
+
+        reapBuffer[reapCount] = _entityIds[index];
+        _reapCounts[workerId] = reapCount + 1;
+    }
+
+    public bool IsPendingReap(long entityKey) =>
+        TryGetFrameIndex(entityKey, out var index) && _reapGenerations[index] == CurrentGeneration;
+
+    public int PendingReapCount
+    {
+        get
+        {
+            var count = 0;
+            for (var workerId = 0; workerId < WorkerCount; workerId++)
+            {
+                count += _reapCounts[workerId];
+            }
+
+            return count;
+        }
     }
 
     public int CopyPendingReaps(Span<EntityId> destination)
     {
-        var count = Volatile.Read(ref _pendingReapCount);
-        if (destination.Length < count)
+        var total = PendingReapCount;
+        if (destination.Length < total)
         {
             throw new ArgumentException("目标缓冲区不足以容纳待回收实体。", nameof(destination));
         }
 
-        _reapBuffer.AsSpan(0, count).CopyTo(destination);
-        return count;
+        var offset = 0;
+        for (var workerId = 0; workerId < WorkerCount; workerId++)
+        {
+            var count = _reapCounts[workerId];
+            _reapBuffers[workerId].AsSpan(0, count).CopyTo(destination[offset..]);
+            offset += count;
+        }
+
+        return total;
     }
 
-    public void CompleteReaps() => Volatile.Write(ref _pendingReapCount, 0);
+    public void CompleteReaps() => Array.Clear(_reapCounts);
+
+    private bool TryGetEntityIndex(long entityKey, out int index)
+    {
+        if ((ulong)entityKey < (ulong)_frames.Length)
+        {
+            index = (int)entityKey;
+            return index > 0;
+        }
+
+        index = -1;
+        return false;
+    }
 
     public SpaceBattleSnapshot BuildPublishedSnapshot()
     {
@@ -301,7 +514,8 @@ internal sealed class SpaceBattleSimulationState : IDisposable
         var generation = CurrentGeneration;
         for (var index = 1; index < _frames.Length; index++)
         {
-            if (Volatile.Read(ref _frameGenerations[index]) == generation)
+            if (Volatile.Read(ref _frameGenerations[index]) == generation &&
+                _frames[index].Vitals.CurrentHealth > 0)
             {
                 ships.Add(_frames[index]);
             }
@@ -346,6 +560,7 @@ internal enum SpaceBattleRandomPurpose : ulong
     InitialWanderHeading = 0x11A7_6C4D_2F90_B381UL,
     WanderHeading = 0x8C31_5A72_D4E6_109FUL,
     WanderSpeed = 0xE27B_4390_6D1F_A508UL,
+    WeaponPhase = 0xC49E_2D17_6A83_F051UL,
 }
 
 internal static class SpaceBattleMath

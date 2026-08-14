@@ -4,6 +4,45 @@ using Typhon.Engine;
 
 namespace SpaceBattle;
 
+internal static class SpaceBattleCombat
+{
+    public const float WeaponRange = SpaceBattleTargeting.WeaponRange;
+    public const uint WeaponDamage = 250u;
+    public const ushort WeaponPeriodTicks = 15;
+    public const float WeaponSpeed = SpaceBattleTargeting.ApproachSpeed;
+
+    public static int FirstWeaponPhase(long entityKey)
+    {
+        if (entityKey <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(entityKey));
+        }
+
+        return (int)(SpaceBattleMath.DeriveUInt64(
+            seed: 0,
+            entityKey,
+            modeStartedTick: 0,
+            SpaceBattleRandomPurpose.WeaponPhase) % WeaponPeriodTicks);
+    }
+
+    public static bool IsWeaponUseTick(long entityKey, long tickNumber)
+    {
+        var phase = FirstWeaponPhase(entityKey);
+        var tickPhase = tickNumber % WeaponPeriodTicks;
+        if (tickPhase < 0)
+        {
+            tickPhase += WeaponPeriodTicks;
+        }
+
+        return tickPhase == phase;
+    }
+
+    public static uint DamageForDistance(double distanceSquared) =>
+        distanceSquared >= 0d && distanceSquared <= WeaponRange * WeaponRange
+            ? WeaponDamage
+            : 0u;
+}
+
 internal static class SpaceBattlePhases
 {
     public static readonly Phase Publish = new("Publish");
@@ -67,9 +106,10 @@ internal sealed class PublishSystem : ShipChunkSystem
                 var vitals = vitalsSpan[slot];
                 if (vitals.CurrentHealth == 0)
                 {
-                    // #41 尚未引入伤害结算；cluster spawn 的零填充槽按 bootstrap 的存活事实发布。
+                    // bootstrap 的批量 spawn 在首个 cluster fence 可能暂读零填充；本逻辑帧尚未进入伤害阶段，按存活事实发布。
                     vitals = new Vitals { CurrentHealth = State.MaximumHealth };
                 }
+
                 State.PublishFrame(entityId, new ShipSnapshot(
                     entityKey,
                     hulls[slot],
@@ -84,6 +124,8 @@ internal sealed class PublishSystem : ShipChunkSystem
 
 internal sealed class BehaviorSystem : ShipChunkSystem
 {
+    private const int MaximumClusterSize = 64;
+
     public BehaviorSystem(SpaceBattleSimulationState state)
         : base(state)
     {
@@ -95,6 +137,9 @@ internal sealed class BehaviorSystem : ShipChunkSystem
 
     protected override void Execute(TickContext ctx)
     {
+        Span<ShipSnapshot> trackingSources = stackalloc ShipSnapshot[MaximumClusterSize];
+        Span<int> trackingSlots = stackalloc int[MaximumClusterSize];
+        Span<TargetingResult> trackingResults = stackalloc TargetingResult[MaximumClusterSize];
         using var clusters = OpenClusters(ctx);
         while (clusters.MoveNext())
         {
@@ -102,8 +147,15 @@ internal sealed class BehaviorSystem : ShipChunkSystem
             var motions = cluster.GetSpan(Ship.Motion);
             var targetings = cluster.GetSpan(Ship.Targeting);
             var behaviors = cluster.GetSpan(Ship.Behavior);
+            if (motions.Length > MaximumClusterSize)
+            {
+                throw new InvalidOperationException("SpaceBattle cluster 超出锁定临时缓冲容量。");
+            }
+
+            var trackingCount = 0;
             var bits = cluster.OccupancyBits;
             var clusterDirty = false;
+
             while (bits != 0)
             {
                 var slot = BitOperations.TrailingZeroCount(bits);
@@ -120,10 +172,24 @@ internal sealed class BehaviorSystem : ShipChunkSystem
                     continue;
                 }
 
+                var mode = (BehaviorMode)frame.Behavior.Mode;
+                if (mode == BehaviorMode.Tracking)
+                {
+                    trackingSources[trackingCount] = frame;
+                    trackingSlots[trackingCount] = slot;
+                    trackingCount++;
+                    continue;
+                }
+
+                if (mode == BehaviorMode.Attacking)
+                {
+                    EmitWeaponUse(ctx, frame);
+                }
+
                 var nextMotion = frame.Motion;
                 var nextTargeting = frame.Targeting;
                 var nextBehavior = frame.Behavior;
-                switch ((BehaviorMode)frame.Behavior.Mode)
+                switch (mode)
                 {
                     case BehaviorMode.Wandering:
                         AdvanceWandering(
@@ -132,14 +198,6 @@ internal sealed class BehaviorSystem : ShipChunkSystem
                             ref nextMotion,
                             ref nextBehavior,
                             (BehaviorPhase)frame.Behavior.Phase);
-                        break;
-                    case BehaviorMode.Tracking:
-                        AcquireTarget(
-                            ctx,
-                            frame,
-                            ref nextMotion,
-                            ref nextTargeting,
-                            ref nextBehavior);
                         break;
                     case BehaviorMode.Approaching:
                     case BehaviorMode.Attacking:
@@ -152,15 +210,57 @@ internal sealed class BehaviorSystem : ShipChunkSystem
                         break;
                 }
 
-                if (!MotionEquals(frame.Motion, nextMotion) ||
-                    !TargetingEquals(frame.Targeting, nextTargeting) ||
-                    !BehaviorEquals(frame.Behavior, nextBehavior))
+                if (WriteBehaviorChanges(
+                        entityKey,
+                        slot,
+                        frame,
+                        nextMotion,
+                        nextTargeting,
+                        nextBehavior,
+                        motions,
+                        targetings,
+                        behaviors))
                 {
-                    motions[slot] = nextMotion;
-                    targetings[slot] = nextTargeting;
-                    behaviors[slot] = nextBehavior;
-                    State.MarkModified(entityKey);
                     clusterDirty = true;
+                }
+            }
+
+            if (trackingCount > 0)
+            {
+                SpaceBattleTargeting.FindNearestBatch(
+                    State.GetAcquisitionTransaction(ctx.WorkerId, ctx.TickNumber),
+                    State,
+                    trackingSources[..trackingCount],
+                    trackingResults[..trackingCount],
+                    out var targetingMetrics);
+                State.RecordTargetingMetrics(ctx.WorkerId, targetingMetrics);
+
+                for (var index = 0; index < trackingCount; index++)
+                {
+                    var slot = trackingSlots[index];
+                    var source = trackingSources[index];
+                    var nextMotion = source.Motion;
+                    var nextTargeting = source.Targeting;
+                    var nextBehavior = source.Behavior;
+                    ApplyAcquiredTarget(
+                        ctx.TickNumber,
+                        trackingResults[index],
+                        ref nextMotion,
+                        ref nextTargeting,
+                        ref nextBehavior);
+                    if (WriteBehaviorChanges(
+                            source.EntityKey,
+                            slot,
+                            source,
+                            nextMotion,
+                            nextTargeting,
+                            nextBehavior,
+                            motions,
+                            targetings,
+                            behaviors))
+                    {
+                        clusterDirty = true;
+                    }
                 }
             }
 
@@ -176,33 +276,45 @@ internal sealed class BehaviorSystem : ShipChunkSystem
         }
     }
 
-    private void AcquireTarget(
-        TickContext ctx,
-        in ShipSnapshot source,
+    private void EmitWeaponUse(TickContext ctx, in ShipSnapshot source)
+    {
+        if (!SpaceBattleCombat.IsWeaponUseTick(
+                source.EntityKey,
+                ctx.TickNumber - source.Behavior.ModeStartedTick) ||
+            !SpaceBattleTargeting.TryReadTarget(State, source, out var target, out var distanceSquared))
+        {
+            return;
+        }
+
+        var damage = SpaceBattleCombat.DamageForDistance(distanceSquared);
+        if (damage != 0)
+        {
+            State.RecordIncomingDamage(ctx.WorkerId, target.EntityKey, damage);
+        }
+    }
+
+    private void ApplyAcquiredTarget(
+        long tickNumber,
+        in TargetingResult result,
         ref Motion motion,
         ref Targeting targeting,
         ref Behavior behavior)
     {
-        var targetId = SpaceBattleTargeting.FindNearest(
-            State.GetAcquisitionTransaction(ctx.WorkerId, ctx.TickNumber),
-            State,
-            source,
-            out var distanceSquared);
-        if (targetId.IsNull)
+        if (result.EntityId.IsNull)
         {
             // 没有候选时保留原速度和航向，下一 tick 继续重试。
             targeting.TargetEntityId = 0;
             return;
         }
 
-        targeting.TargetEntityId = SpaceBattleTargeting.PackRaw(targetId);
-        behavior.Mode = (byte)(distanceSquared <= SpaceBattleTargeting.WeaponRange * SpaceBattleTargeting.WeaponRange
+        targeting.TargetEntityId = SpaceBattleTargeting.PackRaw(result.EntityId);
+        behavior.Mode = (byte)(result.DistanceSquared <= SpaceBattleCombat.WeaponRange * SpaceBattleCombat.WeaponRange
             ? BehaviorMode.Attacking
             : BehaviorMode.Approaching);
         behavior.Phase = (byte)BehaviorPhase.Ready;
         behavior.TicksRemaining = 0;
-        behavior.ModeStartedTick = unchecked((uint)(ctx.TickNumber + 1));
-        motion.Speed = SpaceBattleTargeting.ApproachSpeed;
+        behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
+        motion.Speed = SpaceBattleCombat.WeaponSpeed;
     }
 
     private void AdvanceTargetedMode(
@@ -223,18 +335,11 @@ internal sealed class BehaviorSystem : ShipChunkSystem
             return;
         }
 
-        motion.Speed = SpaceBattleTargeting.ApproachSpeed;
-        var currentMode = (BehaviorMode)source.Behavior.Mode;
-        if (currentMode == BehaviorMode.Approaching &&
-            distanceSquared <= SpaceBattleTargeting.WeaponRange * SpaceBattleTargeting.WeaponRange)
+        motion.Speed = SpaceBattleCombat.WeaponSpeed;
+        if ((BehaviorMode)source.Behavior.Mode == BehaviorMode.Approaching &&
+            distanceSquared <= SpaceBattleCombat.WeaponRange * SpaceBattleCombat.WeaponRange)
         {
             behavior.Mode = (byte)BehaviorMode.Attacking;
-            behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
-        }
-        else if (currentMode == BehaviorMode.Attacking &&
-                 distanceSquared > SpaceBattleTargeting.WeaponRange * SpaceBattleTargeting.WeaponRange)
-        {
-            behavior.Mode = (byte)BehaviorMode.Approaching;
             behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
         }
 
@@ -337,6 +442,31 @@ internal sealed class BehaviorSystem : ShipChunkSystem
         }
     }
 
+    private bool WriteBehaviorChanges(
+        long entityKey,
+        int slot,
+        in ShipSnapshot frame,
+        in Motion nextMotion,
+        in Targeting nextTargeting,
+        in Behavior nextBehavior,
+        Span<Motion> motions,
+        Span<Targeting> targetings,
+        Span<Behavior> behaviors)
+    {
+        if (MotionEquals(frame.Motion, nextMotion) &&
+            TargetingEquals(frame.Targeting, nextTargeting) &&
+            BehaviorEquals(frame.Behavior, nextBehavior))
+        {
+            return false;
+        }
+
+        motions[slot] = nextMotion;
+        targetings[slot] = nextTargeting;
+        behaviors[slot] = nextBehavior;
+        State.MarkModified(entityKey);
+        return true;
+    }
+
     private static bool MotionEquals(in Motion left, in Motion right) =>
         left.CurrentHeadingX == right.CurrentHeadingX &&
         left.CurrentHeadingY == right.CurrentHeadingY &&
@@ -365,11 +495,82 @@ internal sealed class DamageSystem : ShipChunkSystem
     }
 
     protected override void Configure(SystemBuilder b) => ConfigureChunked(b, "Damage", "Behavior")
-        .Phase(SpaceBattlePhases.Damage);
+        .Phase(SpaceBattlePhases.Damage)
+        .Writes<Vitals>();
 
     protected override void Execute(TickContext ctx)
     {
-        // #41 只建立进入攻击模式的入口，伤害和销毁留给 #42。
+        using var clusters = OpenClusters(ctx);
+        while (clusters.MoveNext())
+        {
+            var cluster = clusters.Current;
+            var vitals = cluster.GetSpan(Ship.Vitals);
+            var bits = cluster.OccupancyBits;
+            var clusterDirty = false;
+            while (bits != 0)
+            {
+                var slot = BitOperations.TrailingZeroCount(bits);
+                bits &= bits - 1;
+                var entityKey = cluster.GetEntityId(slot).EntityKey;
+                if (!State.TryGetFrameIndex(entityKey, out _))
+                {
+                    continue;
+                }
+
+                var incomingDamage = State.ReduceIncomingDamage(entityKey);
+                if (incomingDamage == 0)
+                {
+                    continue;
+                }
+
+                var currentHealth = vitals[slot].CurrentHealth;
+                var nextHealth = incomingDamage >= currentHealth
+                    ? 0u
+                    : currentHealth - incomingDamage;
+                if (nextHealth == currentHealth)
+                {
+                    continue;
+                }
+
+                vitals[slot] = new Vitals { CurrentHealth = nextHealth };
+                State.UpdateFrameHealth(entityKey, nextHealth);
+                State.MarkModified(entityKey);
+                clusterDirty = true;
+                if (nextHealth == 0)
+                {
+                    // 本 tick 后续 Movement 通过已更新的 frame health 跳过该飞船，Reap 再统一销毁。
+                    State.MarkForReap(ctx.WorkerId, entityKey);
+                }
+            }
+
+            if (clusterDirty)
+            {
+                clusters.MarkCurrentDirty();
+            }
+        }
+    }
+}
+
+internal sealed class DamageCleanupSystem : ChunkedCallbackSystem
+{
+    private readonly SpaceBattleSimulationState _state;
+
+    public DamageCleanupSystem(SpaceBattleSimulationState state)
+    {
+        _state = state;
+    }
+
+    protected override void Configure(SystemBuilder b) => b
+        .Name("DamageCleanup")
+        .Priority(SystemPriority.Critical)
+        .CanShed(false)
+        .Phase(SpaceBattlePhases.Damage)
+        .After("Damage")
+        .ChunkedParallel(1);
+
+    protected override void Execute(TickContext ctx)
+    {
+        _state.ClearIncomingDamage();
     }
 }
 
@@ -379,6 +580,9 @@ internal sealed class MovementSystem : ShipChunkSystem
         : base(state)
     {
     }
+
+    internal static bool CanMove(in ShipSnapshot frame, bool pendingReap) =>
+        frame.Vitals.CurrentHealth != 0 && !pendingReap;
 
     protected override void Configure(SystemBuilder b) => ConfigureChunked(b, "Movement", "Damage")
         .Phase(SpaceBattlePhases.Movement)
@@ -405,7 +609,7 @@ internal sealed class MovementSystem : ShipChunkSystem
                 }
 
                 ref readonly var frame = ref State.GetFrame(frameIndex);
-                if (frame.Vitals.CurrentHealth == 0)
+                if (!CanMove(frame, State.IsPendingReap(entityKey)))
                 {
                     continue;
                 }

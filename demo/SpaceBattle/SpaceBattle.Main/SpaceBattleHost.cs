@@ -219,6 +219,7 @@ internal static class SpaceBattleHost
         dag.Add(new PublishSystem(state));
         dag.Add(new BehaviorSystem(state));
         dag.Add(new DamageSystem(state));
+        dag.Add(new DamageCleanupSystem(state));
         dag.Add(new MovementSystem(state));
         dag.Add(new ReapSystem(state));
         dag.Add(new AcquisitionCleanupSystem(state));
