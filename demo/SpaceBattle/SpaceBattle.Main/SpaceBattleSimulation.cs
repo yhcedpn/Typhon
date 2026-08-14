@@ -54,14 +54,17 @@ internal sealed class SpaceBattleSimulationState : IDisposable
 
     public int ShipCount => _definition.ShipCount;
 
+    public ulong Seed => _definition.Seed;
+
     public uint MaximumHealth => _definition.MaximumHealth;
 
     public float FixedDeltaSeconds => _definition.FixedDeltaSeconds;
 
     public float WorldWidth => _definition.WorldWidth;
-    public long CompletedTicks => Interlocked.Read(ref _completedTicks);
     public float WorldHeight => _definition.WorldHeight;
+    public float WorldDepth => _definition.WorldDepth;
 
+    public long CompletedTicks => Interlocked.Read(ref _completedTicks);
     public long TickStartedAt => Volatile.Read(ref _tickStartedAt);
 
 
@@ -219,30 +222,106 @@ internal sealed class SpaceBattleSimulationState : IDisposable
 
 }
 
+internal enum SpaceBattleRandomPurpose : ulong
+{
+    InitialWanderHeading = 0x11A7_6C4D_2F90_B381UL,
+    WanderHeading = 0x8C31_5A72_D4E6_109FUL,
+    WanderSpeed = 0xE27B_4390_6D1F_A508UL,
+}
+
 internal static class SpaceBattleMath
 {
-    public static float HeadingX(long entityKey)
+    public const float MaximumWanderSpeed = 200f;
+    public const float MaximumTurnRadiansPerSecond = 1f;
+    public const ushort WanderFlightTicks = 50;
+
+    private const float TwoPi = 2f * MathF.PI;
+    private const float UnitFloatScale = 1f / 16_777_216f;
+    private const float VectorEpsilonSquared = 1e-12f;
+
+    public static ulong DeriveUInt64(
+        ulong seed,
+        long entityKey,
+        ulong modeStartedTick,
+        SpaceBattleRandomPurpose purpose)
     {
-        var angle = (Mix(entityKey) % 6283UL) * 0.001f;
-        return MathF.Cos(angle);
+        var value = Mix(seed ^ 0xD1B5_4A32_9C87_E601UL);
+        value = Mix(value ^ unchecked((ulong)entityKey + 0x9E37_79B9_7F4A_7C15UL));
+        value = Mix(value ^ modeStartedTick);
+        return Mix(value ^ (ulong)purpose);
     }
 
-    public static float HeadingY(long entityKey)
+    public static float DeriveUnitFloat(
+        ulong seed,
+        long entityKey,
+        ulong modeStartedTick,
+        SpaceBattleRandomPurpose purpose)
+        => (DeriveUInt64(seed, entityKey, modeStartedTick, purpose) >> 40) * UnitFloatScale;
+
+    public static Vector3 RandomDirection(
+        ulong seed,
+        long entityKey,
+        ulong modeStartedTick,
+        SpaceBattleRandomPurpose purpose)
     {
-        var angle = (Mix(entityKey) % 6283UL) * 0.001f;
-        return MathF.Sin(angle);
+        var azimuthUnit = DeriveUnitFloat(
+            seed,
+            entityKey,
+            modeStartedTick,
+            purpose ^ (SpaceBattleRandomPurpose)0xA5A5_A5A5_A5A5_A5A5UL);
+        var zUnit = DeriveUnitFloat(
+            seed,
+            entityKey,
+            modeStartedTick,
+            purpose ^ (SpaceBattleRandomPurpose)0x5A5A_5A5A_5A5A_5A5AUL);
+        var z = (zUnit * 2f) - 1f;
+        var radius = MathF.Sqrt(MathF.Max(0f, 1f - (z * z)));
+        var azimuth = azimuthUnit * TwoPi;
+        return new Vector3(
+            radius * MathF.Cos(azimuth),
+            radius * MathF.Sin(azimuth),
+            z);
     }
 
-    public static long NextTargetRaw(ushort archetypeId, long entityKey, int shipCount)
+    public static float RandomWanderSpeed(ulong seed, long entityKey, ulong modeStartedTick)
+        => DeriveUnitFloat(seed, entityKey, modeStartedTick, SpaceBattleRandomPurpose.WanderSpeed) * MaximumWanderSpeed;
+
+    public static float AngleBetween(Vector3 current, Vector3 target)
     {
-        if (shipCount < 2)
+        var from = NormalizeOrFallback(current, Vector3.UnitX);
+        var to = NormalizeOrFallback(target, from);
+        var dot = Math.Clamp(Vector3.Dot(from, to), -1f, 1f);
+        return MathF.Acos(dot);
+    }
+
+    public static Vector3 TurnTowards(Vector3 current, Vector3 target, float maximumRadians, out float remainingRadians)
+    {
+        var from = NormalizeOrFallback(current, Vector3.UnitX);
+        var to = NormalizeOrFallback(target, from);
+        var angle = AngleBetween(from, to);
+        if (!float.IsFinite(maximumRadians) || maximumRadians <= 0f || angle <= maximumRadians)
         {
-            return 0;
+            remainingRadians = 0f;
+            return to;
         }
 
-        var targetKey = entityKey == shipCount ? 1 : entityKey + 1;
-        return (targetKey << 16) | archetypeId;
+        remainingRadians = angle - maximumRadians;
+        var dot = Math.Clamp(Vector3.Dot(from, to), -1f, 1f);
+        var sine = MathF.Sin(angle);
+        if (MathF.Abs(sine) > 1e-5f)
+        {
+            var firstWeight = MathF.Sin(angle - maximumRadians) / sine;
+            var secondWeight = MathF.Sin(maximumRadians) / sine;
+            return NormalizeOrFallback((from * firstWeight) + (to * secondWeight), to);
+        }
+
+        var basis = MathF.Abs(from.X) < 0.9f ? Vector3.UnitX : Vector3.UnitY;
+        var perpendicular = NormalizeOrFallback(Vector3.Cross(from, basis), Vector3.UnitZ);
+        return NormalizeOrFallback(
+            (from * MathF.Cos(maximumRadians)) + (perpendicular * MathF.Sin(maximumRadians)),
+            to);
     }
+
     public static AABB3F MoveBounds(
         AABB3F current,
         float headingX,
@@ -254,33 +333,18 @@ internal static class SpaceBattleMath
         out float resultingHeadingX,
         out float resultingHeadingY)
     {
-        var x = current.MinX + headingX * speed * deltaSeconds;
-        var y = current.MinY + headingY * speed * deltaSeconds;
-        resultingHeadingX = headingX;
-        resultingHeadingY = headingY;
-
-        if (x < 0f)
-        {
-            x = 0f;
-            resultingHeadingX = MathF.Abs(resultingHeadingX);
-        }
-        else if (x >= worldWidth)
-        {
-            x = MathF.BitDecrement(worldWidth);
-            resultingHeadingX = -MathF.Abs(resultingHeadingX);
-        }
-
-        if (y < 0f)
-        {
-            y = 0f;
-            resultingHeadingY = MathF.Abs(resultingHeadingY);
-        }
-        else if (y >= worldHeight)
-        {
-            y = MathF.BitDecrement(worldHeight);
-            resultingHeadingY = -MathF.Abs(resultingHeadingY);
-        }
-
+        var x = ReflectCoordinate(
+            current.MinX,
+            (double)headingX * speed * deltaSeconds,
+            worldWidth,
+            out var xDirection);
+        var y = ReflectCoordinate(
+            current.MinY,
+            (double)headingY * speed * deltaSeconds,
+            worldHeight,
+            out var yDirection);
+        resultingHeadingX = headingX * xDirection;
+        resultingHeadingY = headingY * yDirection;
         return new AABB3F
         {
             MinX = x,
@@ -292,11 +356,140 @@ internal static class SpaceBattleMath
         };
     }
 
-    private static ulong Mix(long value)
+    public static AABB3F MoveBounds(
+        AABB3F current,
+        float headingX,
+        float headingY,
+        float headingZ,
+        float speed,
+        float deltaSeconds,
+        float worldWidth,
+        float worldHeight,
+        float worldDepth,
+        out float resultingHeadingX,
+        out float resultingHeadingY,
+        out float resultingHeadingZ)
     {
-        var x = unchecked((ulong)value + 0x9E37_79B9_7F4A_7C15UL);
-        x = unchecked((x ^ (x >> 30)) * 0xBF58_476D_1CE4_E5B9UL);
-        x = unchecked((x ^ (x >> 27)) * 0x94D0_49BB_1331_11EBUL);
-        return x ^ (x >> 31);
+        var x = ReflectCoordinate(
+            current.MinX,
+            (double)headingX * speed * deltaSeconds,
+            worldWidth,
+            out var xDirection);
+        var y = ReflectCoordinate(
+            current.MinY,
+            (double)headingY * speed * deltaSeconds,
+            worldHeight,
+            out var yDirection);
+        var z = ReflectCoordinate(
+            current.MinZ,
+            (double)headingZ * speed * deltaSeconds,
+            worldDepth,
+            out var zDirection);
+        resultingHeadingX = headingX * xDirection;
+        resultingHeadingY = headingY * yDirection;
+        resultingHeadingZ = headingZ * zDirection;
+        return new AABB3F
+        {
+            MinX = x,
+            MaxX = x,
+            MinY = y,
+            MaxY = y,
+            MinZ = z,
+            MaxZ = z,
+        };
+    }
+
+    public static AABB3F MoveBounds(
+        AABB3F current,
+        Vector3 heading,
+        float speed,
+        float deltaSeconds,
+        float worldWidth,
+        float worldHeight,
+        float worldDepth,
+        out Vector3 resultingHeading)
+    {
+        var bounds = MoveBounds(
+            current,
+            heading.X,
+            heading.Y,
+            heading.Z,
+            speed,
+            deltaSeconds,
+            worldWidth,
+            worldHeight,
+            worldDepth,
+            out var resultingHeadingX,
+            out var resultingHeadingY,
+            out var resultingHeadingZ);
+        resultingHeading = new Vector3(resultingHeadingX, resultingHeadingY, resultingHeadingZ);
+        return bounds;
+    }
+
+    public static float ReflectCoordinate(float position, float displacement, float upperBound, out bool reflected)
+    {
+        var result = ReflectCoordinate(position, (double)displacement, upperBound, out var direction);
+        reflected = direction < 0;
+        return result;
+    }
+
+    private static float ReflectCoordinate(
+        float position,
+        double displacement,
+        float upperBound,
+        out int direction)
+    {
+        if (!float.IsFinite(position) || !float.IsFinite(upperBound) || upperBound <= 0f || !double.IsFinite(displacement))
+        {
+            throw new ArgumentOutOfRangeException(nameof(position), "反射坐标必须使用有限值和正世界边界。");
+        }
+
+        var extent = (double)upperBound;
+        var maximumInside = (double)MathF.BitDecrement(upperBound);
+        var period = extent * 2d;
+        var folded = ((double)position + displacement) % period;
+        if (folded < 0d)
+        {
+            folded += period;
+        }
+
+        if (folded > extent || (folded == extent && displacement > 0d))
+        {
+            direction = -1;
+            folded = period - folded;
+        }
+        else if (folded == 0d && displacement < 0d)
+        {
+            direction = -1;
+        }
+        else
+        {
+            direction = 1;
+        }
+
+        if (folded >= extent)
+        {
+            folded = maximumInside;
+        }
+
+        return (float)Math.Clamp(folded, 0d, maximumInside);
+    }
+
+    private static Vector3 NormalizeOrFallback(Vector3 value, Vector3 fallback)
+    {
+        var lengthSquared = value.LengthSquared();
+        if (!float.IsFinite(lengthSquared) || lengthSquared <= VectorEpsilonSquared)
+        {
+            return fallback;
+        }
+
+        return value / MathF.Sqrt(lengthSquared);
+    }
+
+    private static ulong Mix(ulong value)
+    {
+        value = unchecked((value ^ (value >> 30)) * 0xBF58_476D_1CE4_E5B9UL);
+        value = unchecked((value ^ (value >> 27)) * 0x94D0_49BB_1331_11EBUL);
+        return value ^ (value >> 31);
     }
 }

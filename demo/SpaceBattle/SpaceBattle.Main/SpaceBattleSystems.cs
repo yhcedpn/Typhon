@@ -84,43 +84,168 @@ internal sealed class BehaviorSystem : ShipChunkSystem
 
     protected override void Configure(SystemBuilder b) => ConfigureChunked(b, "Behavior", "Publish")
         .Phase(SpaceBattlePhases.Behavior)
-        .Writes<Targeting, Behavior>();
+        .Writes<Motion, Behavior>();
 
     protected override void Execute(TickContext ctx)
     {
         using var clusters = OpenClusters(ctx);
-        foreach (var cluster in clusters)
+        while (clusters.MoveNext())
         {
-            var targetings = cluster.GetSpan(Ship.Targeting);
+            var cluster = clusters.Current;
+            var motions = cluster.GetSpan(Ship.Motion);
             var behaviors = cluster.GetSpan(Ship.Behavior);
             var bits = cluster.OccupancyBits;
+            var clusterDirty = false;
             while (bits != 0)
             {
                 var slot = BitOperations.TrailingZeroCount(bits);
                 bits &= bits - 1;
-                var entityId = cluster.GetEntityId(slot);
-                var entityKey = entityId.EntityKey;
+                var entityKey = cluster.GetEntityId(slot).EntityKey;
                 if (!State.TryGetFrameIndex(entityKey, out var frameIndex))
                 {
                     continue;
                 }
 
                 ref readonly var frame = ref State.GetFrame(frameIndex);
-                targetings[slot] = new Targeting
+                var nextMotion = frame.Motion;
+                var nextBehavior = frame.Behavior;
+                var phase = (BehaviorPhase)frame.Behavior.Phase;
+                if ((BehaviorMode)frame.Behavior.Mode == BehaviorMode.Wandering)
                 {
-                    TargetEntityId = SpaceBattleMath.NextTargetRaw(entityId.ArchetypeId, frame.EntityKey, State.ShipCount),
-                };
-                behaviors[slot] = new Behavior
+                    AdvanceWandering(
+                        ctx.TickNumber,
+                        entityKey,
+                        ref nextMotion,
+                        ref nextBehavior,
+                        phase);
+                }
+
+                if (!MotionEquals(frame.Motion, nextMotion) || !BehaviorEquals(frame.Behavior, nextBehavior))
                 {
-                    Mode = (byte)BehaviorMode.Tracking,
-                    Phase = (byte)BehaviorPhase.Flying,
-                    TicksRemaining = 1,
-                    ModeStartedTick = unchecked((uint)ctx.TickNumber),
-                };
-                State.MarkModified(frame.EntityKey);
+                    motions[slot] = nextMotion;
+                    behaviors[slot] = nextBehavior;
+                    State.MarkModified(entityKey);
+                    clusterDirty = true;
+                }
+            }
+
+            if (clusterDirty)
+            {
+                clusters.MarkCurrentDirty();
             }
         }
     }
+
+    private void AdvanceWandering(
+        long tickNumber,
+        long entityKey,
+        ref Motion motion,
+        ref Behavior behavior,
+        BehaviorPhase phase)
+    {
+        var turnStep = SpaceBattleMath.MaximumTurnRadiansPerSecond * State.FixedDeltaSeconds;
+        switch (phase)
+        {
+            case BehaviorPhase.Ready:
+            {
+                var hasCurrentHeading = motion.CurrentHeadingX != 0f ||
+                                        motion.CurrentHeadingY != 0f ||
+                                        motion.CurrentHeadingZ != 0f;
+                var purpose = hasCurrentHeading
+                    ? SpaceBattleRandomPurpose.WanderHeading
+                    : SpaceBattleRandomPurpose.InitialWanderHeading;
+                var target = SpaceBattleMath.RandomDirection(State.Seed, entityKey, behavior.ModeStartedTick, purpose);
+                var speed = SpaceBattleMath.RandomWanderSpeed(State.Seed, entityKey, behavior.ModeStartedTick);
+                motion.TargetHeadingX = target.X;
+                motion.TargetHeadingY = target.Y;
+                motion.TargetHeadingZ = target.Z;
+                motion.Speed = speed;
+
+                if (!hasCurrentHeading)
+                {
+                    motion.CurrentHeadingX = target.X;
+                    motion.CurrentHeadingY = target.Y;
+                    motion.CurrentHeadingZ = target.Z;
+                    motion.RemainingTurnRadians = 0f;
+                    behavior.Phase = (byte)BehaviorPhase.Flying;
+                    behavior.TicksRemaining = SpaceBattleMath.WanderFlightTicks;
+                    break;
+                }
+
+                var current = new Vector3(
+                    motion.CurrentHeadingX,
+                    motion.CurrentHeadingY,
+                    motion.CurrentHeadingZ);
+                var angle = SpaceBattleMath.AngleBetween(current, target);
+                motion.RemainingTurnRadians = angle;
+                if (angle <= turnStep)
+                {
+                    motion.CurrentHeadingX = target.X;
+                    motion.CurrentHeadingY = target.Y;
+                    motion.CurrentHeadingZ = target.Z;
+                    motion.RemainingTurnRadians = 0f;
+                    behavior.Phase = (byte)BehaviorPhase.Flying;
+                    behavior.TicksRemaining = SpaceBattleMath.WanderFlightTicks;
+                }
+                else
+                {
+                    behavior.Phase = (byte)BehaviorPhase.Aligning;
+                    behavior.TicksRemaining = 0;
+                }
+
+                break;
+            }
+            case BehaviorPhase.Aligning:
+            {
+                var current = new Vector3(
+                    motion.CurrentHeadingX,
+                    motion.CurrentHeadingY,
+                    motion.CurrentHeadingZ);
+                var target = new Vector3(
+                    motion.TargetHeadingX,
+                    motion.TargetHeadingY,
+                    motion.TargetHeadingZ);
+                var angle = SpaceBattleMath.AngleBetween(current, target);
+                motion.RemainingTurnRadians = angle;
+                if (angle <= turnStep)
+                {
+                    behavior.Phase = (byte)BehaviorPhase.Flying;
+                    behavior.TicksRemaining = SpaceBattleMath.WanderFlightTicks;
+                }
+
+                break;
+            }
+            case BehaviorPhase.Flying:
+                if (behavior.TicksRemaining == 0)
+                {
+                    behavior.Mode = (byte)BehaviorMode.Tracking;
+                    behavior.Phase = (byte)BehaviorPhase.Ready;
+                    behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
+                }
+                else
+                {
+                    behavior.TicksRemaining--;
+                }
+
+                break;
+        }
+    }
+
+    private static bool MotionEquals(in Motion left, in Motion right) =>
+        left.CurrentHeadingX == right.CurrentHeadingX &&
+        left.CurrentHeadingY == right.CurrentHeadingY &&
+        left.CurrentHeadingZ == right.CurrentHeadingZ &&
+        left.TargetHeadingX == right.TargetHeadingX &&
+        left.TargetHeadingY == right.TargetHeadingY &&
+        left.TargetHeadingZ == right.TargetHeadingZ &&
+        left.Speed == right.Speed &&
+        left.RemainingTurnRadians == right.RemainingTurnRadians;
+
+    private static bool BehaviorEquals(in Behavior left, in Behavior right) =>
+        left.Mode == right.Mode &&
+        left.Phase == right.Phase &&
+        left.TicksRemaining == right.TicksRemaining &&
+        left.ModeStartedTick == right.ModeStartedTick;
 }
 
 internal sealed class DamageSystem : ShipChunkSystem
@@ -194,6 +319,7 @@ internal sealed class MovementSystem : ShipChunkSystem
             var hulls = cluster.GetSpan(Ship.Hull);
             var motions = cluster.GetSpan(Ship.Motion);
             var bits = cluster.OccupancyBits;
+            var clusterDirty = false;
             while (bits != 0)
             {
                 var slot = BitOperations.TrailingZeroCount(bits);
@@ -210,47 +336,74 @@ internal sealed class MovementSystem : ShipChunkSystem
                     continue;
                 }
 
-                var headingX = frame.Motion.CurrentHeadingX;
-                var headingY = frame.Motion.CurrentHeadingY;
-                var headingLength = MathF.Sqrt((headingX * headingX) + (headingY * headingY));
-                if (headingLength < 0.001f)
+                var mode = (BehaviorMode)frame.Behavior.Mode;
+                var phase = (BehaviorPhase)frame.Behavior.Phase;
+                if (mode == BehaviorMode.Wandering && phase == BehaviorPhase.Aligning)
                 {
-                    headingX = SpaceBattleMath.HeadingX(frame.EntityKey);
-                    headingY = SpaceBattleMath.HeadingY(frame.EntityKey);
-                }
-                else
-                {
-                    headingX /= headingLength;
-                    headingY /= headingLength;
+                    var current = new Vector3(
+                        frame.Motion.CurrentHeadingX,
+                        frame.Motion.CurrentHeadingY,
+                        frame.Motion.CurrentHeadingZ);
+                    var target = new Vector3(
+                        frame.Motion.TargetHeadingX,
+                        frame.Motion.TargetHeadingY,
+                        frame.Motion.TargetHeadingZ);
+                    var turned = SpaceBattleMath.TurnTowards(
+                        current,
+                        target,
+                        SpaceBattleMath.MaximumTurnRadiansPerSecond * State.FixedDeltaSeconds,
+                        out var remainingRadians);
+                    var nextMotion = frame.Motion;
+                    nextMotion.CurrentHeadingX = turned.X;
+                    nextMotion.CurrentHeadingY = turned.Y;
+                    nextMotion.CurrentHeadingZ = turned.Z;
+                    nextMotion.RemainingTurnRadians = remainingRadians;
+                    motions[slot] = nextMotion;
+                    State.MarkModified(entityKey);
+                    clusterDirty = true;
+                    continue;
                 }
 
-                const float speed = 75f;
+                var shouldMove = mode == BehaviorMode.Tracking ||
+                                 (mode == BehaviorMode.Wandering &&
+                                  phase == BehaviorPhase.Flying &&
+                                  frame.Behavior.TicksRemaining > 0);
+                if (!shouldMove)
+                {
+                    continue;
+                }
+
+                var heading = new Vector3(
+                    frame.Motion.CurrentHeadingX,
+                    frame.Motion.CurrentHeadingY,
+                    frame.Motion.CurrentHeadingZ);
                 var bounds = SpaceBattleMath.MoveBounds(
                     frame.Hull.Bounds,
-                    headingX,
-                    headingY,
-                    speed,
+                    heading,
+                    frame.Motion.Speed,
                     State.FixedDeltaSeconds,
                     State.WorldWidth,
                     State.WorldHeight,
-                    out var resultingHeadingX,
-                    out var resultingHeadingY);
+                    State.WorldDepth,
+                    out var resultingHeading);
                 hulls[slot] = new Hull { Bounds = bounds };
-                motions[slot] = new Motion
-                {
-                    CurrentHeadingX = resultingHeadingX,
-                    CurrentHeadingY = resultingHeadingY,
-                    CurrentHeadingZ = 0f,
-                    TargetHeadingX = resultingHeadingX,
-                    TargetHeadingY = resultingHeadingY,
-                    TargetHeadingZ = 0f,
-                    Speed = speed,
-                    RemainingTurnRadians = 0f,
-                };
-                State.MarkModified(frame.EntityKey);
+                var movedMotion = frame.Motion;
+                movedMotion.CurrentHeadingX = resultingHeading.X;
+                movedMotion.CurrentHeadingY = resultingHeading.Y;
+                movedMotion.CurrentHeadingZ = resultingHeading.Z;
+                movedMotion.TargetHeadingX = resultingHeading.X;
+                movedMotion.TargetHeadingY = resultingHeading.Y;
+                movedMotion.TargetHeadingZ = resultingHeading.Z;
+                movedMotion.RemainingTurnRadians = 0f;
+                motions[slot] = movedMotion;
+                State.MarkModified(entityKey);
+                clusterDirty = true;
             }
 
-            clusters.MarkCurrentDirty();
+            if (clusterDirty)
+            {
+                clusters.MarkCurrentDirty();
+            }
         }
     }
 }
