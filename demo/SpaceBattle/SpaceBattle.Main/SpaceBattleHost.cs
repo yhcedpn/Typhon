@@ -7,7 +7,6 @@ namespace SpaceBattle;
 internal static class SpaceBattleHost
 {
     private const int ProgressBatchSize = 2_048;
-    private const int MaximumWorkerCount = 8;
 
     public static SpaceBattleRunResult Run(
         SimulationDefinition definition,
@@ -23,6 +22,23 @@ internal static class SpaceBattleHost
         ISpaceBattleObservationSink observationSink)
         => RunCore(definition, databaseRoot, cancellationToken, observationSink, runSimulation: false);
 
+    public static SpaceBattleDeterminismDiagnostic RunDeterminismDiagnostic(
+        SimulationDefinition definition,
+        string databaseRoot,
+        CancellationToken cancellationToken,
+        ISpaceBattleObservationSink observationSink)
+    {
+        ArgumentNullException.ThrowIfNull(definition);
+        if (definition.WorkerCount <= 0)
+        {
+            throw new ArgumentException("复现诊断必须显式指定正数 worker 数。", nameof(definition));
+        }
+
+        var result = Run(definition, databaseRoot, cancellationToken, observationSink);
+        var snapshot = ReadSnapshot(definition, databaseRoot);
+        return SpaceBattleDeterminismDiagnostic.Capture(definition, result, snapshot);
+    }
+
     public static SpaceBattleSnapshot ReadSnapshot(
         SimulationDefinition definition,
         string databaseRoot)
@@ -33,6 +49,12 @@ internal static class SpaceBattleHost
 
         var databaseDirectory = SpaceBattlePaths.DatabaseDirectory(databaseRoot);
         using var engine = SpaceBattleDatabase.Open(definition, databaseDirectory);
+        return ReadSnapshotFromOpenEngine(engine);
+
+    }
+
+    private static SpaceBattleSnapshot ReadSnapshotFromOpenEngine(DatabaseEngine engine)
+    {
         using var transaction = engine.CreateReadOnlyTransaction();
         var ids = transaction.QueryExact<Ship>().Execute().ToList();
         ids.Sort(static (left, right) => left.EntityKey.CompareTo(right.EntityKey));
@@ -178,18 +200,21 @@ internal static class SpaceBattleHost
             };
         }
 
-        var workerCount = ResolveWorkerCount();
-        using var state = new SpaceBattleSimulationState(engine, definition, observationSink, workerCount);
+        var workerCount = ResolveWorkerCount(definition);
+        var finalTickObservationSink = new FinalTickObservationSink(
+            observationSink,
+            definition.MaximumCompletedTicks);
+        using var state = new SpaceBattleSimulationState(engine, definition, finalTickObservationSink, workerCount);
         var runtimeOptions = new RuntimeOptions
         {
-            BaseTickRate = SimulationDefinition.FixedTickRate,
+            BaseTickRate = definition.TickRate,
             WorkerCount = workerCount,
             EnableParallelFence = true,
             AdaptiveFenceCost = false,
             SystemExceptionPolicy = SystemExceptionPolicy.AbortTickAndStop,
             Overload = new OverloadOptions
             {
-                MinTickRateHz = SimulationDefinition.FixedTickRate,
+                MinTickRateHz = definition.TickRate,
             },
         };
 
@@ -207,7 +232,7 @@ internal static class SpaceBattleHost
         }
         using (var runtime = TyphonRuntime.Create(
                    engine,
-                   schedule => BuildSchedule(schedule, state, timing),
+                   schedule => BuildSchedule(schedule, state, timing, definition.WorkerCount > 0),
                    runtimeOptions))
         {
             runtime.OnTickAborted += (abortedRuntime, outcome) =>
@@ -253,7 +278,8 @@ internal static class SpaceBattleHost
                     cancellationToken,
                     ReadFatalOutcome,
                     () => Volatile.Read(ref cancellationRequestedAtCompletedTicks),
-                    () => Volatile.Read(ref cancellationRequestedAtRuntimeTick));
+                    () => Volatile.Read(ref cancellationRequestedAtRuntimeTick),
+                    definition.WorkerCount > 0);
             }
             finally
             {
@@ -265,7 +291,8 @@ internal static class SpaceBattleHost
                         runtime,
                         state.CompletedTicks,
                         runtime.CurrentTickNumber,
-                        ReadFatalOutcome);
+                        ReadFatalOutcome,
+                        definition.WorkerCount > 0);
                     observedFatal = ReadFatalOutcome();
                 }
 
@@ -288,7 +315,15 @@ internal static class SpaceBattleHost
                 finalFatalOutcome = fatalOutcome;
             }
 
-            var remainingShips = ReadShipCountFromOpenEngine(engine);
+            ReapDeadShips(engine, state.CompletedTicks);
+            var committedSnapshot = ReadSnapshotFromOpenEngine(engine);
+            var finalSnapshot = new SpaceBattleSnapshot(
+                committedSnapshot.Ships
+                    .Where(static ship => ship.Vitals.CurrentHealth > 0)
+                    .ToArray());
+            // Observe 在 tick 事务 flush 前执行；最终结果必须读取 flush 后的数据库组件，而不是旧镜像。
+            finalTickObservationSink.PublishCommittedSnapshot(finalSnapshot);
+            var remainingShips = finalSnapshot.Ships.Count;
             state.ReleaseAllAcquisitionTransactions();
             var termination = ResolveTerminationReason(
                 requestedTermination,
@@ -305,7 +340,7 @@ internal static class SpaceBattleHost
             {
                 CompletedTicks = state.CompletedTicks,
                 RemainingShips = remainingShips,
-                PublishedSnapshot = state.BuildPublishedSnapshot(),
+                PublishedSnapshot = finalSnapshot,
                 TerminationReason = termination,
                 FatalOutcome = finalFatalOutcome,
                 FailedSystemName = finalFatalOutcome?.FailedSystemName,
@@ -319,7 +354,8 @@ internal static class SpaceBattleHost
     private static void BuildSchedule(
         RuntimeSchedule schedule,
         SpaceBattleSimulationState state,
-        TickTiming timing)
+        TickTiming timing,
+        bool resetAcquisitionTransactions)
     {
         var dag = schedule.PublicTrack.DeclareDag("SpaceBattle")
             .Phases(
@@ -329,6 +365,11 @@ internal static class SpaceBattleHost
                 SpaceBattlePhases.Movement,
                 SpaceBattlePhases.Reap,
                 SpaceBattlePhases.Observe);
+        if (resetAcquisitionTransactions)
+        {
+            dag.Add(new DeterminismAcquisitionResetSystem(state));
+        }
+
         dag.Add(new FramePrepareSystem(state));
         dag.Add(new PublishSystem(state));
         dag.Add(new BehaviorSystem(state));
@@ -347,7 +388,8 @@ internal static class SpaceBattleHost
         CancellationToken cancellationToken,
         Func<TickOutcome?> readFatalOutcome,
         Func<long> readCancellationCompletedTicks,
-        Func<long> readCancellationRuntimeTick)
+        Func<long> readCancellationRuntimeTick,
+        bool highPrecisionWait)
     {
         var observedCompletedTicks = state.CompletedTicks;
         while (true)
@@ -381,12 +423,20 @@ internal static class SpaceBattleHost
                     runtime,
                     completedTicksAtRequest >= 0 ? completedTicksAtRequest : completedTicks,
                     runtimeTickAtRequest >= 0 ? runtimeTickAtRequest : runtime.CurrentTickNumber,
-                    readFatalOutcome);
+                    readFatalOutcome,
+                    highPrecisionWait);
                 return readFatalOutcome().HasValue
                     ? SpaceBattleTerminationReason.Fatal
                     : SpaceBattleTerminationReason.Cancelled;
             }
-            Thread.Sleep(1);
+            if (highPrecisionWait)
+            {
+                Thread.SpinWait(1_000);
+            }
+            else
+            {
+                Thread.Sleep(1);
+            }
         }
     }
 
@@ -395,7 +445,8 @@ internal static class SpaceBattleHost
         TyphonRuntime runtime,
         long completedTicksAtRequest,
         long runtimeTickAtRequest,
-        Func<TickOutcome?> readFatalOutcome)
+        Func<TickOutcome?> readFatalOutcome,
+        bool highPrecisionWait)
     {
         var targetCompletedTicks = completedTicksAtRequest;
         if (state.IsTickInFlight && runtimeTickAtRequest >= completedTicksAtRequest)
@@ -423,7 +474,14 @@ internal static class SpaceBattleHost
                 return;
             }
 
-            Thread.Sleep(1);
+            if (highPrecisionWait)
+            {
+                Thread.SpinWait(1_000);
+            }
+            else
+            {
+                Thread.Sleep(1);
+            }
         }
     }
 
@@ -509,13 +567,43 @@ internal static class SpaceBattleHost
         });
     }
 
-    private static int ResolveWorkerCount() =>
-        Math.Max(1, Math.Min(MaximumWorkerCount, Environment.ProcessorCount - 4));
+    private static int ResolveWorkerCount(SimulationDefinition definition) =>
+        definition.WorkerCount == SimulationDefinition.AutomaticWorkerCount
+            ? Math.Max(1, Math.Min(SimulationDefinition.MaximumWorkerCount, Environment.ProcessorCount - 4))
+            : definition.WorkerCount;
 
     private static int ReadShipCountFromOpenEngine(DatabaseEngine engine)
     {
         using var transaction = engine.CreateReadOnlyTransaction();
         return transaction.QueryExact<Ship>().Count();
+    }
+
+    // runtime 可能在 Observe 后停止，补做一次幂等回收，避免零血实体留在最终数据库快照中。
+    private static void ReapDeadShips(DatabaseEngine engine, long tickNumber)
+    {
+        using var readTransaction = engine.CreateReadOnlyTransaction();
+        var deadIds = new List<EntityId>();
+        foreach (var entityId in readTransaction.QueryExact<Ship>().Execute())
+        {
+            if (readTransaction.Open(entityId).Read(Ship.Vitals).CurrentHealth == 0)
+            {
+                deadIds.Add(entityId);
+            }
+        }
+
+        if (deadIds.Count == 0)
+        {
+            return;
+        }
+
+        using var transaction = engine.CreateQuickTransaction(DurabilityMode.Immediate);
+        transaction.DestroyBatch(deadIds.ToArray().AsSpan());
+        if (!transaction.Commit())
+        {
+            throw new InvalidOperationException("SpaceBattle 终态死船回收事务提交失败。");
+        }
+
+        engine.WriteTickFence(tickNumber);
     }
 
     private static void Bootstrap(

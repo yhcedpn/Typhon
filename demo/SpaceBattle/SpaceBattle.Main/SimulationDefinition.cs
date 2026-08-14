@@ -12,6 +12,8 @@ public sealed record SimulationDefinition
     public const float FixedSimulationDeltaSeconds = 0.04f;
     public const ulong DefaultMaximumCompletedTicks = 22_500;
     public const float DefaultSpatialCellSize = 100f;
+    public const int AutomaticWorkerCount = -1;
+    public const int MaximumWorkerCount = 8;
 
     public static SimulationDefinition Default { get; } = new();
 
@@ -29,6 +31,7 @@ public sealed record SimulationDefinition
         FixedDeltaSeconds = FixedSimulationDeltaSeconds;
         MaximumCompletedTicks = DefaultMaximumCompletedTicks;
         SpatialCellSize = DefaultSpatialCellSize;
+        WorkerCount = AutomaticWorkerCount;
     }
 
     public SimulationDefinition(
@@ -43,7 +46,8 @@ public sealed record SimulationDefinition
         ulong maximumCompletedTicks = DefaultMaximumCompletedTicks,
         float spatialCellSize = DefaultSpatialCellSize,
         string runName = "test",
-        uint rulesetVersion = 1)
+        uint rulesetVersion = 1,
+        int workerCount = AutomaticWorkerCount)
     {
         RunName = runName;
         ShipCount = shipCount;
@@ -57,6 +61,7 @@ public sealed record SimulationDefinition
         FixedDeltaSeconds = fixedDeltaSeconds;
         MaximumCompletedTicks = maximumCompletedTicks;
         SpatialCellSize = spatialCellSize;
+        WorkerCount = workerCount;
     }
 
     public string RunName { get; init; }
@@ -71,6 +76,9 @@ public sealed record SimulationDefinition
     public float FixedDeltaSeconds { get; init; }
     public ulong MaximumCompletedTicks { get; init; }
     public float SpatialCellSize { get; init; }
+
+    // -1 保留运行时自动拓扑；正数用于固定 worker 拓扑复现诊断。
+    public int WorkerCount { get; init; }
 
     public float WorldSizeX => WorldWidth;
     public float WorldSizeY => WorldHeight;
@@ -88,6 +96,14 @@ public sealed record SimulationDefinition
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(FixedDeltaSeconds);
         ArgumentOutOfRangeException.ThrowIfZero(MaximumCompletedTicks);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(SpatialCellSize);
+
+        if (WorkerCount < AutomaticWorkerCount || WorkerCount == 0 || WorkerCount > MaximumWorkerCount)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(WorkerCount),
+                WorkerCount,
+                $"worker 数必须为 {AutomaticWorkerCount} 或 1 到 {MaximumWorkerCount}。 ");
+        }
 
         if (!float.IsFinite(WorldWidth) || !float.IsFinite(WorldHeight) || !float.IsFinite(WorldDepth) ||
             !float.IsFinite(FixedDeltaSeconds) || !float.IsFinite(SpatialCellSize))
