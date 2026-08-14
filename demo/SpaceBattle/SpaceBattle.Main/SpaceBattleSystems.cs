@@ -71,7 +71,13 @@ internal sealed class FramePrepareSystem : ChunkedCallbackSystem
 
     protected override void Execute(TickContext ctx)
     {
+        var startedAt = Stopwatch.GetTimestamp();
         _state.PrepareTick(ctx.TickNumber);
+        _state.RecordSystemMetric(
+            SpaceBattleSystemMetricId.FramePrepare,
+            startedAt,
+            _state.PublishedShipCount,
+            ctx.WorkerId);
     }
 }
 
@@ -88,6 +94,7 @@ internal sealed class PublishSystem : ShipChunkSystem
 
     protected override void Execute(TickContext ctx)
     {
+        var startedAt = Stopwatch.GetTimestamp();
         using var clusters = OpenClusters(ctx);
         foreach (var cluster in clusters)
         {
@@ -119,6 +126,8 @@ internal sealed class PublishSystem : ShipChunkSystem
                     behaviors[slot]));
             }
         }
+
+        State.RecordSystemMetric(SpaceBattleSystemMetricId.Publish, startedAt, State.PublishedShipCount, ctx.WorkerId);
     }
 }
 
@@ -137,6 +146,7 @@ internal sealed class BehaviorSystem : ShipChunkSystem
 
     protected override void Execute(TickContext ctx)
     {
+        var startedAt = Stopwatch.GetTimestamp();
         Span<ShipSnapshot> trackingSources = stackalloc ShipSnapshot[MaximumClusterSize];
         Span<int> trackingSlots = stackalloc int[MaximumClusterSize];
         Span<TargetingResult> trackingResults = stackalloc TargetingResult[MaximumClusterSize];
@@ -217,8 +227,8 @@ internal sealed class BehaviorSystem : ShipChunkSystem
                             ref nextBehavior);
                         break;
                 }
-
                 if (WriteBehaviorChanges(
+                        ctx.WorkerId,
                         entityKey,
                         slot,
                         frame,
@@ -257,6 +267,7 @@ internal sealed class BehaviorSystem : ShipChunkSystem
                         ref nextTargeting,
                         ref nextBehavior);
                     if (WriteBehaviorChanges(
+                            ctx.WorkerId,
                             source.EntityKey,
                             slot,
                             source,
@@ -282,14 +293,21 @@ internal sealed class BehaviorSystem : ShipChunkSystem
         {
             State.ReleaseAcquisitionTransactionIfOwnedByCurrentThread(ctx.WorkerId);
         }
+
+        State.RecordSystemMetric(SpaceBattleSystemMetricId.Behavior, startedAt, State.PublishedShipCount, ctx.WorkerId);
     }
 
     private void EmitWeaponUse(TickContext ctx, in ShipSnapshot source)
     {
         if (!SpaceBattleCombat.IsWeaponUseTick(
                 source.EntityKey,
-                ctx.TickNumber - source.Behavior.ModeStartedTick) ||
-            !SpaceBattleTargeting.TryReadTarget(State, source, out var target, out var distanceSquared))
+                ctx.TickNumber - source.Behavior.ModeStartedTick))
+        {
+            return;
+        }
+
+        State.RecordWeaponUse();
+        if (!SpaceBattleTargeting.TryReadTarget(State, source, out var target, out var distanceSquared))
         {
             return;
         }
@@ -297,6 +315,7 @@ internal sealed class BehaviorSystem : ShipChunkSystem
         var damage = SpaceBattleCombat.DamageForDistance(distanceSquared);
         if (damage != 0)
         {
+            State.RecordInRangeAttack();
             State.RecordIncomingDamage(ctx.WorkerId, target.EntityKey, damage);
         }
     }
@@ -507,8 +526,8 @@ internal sealed class BehaviorSystem : ShipChunkSystem
                 break;
         }
     }
-
     private bool WriteBehaviorChanges(
+        int workerId,
         long entityKey,
         int slot,
         in ShipSnapshot frame,
@@ -529,7 +548,8 @@ internal sealed class BehaviorSystem : ShipChunkSystem
         motions[slot] = nextMotion;
         targetings[slot] = nextTargeting;
         behaviors[slot] = nextBehavior;
-        State.MarkModified(entityKey);
+        State.UpdateFrameBehavior(entityKey, nextMotion, nextTargeting, nextBehavior);
+        State.MarkModified(workerId, entityKey);
         return true;
     }
 
@@ -566,6 +586,7 @@ internal sealed class DamageSystem : ShipChunkSystem
 
     protected override void Execute(TickContext ctx)
     {
+        var startedAt = Stopwatch.GetTimestamp();
         using var clusters = OpenClusters(ctx);
         while (clusters.MoveNext())
         {
@@ -597,13 +618,14 @@ internal sealed class DamageSystem : ShipChunkSystem
                 {
                     continue;
                 }
-
                 vitals[slot] = new Vitals { CurrentHealth = nextHealth };
                 State.UpdateFrameHealth(entityKey, nextHealth);
-                State.MarkModified(entityKey);
+                State.RecordDamage(incomingDamage);
+                State.MarkModified(ctx.WorkerId, entityKey);
                 clusterDirty = true;
                 if (nextHealth == 0)
                 {
+                    State.RecordDeath();
                     // 本 tick 后续 Movement 通过已更新的 frame health 跳过该飞船，Reap 再统一销毁。
                     State.MarkForReap(ctx.WorkerId, entityKey);
                 }
@@ -614,6 +636,7 @@ internal sealed class DamageSystem : ShipChunkSystem
                 clusters.MarkCurrentDirty();
             }
         }
+        State.RecordSystemMetric(SpaceBattleSystemMetricId.Damage, startedAt, State.PublishedShipCount, ctx.WorkerId);
     }
 }
 
@@ -636,7 +659,9 @@ internal sealed class DamageCleanupSystem : ChunkedCallbackSystem
 
     protected override void Execute(TickContext ctx)
     {
+        var startedAt = Stopwatch.GetTimestamp();
         _state.ClearIncomingDamage();
+        _state.RecordSystemMetric(SpaceBattleSystemMetricId.DamageCleanup, startedAt, _state.PublishedShipCount, ctx.WorkerId);
     }
 }
 
@@ -656,6 +681,7 @@ internal sealed class MovementSystem : ShipChunkSystem
 
     protected override void Execute(TickContext ctx)
     {
+        var startedAt = Stopwatch.GetTimestamp();
         using var clusters = OpenClusters(ctx);
         while (clusters.MoveNext())
         {
@@ -703,7 +729,8 @@ internal sealed class MovementSystem : ShipChunkSystem
                     nextMotion.CurrentHeadingZ = turned.Z;
                     nextMotion.RemainingTurnRadians = remainingRadians;
                     motions[slot] = nextMotion;
-                    State.MarkModified(entityKey);
+                    State.UpdateFrameMovement(entityKey, frame.Hull, nextMotion);
+                    State.MarkModified(ctx.WorkerId, entityKey);
                     clusterDirty = true;
                     continue;
                 }
@@ -730,7 +757,8 @@ internal sealed class MovementSystem : ShipChunkSystem
                     nextMotion.CurrentHeadingZ = turned.Z;
                     nextMotion.RemainingTurnRadians = remainingRadians;
                     motions[slot] = nextMotion;
-                    State.MarkModified(entityKey);
+                    State.UpdateFrameMovement(entityKey, frame.Hull, nextMotion);
+                    State.MarkModified(ctx.WorkerId, entityKey);
                     clusterDirty = true;
                     continue;
                 }
@@ -798,7 +826,8 @@ internal sealed class MovementSystem : ShipChunkSystem
                     ? nextMotionForTurn.RemainingTurnRadians
                     : 0f;
                 motions[slot] = nextMotionForTurn;
-                State.MarkModified(entityKey);
+                State.UpdateFrameMovement(entityKey, hulls[slot], nextMotionForTurn);
+                State.MarkModified(ctx.WorkerId, entityKey);
                 clusterDirty = true;
             }
 
@@ -807,6 +836,7 @@ internal sealed class MovementSystem : ShipChunkSystem
                 clusters.MarkCurrentDirty();
             }
         }
+        State.RecordSystemMetric(SpaceBattleSystemMetricId.Movement, startedAt, State.PublishedShipCount, ctx.WorkerId);
     }
 }
 
@@ -831,9 +861,11 @@ internal sealed class ReapSystem : ChunkedCallbackSystem
 
     protected override void Execute(TickContext ctx)
     {
+        var startedAt = Stopwatch.GetTimestamp();
         var count = _state.CopyPendingReaps(_reapBuffer);
         if (count == 0)
         {
+            _state.RecordSystemMetric(SpaceBattleSystemMetricId.Reap, startedAt, _state.PublishedShipCount, ctx.WorkerId);
             return;
         }
 
@@ -845,6 +877,7 @@ internal sealed class ReapSystem : ChunkedCallbackSystem
         }
 
         _state.CompleteReaps();
+        _state.RecordSystemMetric(SpaceBattleSystemMetricId.Reap, startedAt, _state.PublishedShipCount, ctx.WorkerId);
     }
 }
 
@@ -867,10 +900,13 @@ internal sealed class AcquisitionCleanupSystem : ChunkedCallbackSystem
 
     protected override void Execute(TickContext ctx)
     {
+        var startedAt = Stopwatch.GetTimestamp();
         if (ctx.TickNumber + 1 == (long)_state.MaximumCompletedTicks)
         {
             _state.ReleaseAcquisitionTransactionIfOwnedByCurrentThread(ctx.WorkerId);
         }
+
+        _state.RecordSystemMetric(SpaceBattleSystemMetricId.AcquisitionCleanup, startedAt, _state.PublishedShipCount, ctx.WorkerId);
     }
 }
 
@@ -895,8 +931,9 @@ internal sealed class ObserveSystem : ChunkedCallbackSystem
 
     protected override void Execute(TickContext ctx)
     {
-        _timing.RecordTick(Stopwatch.GetElapsedTime(_state.TickStartedAt));
-        _state.CompleteTick(ctx.TickNumber);
+        var startedAt = Stopwatch.GetTimestamp();
+        _state.CompleteTick(ctx.TickNumber, _timing);
+        _state.RecordSystemMetric(SpaceBattleSystemMetricId.Observe, startedAt, _state.PublishedShipCount, ctx.WorkerId);
     }
 }
 

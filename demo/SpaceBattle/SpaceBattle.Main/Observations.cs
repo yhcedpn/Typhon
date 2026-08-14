@@ -34,7 +34,13 @@ public sealed record SimulationTickCompleted(
     long TickNumber,
     int ShipCount,
     TimeSpan Duration,
-    SpaceBattleSnapshot PublishedSnapshot) : SpaceBattleObservation;
+    SpaceBattleSnapshot PublishedSnapshot) : SpaceBattleObservation
+{
+    public SpaceBattleTelemetrySnapshot Telemetry { get; init; }
+}
+
+public sealed record SimulationTelemetrySample(
+    SpaceBattleTelemetrySnapshot Telemetry) : SpaceBattleObservation;
 
 public sealed record SimulationCompleted(
     long CompletedTicks,
@@ -43,6 +49,7 @@ public sealed record SimulationCompleted(
     SpaceBattleSnapshot PublishedSnapshot) : SpaceBattleObservation
 {
     public SpaceBattleTerminationReason TerminationReason { get; init; }
+    public SpaceBattleTelemetrySnapshot Telemetry { get; init; }
 
     public string FailedSystemName { get; init; }
 
@@ -56,7 +63,26 @@ public sealed record TickPerformanceSnapshot(
     double P50Milliseconds,
     double P95Milliseconds,
     double P99Milliseconds,
-    double MaximumMilliseconds);
+    double MaximumMilliseconds)
+{
+    public long Over40Milliseconds { get; init; }
+
+    public long Over40MsCount => Over40Milliseconds;
+
+    public double ActualHz { get; init; }
+
+    public double ActualHertz => ActualHz;
+
+    public string Overload { get; init; } = "none";
+
+    public int TickMultiplier { get; init; } = 1;
+
+    public int WorkerCount { get; init; }
+
+    public int SystemCount { get; init; }
+
+    public IReadOnlyList<SpaceBattleSystemTelemetrySnapshot> SystemMetrics { get; init; } = [];
+}
 
 public sealed record SpaceBattleRunResult(
     string DatabaseDirectory,
@@ -64,6 +90,9 @@ public sealed record SpaceBattleRunResult(
     TimeSpan BootstrapDuration,
     TickPerformanceSnapshot TickPerformance)
 {
+    public SpaceBattleTelemetrySnapshot Telemetry { get; init; }
+
+    public string TraceFilePath { get; init; }
     public long CompletedTicks { get; init; }
 
     public int RemainingShips { get; init; }

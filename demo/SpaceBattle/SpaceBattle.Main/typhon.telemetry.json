@@ -1,0 +1,13 @@
+{
+  "_comment": "SpaceBattle 默认不启用完整 profiler。诊断时取消 Trace 注释并重启程序，即可写入固定 trace 文件。",
+  "Typhon": {
+    "Profiler": {
+      "Enabled": false,
+      "GcTracing": { "Enabled": false },
+      "MemoryAllocations": { "Enabled": false },
+      "CpuSampling": { "Enabled": false },
+      "Gauges": { "Enabled": false },
+      // "Trace": "trace/space-battle.typhon-trace"
+    }
+  }
+}

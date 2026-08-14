@@ -13,21 +13,23 @@ internal static class Program
             cancellation.Cancel();
         };
 
+        var sink = new ConsoleObservationSink();
         try
         {
             var result = SpaceBattleHost.Run(
                 SimulationDefinition.Default,
                 SpaceBattlePaths.ProductionDatabaseRoot,
                 cancellation.Token,
-                new ConsoleObservationSink());
+                sink);
 
             Console.WriteLine(
                 $"termination={FormatTermination(result.TerminationReason)} " +
-                $"bootstrap_ships={result.ShipCount.ToString(CultureInfo.InvariantCulture)} " +
-                $"completed_ticks={result.CompletedTicks.ToString(CultureInfo.InvariantCulture)} " +
-                $"remaining_ships={result.RemainingShips.ToString(CultureInfo.InvariantCulture)} " +
-                $"bootstrap_ms={result.BootstrapDuration.TotalMilliseconds.ToString("F3", CultureInfo.InvariantCulture)} " +
-                $"database={result.DatabaseDirectory}");
+                $"bootstrap_ships={Format(result.ShipCount)} " +
+                $"completed_ticks={Format(result.CompletedTicks)} " +
+                $"remaining_ships={Format(result.RemainingShips)} " +
+                $"bootstrap_ms={Format(result.BootstrapDuration.TotalMilliseconds)} " +
+                $"database={Path.GetFullPath(result.DatabaseDirectory)} " +
+                $"trace={SpaceBattlePaths.ConfiguredTraceFilePath()}");
             if (result.IsFatal)
             {
                 Console.Error.WriteLine($"fatal_system={result.FailedSystemName ?? "<unknown>"}");
@@ -40,7 +42,10 @@ internal static class Program
         catch (OperationCanceledException)
         {
             // 仅作为 bootstrap 之外的最后防线；正常 Ctrl+C 会由 Host 返回结构化结果。
-            Console.WriteLine("termination=cancelled completed_ticks=0 remaining_ships=0");
+            Console.WriteLine(
+                $"termination=cancelled completed_ticks=0 remaining_ships=0 " +
+                $"database={Path.GetFullPath(SpaceBattlePaths.DatabaseDirectory(SpaceBattlePaths.ProductionDatabaseRoot))} " +
+                $"trace={SpaceBattlePaths.ConfiguredTraceFilePath()}");
             return 0;
         }
     }
@@ -56,15 +61,38 @@ internal static class Program
         _ => "unknown",
     };
 
+    private static string Format(long value) => value.ToString(CultureInfo.InvariantCulture);
+
+    private static string Format(int value) => value.ToString(CultureInfo.InvariantCulture);
+
+    private static string Format(double value) => value.ToString("F3", CultureInfo.InvariantCulture);
+
     private sealed class ConsoleObservationSink : ISpaceBattleObservationSink
     {
+        private long _lastPrintedTick = -1;
+
         public void Publish(SpaceBattleObservation observation)
         {
-            if (observation is InitializationCompleted completed)
+            switch (observation)
             {
-                Console.WriteLine(
-                    $"initialization_completed=true ships={completed.ShipCount.ToString(CultureInfo.InvariantCulture)} " +
-                    $"bootstrap_ms={completed.BootstrapDuration.TotalMilliseconds.ToString("F3", CultureInfo.InvariantCulture)}");
+                case InitializationCompleted completed:
+                    Console.WriteLine(
+                        $"initialization_completed=true ships={Format(completed.ShipCount)} " +
+                        $"bootstrap_ms={Format(completed.BootstrapDuration.TotalMilliseconds)} " +
+                        $"database={Path.GetFullPath(SpaceBattlePaths.DatabaseDirectory(SpaceBattlePaths.ProductionDatabaseRoot))} " +
+                        $"trace={SpaceBattlePaths.ConfiguredTraceFilePath()}");
+                    break;
+                case SimulationTickCompleted tick when
+                    tick.Telemetry is not null &&
+                    SpaceBattleTelemetrySampling.IsSampleTick(tick.TickNumber) &&
+                    Interlocked.Exchange(ref _lastPrintedTick, tick.TickNumber) != tick.TickNumber:
+                    Console.WriteLine(SpaceBattleTelemetryFormatter.Format(tick.Telemetry));
+                    break;
+                case SimulationTelemetrySample sample when
+                    SpaceBattleTelemetrySampling.IsSampleTick(sample.Telemetry.TickNumber) &&
+                    Interlocked.Exchange(ref _lastPrintedTick, sample.Telemetry.TickNumber) != sample.Telemetry.TickNumber:
+                    Console.WriteLine(SpaceBattleTelemetryFormatter.Format(sample.Telemetry));
+                    break;
             }
         }
     }

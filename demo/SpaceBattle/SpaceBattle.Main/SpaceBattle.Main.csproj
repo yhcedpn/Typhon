@@ -21,4 +21,7 @@
                       ReferenceOutputAssembly="false"
                       OutputItemType="Analyzer" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="typhon.telemetry.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>
