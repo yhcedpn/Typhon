@@ -199,6 +199,14 @@ internal sealed class BehaviorSystem : ShipChunkSystem
                             ref nextBehavior,
                             (BehaviorPhase)frame.Behavior.Phase);
                         break;
+                    case BehaviorMode.Turning:
+                        AdvanceTurning(
+                            ctx.TickNumber,
+                            entityKey,
+                            ref nextMotion,
+                            ref nextBehavior,
+                            (BehaviorPhase)frame.Behavior.Phase);
+                        break;
                     case BehaviorMode.Approaching:
                     case BehaviorMode.Attacking:
                         AdvanceTargetedMode(
@@ -326,12 +334,13 @@ internal sealed class BehaviorSystem : ShipChunkSystem
     {
         if (!SpaceBattleTargeting.TryReadTarget(State, source, out _, out var distanceSquared))
         {
-            // 目标失效的这一帧仍由 Movement 使用旧快照完成一次移动，然后回到锁定。
+            // 目标失效的这一帧清除锁定，Movement 仍用失效前的速度完成一次移动。
             targeting.TargetEntityId = 0;
-            behavior.Mode = (byte)BehaviorMode.Tracking;
+            behavior.Mode = (byte)BehaviorMode.Turning;
             behavior.Phase = (byte)BehaviorPhase.Ready;
             behavior.TicksRemaining = 0;
             behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
+            motion.RemainingTurnRadians = 0f;
             return;
         }
 
@@ -430,6 +439,63 @@ internal sealed class BehaviorSystem : ShipChunkSystem
                 if (behavior.TicksRemaining == 0)
                 {
                     behavior.Mode = (byte)BehaviorMode.Tracking;
+                    behavior.Phase = (byte)BehaviorPhase.Ready;
+                    behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
+                }
+                else
+                {
+                    behavior.TicksRemaining--;
+                }
+
+                break;
+        }
+    }
+
+    private void AdvanceTurning(
+        long tickNumber,
+        long entityKey,
+        ref Motion motion,
+        ref Behavior behavior,
+        BehaviorPhase phase)
+    {
+        var turnStep = SpaceBattleMath.MaximumTurnRadiansPerSecond * State.FixedDeltaSeconds;
+        switch (phase)
+        {
+            case BehaviorPhase.Ready:
+            {
+                var current = new Vector3(
+                    motion.CurrentHeadingX,
+                    motion.CurrentHeadingY,
+                    motion.CurrentHeadingZ);
+                var target = SpaceBattleMath.RandomTurnTarget(
+                    State.Seed,
+                    entityKey,
+                    behavior.ModeStartedTick,
+                    current,
+                    out var turnRadians);
+                motion.TargetHeadingX = target.X;
+                motion.TargetHeadingY = target.Y;
+                motion.TargetHeadingZ = target.Z;
+                motion.RemainingTurnRadians = turnRadians;
+                motion.Speed = 0f;
+                behavior.Phase = (byte)BehaviorPhase.Aligning;
+                behavior.TicksRemaining = 0;
+                break;
+            }
+            case BehaviorPhase.Aligning:
+                if (!float.IsFinite(motion.RemainingTurnRadians) || motion.RemainingTurnRadians <= turnStep)
+                {
+                    motion.RemainingTurnRadians = MathF.Max(0f, motion.RemainingTurnRadians);
+                    motion.Speed = SpaceBattleMath.EvasiveSpeed;
+                    behavior.Phase = (byte)BehaviorPhase.Flying;
+                    behavior.TicksRemaining = SpaceBattleMath.EvasiveFlightTicks;
+                }
+
+                break;
+            case BehaviorPhase.Flying:
+                if (behavior.TicksRemaining == 0)
+                {
+                    behavior.Mode = (byte)BehaviorMode.Wandering;
                     behavior.Phase = (byte)BehaviorPhase.Ready;
                     behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
                 }
@@ -642,12 +708,42 @@ internal sealed class MovementSystem : ShipChunkSystem
                     continue;
                 }
 
+                if (mode == BehaviorMode.Turning && phase == BehaviorPhase.Aligning)
+                {
+                    var current = new Vector3(
+                        frame.Motion.CurrentHeadingX,
+                        frame.Motion.CurrentHeadingY,
+                        frame.Motion.CurrentHeadingZ);
+                    var target = new Vector3(
+                        frame.Motion.TargetHeadingX,
+                        frame.Motion.TargetHeadingY,
+                        frame.Motion.TargetHeadingZ);
+                    var turned = SpaceBattleMath.TurnAlongGreatCircle(
+                        current,
+                        target,
+                        frame.Motion.RemainingTurnRadians,
+                        SpaceBattleMath.MaximumTurnRadiansPerSecond * State.FixedDeltaSeconds,
+                        out var remainingRadians);
+                    var nextMotion = motions[slot];
+                    nextMotion.CurrentHeadingX = turned.X;
+                    nextMotion.CurrentHeadingY = turned.Y;
+                    nextMotion.CurrentHeadingZ = turned.Z;
+                    nextMotion.RemainingTurnRadians = remainingRadians;
+                    motions[slot] = nextMotion;
+                    State.MarkModified(entityKey);
+                    clusterDirty = true;
+                    continue;
+                }
+
                 var isTargeted = mode is BehaviorMode.Approaching or BehaviorMode.Attacking;
                 var shouldMove = mode == BehaviorMode.Tracking ||
                                  isTargeted ||
                                  (mode == BehaviorMode.Wandering &&
                                   phase == BehaviorPhase.Flying &&
-                                  frame.Behavior.TicksRemaining > 0);
+                                  frame.Behavior.TicksRemaining > 0) ||
+                                 (mode == BehaviorMode.Turning
+                                  && phase == BehaviorPhase.Flying
+                                  && frame.Behavior.TicksRemaining > 0);
                 if (!shouldMove)
                 {
                     continue;

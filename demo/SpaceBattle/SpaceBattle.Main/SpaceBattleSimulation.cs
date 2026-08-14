@@ -561,6 +561,8 @@ internal enum SpaceBattleRandomPurpose : ulong
     WanderHeading = 0x8C31_5A72_D4E6_109FUL,
     WanderSpeed = 0xE27B_4390_6D1F_A508UL,
     WeaponPhase = 0xC49E_2D17_6A83_F051UL,
+    TurnHeading = 0x3B7E_91D4_0A62_F5C8UL,
+    TurnAngle = 0xF1C3_58A7_2D49_806EUL,
 }
 
 internal static class SpaceBattleMath
@@ -568,6 +570,12 @@ internal static class SpaceBattleMath
     public const float MaximumWanderSpeed = 200f;
     public const float MaximumTurnRadiansPerSecond = 1f;
     public const ushort WanderFlightTicks = 50;
+    public const float EvasiveSpeed = 100f;
+    public const ushort EvasiveFlightTicks = 25;
+    public const float MinimumTurnDegrees = 50f;
+    public const float MaximumTurnDegrees = 300f;
+    public const float MinimumTurnRadians = MinimumTurnDegrees * MathF.PI / 180f;
+    public const float MaximumTurnRadians = MaximumTurnDegrees * MathF.PI / 180f;
 
     private const float TwoPi = 2f * MathF.PI;
     private const float UnitFloatScale = 1f / 16_777_216f;
@@ -617,6 +625,32 @@ internal static class SpaceBattleMath
             z);
     }
 
+    public static float RandomTurnRadians(ulong seed, long entityKey, ulong modeStartedTick) =>
+        MinimumTurnRadians
+        + (DeriveUnitFloat(seed, entityKey, modeStartedTick, SpaceBattleRandomPurpose.TurnAngle)
+           * (MaximumTurnRadians - MinimumTurnRadians));
+
+    public static Vector3 RandomTurnTarget(
+        ulong seed,
+        long entityKey,
+        ulong modeStartedTick,
+        Vector3 current,
+        out float turnRadians)
+    {
+        var from = NormalizeOrFallback(current, Vector3.UnitX);
+        turnRadians = RandomTurnRadians(seed, entityKey, modeStartedTick);
+        var basis = MathF.Abs(from.X) < 0.9f ? Vector3.UnitX : Vector3.UnitY;
+        var firstPerpendicular = NormalizeOrFallback(Vector3.Cross(from, basis), Vector3.UnitZ);
+        var secondPerpendicular = NormalizeOrFallback(Vector3.Cross(from, firstPerpendicular), Vector3.UnitZ);
+        var azimuth = DeriveUnitFloat(seed, entityKey, modeStartedTick, SpaceBattleRandomPurpose.TurnHeading) * TwoPi;
+        var perpendicular = NormalizeOrFallback(
+            (firstPerpendicular * MathF.Cos(azimuth)) + (secondPerpendicular * MathF.Sin(azimuth)),
+            firstPerpendicular);
+        return NormalizeOrFallback(
+            (from * MathF.Cos(turnRadians)) + (perpendicular * MathF.Sin(turnRadians)),
+            from);
+    }
+
     public static float RandomWanderSpeed(ulong seed, long entityKey, ulong modeStartedTick)
         => DeriveUnitFloat(seed, entityKey, modeStartedTick, SpaceBattleRandomPurpose.WanderSpeed) * MaximumWanderSpeed;
 
@@ -654,6 +688,48 @@ internal static class SpaceBattleMath
         return NormalizeOrFallback(
             (from * MathF.Cos(maximumRadians)) + (perpendicular * MathF.Sin(maximumRadians)),
             to);
+    }
+
+    public static Vector3 TurnAlongGreatCircle(
+        Vector3 current,
+        Vector3 target,
+        float remainingRadians,
+        float maximumRadians,
+        out float nextRemainingRadians)
+    {
+        var from = NormalizeOrFallback(current, Vector3.UnitX);
+        var to = NormalizeOrFallback(target, from);
+        if (!float.IsFinite(remainingRadians) || remainingRadians <= 0f
+            || !float.IsFinite(maximumRadians) || maximumRadians <= 0f)
+        {
+            nextRemainingRadians = 0f;
+            return to;
+        }
+
+        if (remainingRadians <= maximumRadians)
+        {
+            nextRemainingRadians = 0f;
+            return target;
+        }
+
+        var axis = Vector3.Cross(from, to);
+        if (axis.LengthSquared() <= VectorEpsilonSquared)
+        {
+            var basis = MathF.Abs(from.X) < 0.9f ? Vector3.UnitX : Vector3.UnitY;
+            axis = Vector3.Cross(from, basis);
+        }
+
+        axis = NormalizeOrFallback(axis, Vector3.UnitZ);
+        if (remainingRadians > MathF.PI)
+        {
+            axis = -axis;
+        }
+
+        var cosine = MathF.Cos(maximumRadians);
+        var sine = MathF.Sin(maximumRadians);
+        var turned = (from * cosine) + (Vector3.Cross(axis, from) * sine);
+        nextRemainingRadians = remainingRadians - maximumRadians;
+        return NormalizeOrFallback(turned, to);
     }
 
     public static AABB3F MoveBounds(

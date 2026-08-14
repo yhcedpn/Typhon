@@ -67,6 +67,57 @@ public sealed class TargetingTests
     }
 
     [Test]
+    public void TryReadTarget_UsesDeathAndStrictLockRangeBoundary()
+    {
+        var definition = new SimulationDefinition(
+            shipCount: 2,
+            worldWidth: 1_000f,
+            worldHeight: 1_000f,
+            worldDepth: 400f,
+            maximumCompletedTicks: 1);
+        SpaceBattleHost.BootstrapOnly(definition, _root, CancellationToken.None, new RecordingSink());
+        using var engine = SpaceBattleDatabase.Open(definition, SpaceBattlePaths.DatabaseDirectory(_root));
+        var ids = ReadShipIds(engine);
+        SetPositions(engine, ids, [
+            new(0f, 0f, 0f),
+            new(200f, 0f, 0f)]);
+
+        using var state = new SpaceBattleSimulationState(engine, definition, new RecordingSink(), workerCount: 1);
+        state.PrepareTick(1);
+        var frames = PublishFrames(state, engine, ids).ToArray();
+        var source = frames[0] with
+        {
+            Targeting = new Targeting { TargetEntityId = SpaceBattleTargeting.PackRaw(ids[1]) },
+        };
+        state.PublishFrame(ids[0], source);
+
+        Assert.That(SpaceBattleTargeting.TryReadTarget(state, source, out _, out var boundaryDistance), Is.True);
+        Assert.That(boundaryDistance, Is.EqualTo(40_000d));
+
+        var deadAtBoundary = frames[1] with { Vitals = new Vitals { CurrentHealth = 0 } };
+        state.PublishFrame(ids[1], deadAtBoundary);
+        Assert.That(SpaceBattleTargeting.TryReadTarget(state, source, out _, out _), Is.False);
+
+        var aliveOutsideRange = frames[1] with
+        {
+            Hull = new Hull
+            {
+                Bounds = new AABB3F
+                {
+                    MinX = 200.001f,
+                    MaxX = 200.001f,
+                    MinY = 0f,
+                    MaxY = 0f,
+                    MinZ = 0f,
+                    MaxZ = 0f,
+                },
+            },
+        };
+        state.PublishFrame(ids[1], aliveOutsideRange);
+        Assert.That(SpaceBattleTargeting.TryReadTarget(state, source, out _, out _), Is.False);
+    }
+
+    [Test]
     public void DirectNearestQuery_ExcludesDeadCandidate()
     {
         var definition = new SimulationDefinition(
