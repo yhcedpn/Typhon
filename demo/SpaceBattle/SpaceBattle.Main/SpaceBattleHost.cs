@@ -221,6 +221,7 @@ internal static class SpaceBattleHost
         dag.Add(new DamageSystem(state));
         dag.Add(new MovementSystem(state));
         dag.Add(new ReapSystem(state));
+        dag.Add(new AcquisitionCleanupSystem(state));
         dag.Add(new ObserveSystem(state, timing));
     }
 
@@ -235,7 +236,6 @@ internal static class SpaceBattleHost
             Thread.Sleep(1);
         }
     }
-
     private static int ResolveWorkerCount() =>
         Math.Max(1, Math.Min(MaximumWorkerCount, Environment.ProcessorCount - 4));
 
@@ -296,17 +296,22 @@ internal static class SpaceBattleHost
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        using var transaction = engine.CreateQuickTransaction(DurabilityMode.Immediate);
-        transaction.SpawnBatchAllocate<Ship>(shipCount, ids);
-        transaction.SpawnBatchWriteAll(0, shipCount, Ship.Hull, hulls);
-        transaction.SpawnBatchWriteAll(0, shipCount, Ship.Motion, motions);
-        transaction.SpawnBatchWriteAll(0, shipCount, Ship.Vitals, vitals);
-        transaction.SpawnBatchWriteAll(0, shipCount, Ship.Targeting, targetings);
-        transaction.SpawnBatchWriteAll(0, shipCount, Ship.Behavior, behaviors);
-        if (!transaction.Commit())
+        using (var transaction = engine.CreateQuickTransaction(DurabilityMode.Immediate))
         {
-            throw new InvalidOperationException("SpaceBattle bootstrap 事务提交失败。");
+            transaction.SpawnBatchAllocate<Ship>(shipCount, ids);
+            transaction.SpawnBatchWriteAll(0, shipCount, Ship.Hull, hulls);
+            transaction.SpawnBatchWriteAll(0, shipCount, Ship.Motion, motions);
+            transaction.SpawnBatchWriteAll(0, shipCount, Ship.Vitals, vitals);
+            transaction.SpawnBatchWriteAll(0, shipCount, Ship.Targeting, targetings);
+            transaction.SpawnBatchWriteAll(0, shipCount, Ship.Behavior, behaviors);
+            if (!transaction.Commit())
+            {
+                throw new InvalidOperationException("SpaceBattle bootstrap 事务提交失败。");
+            }
         }
+
+        // 首个 Publish 直接读取 cluster 快照，先用一次 fence 将批量 spawn 的列同步到 cluster。
+        engine.WriteTickFence(0);
 
         observationSink.Publish(new InitializationProgress(shipCount, shipCount));
     }

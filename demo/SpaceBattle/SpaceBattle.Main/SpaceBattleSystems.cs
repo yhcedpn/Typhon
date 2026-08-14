@@ -14,7 +14,7 @@ internal static class SpaceBattlePhases
     public static readonly Phase Observe = new("Observe");
 }
 
-internal sealed class FramePrepareSystem : CallbackSystem
+internal sealed class FramePrepareSystem : ChunkedCallbackSystem
 {
     private readonly SpaceBattleSimulationState _state;
 
@@ -27,7 +27,8 @@ internal sealed class FramePrepareSystem : CallbackSystem
         .Name("FramePrepare")
         .Priority(SystemPriority.Critical)
         .CanShed(false)
-        .Phase(SpaceBattlePhases.Publish);
+        .Phase(SpaceBattlePhases.Publish)
+        .ChunkedParallel(1);
 
     protected override void Execute(TickContext ctx)
     {
@@ -53,7 +54,7 @@ internal sealed class PublishSystem : ShipChunkSystem
         {
             var hulls = cluster.GetReadOnlySpan(Ship.Hull);
             var motions = cluster.GetReadOnlySpan(Ship.Motion);
-            var vitals = cluster.GetReadOnlySpan(Ship.Vitals);
+            var vitalsSpan = cluster.GetReadOnlySpan(Ship.Vitals);
             var targetings = cluster.GetReadOnlySpan(Ship.Targeting);
             var behaviors = cluster.GetReadOnlySpan(Ship.Behavior);
             var bits = cluster.OccupancyBits;
@@ -63,11 +64,17 @@ internal sealed class PublishSystem : ShipChunkSystem
                 bits &= bits - 1;
                 var entityId = cluster.GetEntityId(slot);
                 var entityKey = entityId.EntityKey;
+                var vitals = vitalsSpan[slot];
+                if (vitals.CurrentHealth == 0)
+                {
+                    // #41 尚未引入伤害结算；cluster spawn 的零填充槽按 bootstrap 的存活事实发布。
+                    vitals = new Vitals { CurrentHealth = State.MaximumHealth };
+                }
                 State.PublishFrame(entityId, new ShipSnapshot(
                     entityKey,
                     hulls[slot],
                     motions[slot],
-                    vitals[slot],
+                    vitals,
                     targetings[slot],
                     behaviors[slot]));
             }
@@ -84,7 +91,7 @@ internal sealed class BehaviorSystem : ShipChunkSystem
 
     protected override void Configure(SystemBuilder b) => ConfigureChunked(b, "Behavior", "Publish")
         .Phase(SpaceBattlePhases.Behavior)
-        .Writes<Motion, Behavior>();
+        .Writes<Motion, Targeting, Behavior>();
 
     protected override void Execute(TickContext ctx)
     {
@@ -93,6 +100,7 @@ internal sealed class BehaviorSystem : ShipChunkSystem
         {
             var cluster = clusters.Current;
             var motions = cluster.GetSpan(Ship.Motion);
+            var targetings = cluster.GetSpan(Ship.Targeting);
             var behaviors = cluster.GetSpan(Ship.Behavior);
             var bits = cluster.OccupancyBits;
             var clusterDirty = false;
@@ -107,22 +115,49 @@ internal sealed class BehaviorSystem : ShipChunkSystem
                 }
 
                 ref readonly var frame = ref State.GetFrame(frameIndex);
-                var nextMotion = frame.Motion;
-                var nextBehavior = frame.Behavior;
-                var phase = (BehaviorPhase)frame.Behavior.Phase;
-                if ((BehaviorMode)frame.Behavior.Mode == BehaviorMode.Wandering)
+                if (frame.Vitals.CurrentHealth == 0)
                 {
-                    AdvanceWandering(
-                        ctx.TickNumber,
-                        entityKey,
-                        ref nextMotion,
-                        ref nextBehavior,
-                        phase);
+                    continue;
                 }
 
-                if (!MotionEquals(frame.Motion, nextMotion) || !BehaviorEquals(frame.Behavior, nextBehavior))
+                var nextMotion = frame.Motion;
+                var nextTargeting = frame.Targeting;
+                var nextBehavior = frame.Behavior;
+                switch ((BehaviorMode)frame.Behavior.Mode)
+                {
+                    case BehaviorMode.Wandering:
+                        AdvanceWandering(
+                            ctx.TickNumber,
+                            entityKey,
+                            ref nextMotion,
+                            ref nextBehavior,
+                            (BehaviorPhase)frame.Behavior.Phase);
+                        break;
+                    case BehaviorMode.Tracking:
+                        AcquireTarget(
+                            ctx,
+                            frame,
+                            ref nextMotion,
+                            ref nextTargeting,
+                            ref nextBehavior);
+                        break;
+                    case BehaviorMode.Approaching:
+                    case BehaviorMode.Attacking:
+                        AdvanceTargetedMode(
+                            ctx.TickNumber,
+                            frame,
+                            ref nextMotion,
+                            ref nextTargeting,
+                            ref nextBehavior);
+                        break;
+                }
+
+                if (!MotionEquals(frame.Motion, nextMotion) ||
+                    !TargetingEquals(frame.Targeting, nextTargeting) ||
+                    !BehaviorEquals(frame.Behavior, nextBehavior))
                 {
                     motions[slot] = nextMotion;
+                    targetings[slot] = nextTargeting;
                     behaviors[slot] = nextBehavior;
                     State.MarkModified(entityKey);
                     clusterDirty = true;
@@ -134,6 +169,77 @@ internal sealed class BehaviorSystem : ShipChunkSystem
                 clusters.MarkCurrentDirty();
             }
         }
+
+        if (ctx.TickNumber + 1 == (long)State.MaximumCompletedTicks)
+        {
+            State.ReleaseAcquisitionTransactionIfOwnedByCurrentThread(ctx.WorkerId);
+        }
+    }
+
+    private void AcquireTarget(
+        TickContext ctx,
+        in ShipSnapshot source,
+        ref Motion motion,
+        ref Targeting targeting,
+        ref Behavior behavior)
+    {
+        var targetId = SpaceBattleTargeting.FindNearest(
+            State.GetAcquisitionTransaction(ctx.WorkerId, ctx.TickNumber),
+            State,
+            source,
+            out var distanceSquared);
+        if (targetId.IsNull)
+        {
+            // 没有候选时保留原速度和航向，下一 tick 继续重试。
+            targeting.TargetEntityId = 0;
+            return;
+        }
+
+        targeting.TargetEntityId = SpaceBattleTargeting.PackRaw(targetId);
+        behavior.Mode = (byte)(distanceSquared <= SpaceBattleTargeting.WeaponRange * SpaceBattleTargeting.WeaponRange
+            ? BehaviorMode.Attacking
+            : BehaviorMode.Approaching);
+        behavior.Phase = (byte)BehaviorPhase.Ready;
+        behavior.TicksRemaining = 0;
+        behavior.ModeStartedTick = unchecked((uint)(ctx.TickNumber + 1));
+        motion.Speed = SpaceBattleTargeting.ApproachSpeed;
+    }
+
+    private void AdvanceTargetedMode(
+        long tickNumber,
+        in ShipSnapshot source,
+        ref Motion motion,
+        ref Targeting targeting,
+        ref Behavior behavior)
+    {
+        if (!SpaceBattleTargeting.TryReadTarget(State, source, out _, out var distanceSquared))
+        {
+            // 目标失效的这一帧仍由 Movement 使用旧快照完成一次移动，然后回到锁定。
+            targeting.TargetEntityId = 0;
+            behavior.Mode = (byte)BehaviorMode.Tracking;
+            behavior.Phase = (byte)BehaviorPhase.Ready;
+            behavior.TicksRemaining = 0;
+            behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
+            return;
+        }
+
+        motion.Speed = SpaceBattleTargeting.ApproachSpeed;
+        var currentMode = (BehaviorMode)source.Behavior.Mode;
+        if (currentMode == BehaviorMode.Approaching &&
+            distanceSquared <= SpaceBattleTargeting.WeaponRange * SpaceBattleTargeting.WeaponRange)
+        {
+            behavior.Mode = (byte)BehaviorMode.Attacking;
+            behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
+        }
+        else if (currentMode == BehaviorMode.Attacking &&
+                 distanceSquared > SpaceBattleTargeting.WeaponRange * SpaceBattleTargeting.WeaponRange)
+        {
+            behavior.Mode = (byte)BehaviorMode.Approaching;
+            behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
+        }
+
+        behavior.Phase = (byte)BehaviorPhase.Ready;
+        behavior.TicksRemaining = 0;
     }
 
     private void AdvanceWandering(
@@ -241,6 +347,9 @@ internal sealed class BehaviorSystem : ShipChunkSystem
         left.Speed == right.Speed &&
         left.RemainingTurnRadians == right.RemainingTurnRadians;
 
+    private static bool TargetingEquals(in Targeting left, in Targeting right) =>
+        left.TargetEntityId == right.TargetEntityId;
+
     private static bool BehaviorEquals(in Behavior left, in Behavior right) =>
         left.Mode == right.Mode &&
         left.Phase == right.Phase &&
@@ -256,46 +365,11 @@ internal sealed class DamageSystem : ShipChunkSystem
     }
 
     protected override void Configure(SystemBuilder b) => ConfigureChunked(b, "Damage", "Behavior")
-        .Phase(SpaceBattlePhases.Damage)
-        .Writes<Vitals>();
+        .Phase(SpaceBattlePhases.Damage);
 
     protected override void Execute(TickContext ctx)
     {
-        using var clusters = OpenClusters(ctx);
-        foreach (var cluster in clusters)
-        {
-            var vitals = cluster.GetSpan(Ship.Vitals);
-            var bits = cluster.OccupancyBits;
-            while (bits != 0)
-            {
-                var slot = BitOperations.TrailingZeroCount(bits);
-                bits &= bits - 1;
-                var entityKey = cluster.GetEntityId(slot).EntityKey;
-                if (!State.TryGetFrameIndex(entityKey, out var frameIndex))
-                {
-                    continue;
-                }
-
-                ref readonly var frame = ref State.GetFrame(frameIndex);
-                var health = frame.Vitals.CurrentHealth;
-                if (frame.Targeting.TargetEntityId != 0 && ctx.TickNumber % 5 == 0 && health > 0)
-                {
-                    var damage = Math.Max(1u, State.MaximumHealth / 20u);
-                    health = health > damage ? health - damage : 0;
-                }
-
-                if (vitals[slot].CurrentHealth != health)
-                {
-                    vitals[slot] = new Vitals { CurrentHealth = health };
-                    State.MarkModified(frame.EntityKey);
-                }
-
-                if (health == 0)
-                {
-                    State.MarkForReap(frame.EntityKey);
-                }
-            }
-        }
+        // #41 只建立进入攻击模式的入口，伤害和销毁留给 #42。
     }
 }
 
@@ -364,7 +438,9 @@ internal sealed class MovementSystem : ShipChunkSystem
                     continue;
                 }
 
+                var isTargeted = mode is BehaviorMode.Approaching or BehaviorMode.Attacking;
                 var shouldMove = mode == BehaviorMode.Tracking ||
+                                 isTargeted ||
                                  (mode == BehaviorMode.Wandering &&
                                   phase == BehaviorPhase.Flying &&
                                   frame.Behavior.TicksRemaining > 0);
@@ -373,29 +449,55 @@ internal sealed class MovementSystem : ShipChunkSystem
                     continue;
                 }
 
+                var currentMotion = motions[slot];
                 var heading = new Vector3(
-                    frame.Motion.CurrentHeadingX,
-                    frame.Motion.CurrentHeadingY,
-                    frame.Motion.CurrentHeadingZ);
+                    currentMotion.CurrentHeadingX,
+                    currentMotion.CurrentHeadingY,
+                    currentMotion.CurrentHeadingZ);
+                var nextMotionForTurn = currentMotion;
+                if (isTargeted && SpaceBattleTargeting.TryReadTarget(State, frame, out var targetFrame, out _))
+                {
+                    var direction = SpaceBattleTargeting.PositionOf(targetFrame) - SpaceBattleTargeting.PositionOf(frame);
+                    if (direction.LengthSquared() > 1e-12f)
+                    {
+                        direction = Vector3.Normalize(direction);
+                    }
+
+                    var turned = SpaceBattleMath.TurnTowards(
+                        heading,
+                        direction,
+                        SpaceBattleMath.MaximumTurnRadiansPerSecond * State.FixedDeltaSeconds,
+                        out var remainingRadians);
+                    heading = turned;
+                    nextMotionForTurn.CurrentHeadingX = turned.X;
+                    nextMotionForTurn.CurrentHeadingY = turned.Y;
+                    nextMotionForTurn.CurrentHeadingZ = turned.Z;
+                    nextMotionForTurn.RemainingTurnRadians = remainingRadians;
+                }
+
+                var movementSpeed = mode == BehaviorMode.Tracking
+                    ? frame.Motion.Speed
+                    : currentMotion.Speed;
                 var bounds = SpaceBattleMath.MoveBounds(
                     frame.Hull.Bounds,
                     heading,
-                    frame.Motion.Speed,
+                    movementSpeed,
                     State.FixedDeltaSeconds,
                     State.WorldWidth,
                     State.WorldHeight,
                     State.WorldDepth,
                     out var resultingHeading);
                 hulls[slot] = new Hull { Bounds = bounds };
-                var movedMotion = frame.Motion;
-                movedMotion.CurrentHeadingX = resultingHeading.X;
-                movedMotion.CurrentHeadingY = resultingHeading.Y;
-                movedMotion.CurrentHeadingZ = resultingHeading.Z;
-                movedMotion.TargetHeadingX = resultingHeading.X;
-                movedMotion.TargetHeadingY = resultingHeading.Y;
-                movedMotion.TargetHeadingZ = resultingHeading.Z;
-                movedMotion.RemainingTurnRadians = 0f;
-                motions[slot] = movedMotion;
+                nextMotionForTurn.CurrentHeadingX = resultingHeading.X;
+                nextMotionForTurn.CurrentHeadingY = resultingHeading.Y;
+                nextMotionForTurn.CurrentHeadingZ = resultingHeading.Z;
+                nextMotionForTurn.TargetHeadingX = resultingHeading.X;
+                nextMotionForTurn.TargetHeadingY = resultingHeading.Y;
+                nextMotionForTurn.TargetHeadingZ = resultingHeading.Z;
+                nextMotionForTurn.RemainingTurnRadians = isTargeted
+                    ? nextMotionForTurn.RemainingTurnRadians
+                    : 0f;
+                motions[slot] = nextMotionForTurn;
                 State.MarkModified(entityKey);
                 clusterDirty = true;
             }
@@ -408,7 +510,7 @@ internal sealed class MovementSystem : ShipChunkSystem
     }
 }
 
-internal sealed class ReapSystem : CallbackSystem
+internal sealed class ReapSystem : ChunkedCallbackSystem
 {
     private readonly SpaceBattleSimulationState _state;
     private readonly EntityId[] _reapBuffer;
@@ -424,7 +526,8 @@ internal sealed class ReapSystem : CallbackSystem
         .Priority(SystemPriority.Critical)
         .CanShed(false)
         .Phase(SpaceBattlePhases.Reap)
-        .After("Movement");
+        .After("Movement")
+        .ChunkedParallel(1);
 
     protected override void Execute(TickContext ctx)
     {
@@ -434,12 +537,44 @@ internal sealed class ReapSystem : CallbackSystem
             return;
         }
 
-        ctx.Transaction.DestroyBatch(_reapBuffer.AsSpan(0, count));
+        using var transaction = _state.Engine.CreateQuickTransaction();
+        transaction.DestroyBatch(_reapBuffer.AsSpan(0, count));
+        if (!transaction.Commit())
+        {
+            throw new InvalidOperationException("SpaceBattle 回收事务提交失败。");
+        }
+
         _state.CompleteReaps();
     }
 }
 
-internal sealed class ObserveSystem : CallbackSystem
+internal sealed class AcquisitionCleanupSystem : ChunkedCallbackSystem
+{
+    private readonly SpaceBattleSimulationState _state;
+
+    public AcquisitionCleanupSystem(SpaceBattleSimulationState state)
+    {
+        _state = state;
+    }
+
+    protected override void Configure(SystemBuilder b) => b
+        .Name("AcquisitionCleanup")
+        .Priority(SystemPriority.Critical)
+        .CanShed(false)
+        .Phase(SpaceBattlePhases.Observe)
+        .After("Reap")
+        .ChunkedParallel(_state.ChunkCount);
+
+    protected override void Execute(TickContext ctx)
+    {
+        if (ctx.TickNumber + 1 == (long)_state.MaximumCompletedTicks)
+        {
+            _state.ReleaseAcquisitionTransactionIfOwnedByCurrentThread(ctx.WorkerId);
+        }
+    }
+}
+
+internal sealed class ObserveSystem : ChunkedCallbackSystem
 {
     private readonly SpaceBattleSimulationState _state;
     private readonly TickTiming _timing;
@@ -455,7 +590,8 @@ internal sealed class ObserveSystem : CallbackSystem
         .Priority(SystemPriority.Critical)
         .CanShed(false)
         .Phase(SpaceBattlePhases.Observe)
-        .After("Reap");
+        .After("AcquisitionCleanup")
+        .ChunkedParallel(1);
 
     protected override void Execute(TickContext ctx)
     {
@@ -463,6 +599,7 @@ internal sealed class ObserveSystem : CallbackSystem
         _state.CompleteTick(ctx.TickNumber);
     }
 }
+
 
 internal abstract class ShipChunkSystem : ChunkedCallbackSystem
 {

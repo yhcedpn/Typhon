@@ -22,6 +22,9 @@ internal sealed class SpaceBattleSimulationState : IDisposable
     private int _pendingReapCount;
     private long _tickStartedAt;
     private bool _disposed;
+    private readonly AcquisitionTransactionSlot[] _acquisitionTransactions;
+    private long _acquisitionTransactionsCreated;
+    private long _acquisitionTransactionsDisposed;
     private long _completedTicks;
     public SpaceBattleSimulationState(
         DatabaseEngine engine,
@@ -41,6 +44,11 @@ internal sealed class SpaceBattleSimulationState : IDisposable
         _entityIds = new EntityId[capacity];
         _frames = new ShipSnapshot[capacity];
         _reapBuffer = new EntityId[capacity];
+        _acquisitionTransactions = new AcquisitionTransactionSlot[workerCount];
+        for (var workerId = 0; workerId < workerCount; workerId++)
+        {
+            _acquisitionTransactions[workerId] = new AcquisitionTransactionSlot();
+        }
         Accessor = new PointInTimeAccessor();
     }
 
@@ -63,6 +71,7 @@ internal sealed class SpaceBattleSimulationState : IDisposable
     public float WorldWidth => _definition.WorldWidth;
     public float WorldHeight => _definition.WorldHeight;
     public float WorldDepth => _definition.WorldDepth;
+    public ulong MaximumCompletedTicks => _definition.MaximumCompletedTicks;
 
     public long CompletedTicks => Interlocked.Read(ref _completedTicks);
     public long TickStartedAt => Volatile.Read(ref _tickStartedAt);
@@ -71,6 +80,110 @@ internal sealed class SpaceBattleSimulationState : IDisposable
     public int CurrentGeneration => Volatile.Read(ref _generation);
 
     public int PublishedShipCount => Volatile.Read(ref _publishedShipCount);
+    public long AcquisitionTransactionsCreated => Interlocked.Read(ref _acquisitionTransactionsCreated);
+
+    public long AcquisitionTransactionsDisposed => Interlocked.Read(ref _acquisitionTransactionsDisposed);
+
+    public int ActiveAcquisitionTransactions
+    {
+        get
+        {
+            var active = 0;
+            foreach (var slot in _acquisitionTransactions)
+            {
+                if (Volatile.Read(ref slot.Transaction) is not null)
+                {
+                    active++;
+                }
+            }
+
+            return active;
+        }
+    }
+
+    public Transaction GetAcquisitionTransaction(int workerId, long tickNumber)
+    {
+        if ((uint)workerId >= (uint)_acquisitionTransactions.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(workerId));
+        }
+
+        var slot = _acquisitionTransactions[workerId];
+        var threadId = Environment.CurrentManagedThreadId;
+        var transaction = Volatile.Read(ref slot.Transaction);
+        if (transaction is not null)
+        {
+            if (slot.OwnerThreadId != threadId)
+            {
+                throw new InvalidOperationException("SpaceBattle acquisition transaction 必须在创建它的 worker 线程上复用。");
+            }
+
+            if (tickNumber - slot.CreatedTick <= 1)
+            {
+                slot.LastUsedTick = tickNumber;
+                return transaction;
+            }
+
+            ReleaseAcquisitionTransaction(workerId);
+        }
+
+        transaction = Engine.CreateReadOnlyTransaction();
+        slot.OwnerThreadId = threadId;
+        slot.CreatedTick = tickNumber;
+        slot.LastUsedTick = tickNumber;
+        Volatile.Write(ref slot.Transaction, transaction);
+        Interlocked.Increment(ref _acquisitionTransactionsCreated);
+        return transaction;
+    }
+
+    public void ReleaseAcquisitionTransaction(int workerId)
+    {
+        if ((uint)workerId >= (uint)_acquisitionTransactions.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(workerId));
+        }
+
+        var slot = _acquisitionTransactions[workerId];
+        var transaction = Volatile.Read(ref slot.Transaction);
+        if (transaction is null)
+        {
+            return;
+        }
+
+        if (slot.OwnerThreadId != Environment.CurrentManagedThreadId)
+        {
+            throw new InvalidOperationException("SpaceBattle acquisition transaction 只能在原 worker 线程上释放。");
+        }
+
+        Volatile.Write(ref slot.Transaction, null);
+        slot.OwnerThreadId = 0;
+        slot.CreatedTick = -1;
+        slot.LastUsedTick = -1;
+        transaction.Dispose();
+        Interlocked.Increment(ref _acquisitionTransactionsDisposed);
+    }
+
+    public void ReleaseAcquisitionTransactionIfOwnedByCurrentThread(int workerId)
+    {
+        if ((uint)workerId >= (uint)_acquisitionTransactions.Length)
+        {
+            return;
+        }
+
+        var slot = _acquisitionTransactions[workerId];
+        if (Volatile.Read(ref slot.Transaction) is not null && slot.OwnerThreadId == Environment.CurrentManagedThreadId)
+        {
+            ReleaseAcquisitionTransaction(workerId);
+        }
+    }
+
+    private sealed class AcquisitionTransactionSlot
+    {
+        public Transaction Transaction;
+        public long CreatedTick = -1;
+        public long LastUsedTick = -1;
+        public int OwnerThreadId;
+    }
     public void PrepareTick(long tickNumber)
     {
         lock (_tickGate)
@@ -93,6 +206,7 @@ internal sealed class SpaceBattleSimulationState : IDisposable
             Accessor.Attach(Engine, WorkerCount);
         }
     }
+
 
     public EntityAccessor GetWorkerAccessor(int workerId) => Accessor.GetWorkerAccessor(workerId);
 
@@ -217,6 +331,11 @@ internal sealed class SpaceBattleSimulationState : IDisposable
         }
 
         _disposed = true;
+        for (var workerId = 0; workerId < _acquisitionTransactions.Length; workerId++)
+        {
+            ReleaseAcquisitionTransactionIfOwnedByCurrentThread(workerId);
+        }
+
         Accessor.Dispose();
     }
 
