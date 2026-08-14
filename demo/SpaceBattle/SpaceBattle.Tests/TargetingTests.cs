@@ -102,6 +102,120 @@ public sealed class TargetingTests
 
 
     [Test]
+    public void TargetingBatch_UsesDirectQueriesForAtMostFourSources()
+    {
+        var definition = new SimulationDefinition(
+            shipCount: 5,
+            worldWidth: 1_000f,
+            worldHeight: 1_000f,
+            worldDepth: 400f,
+            maximumCompletedTicks: 1);
+        SpaceBattleHost.BootstrapOnly(definition, _root, CancellationToken.None, new RecordingSink());
+        var databaseDirectory = SpaceBattlePaths.DatabaseDirectory(_root);
+
+        using var engine = SpaceBattleDatabase.Open(definition, databaseDirectory);
+        var ids = ReadShipIds(engine);
+        SetPositions(engine, ids, [
+            new(0f, 0f, 0f),
+            new(50f, 0f, 0f),
+            new(100f, 0f, 0f),
+            new(150f, 0f, 0f),
+            new(500f, 0f, 0f)]);
+
+        using var state = new SpaceBattleSimulationState(engine, definition, new RecordingSink(), workerCount: 1);
+        state.PrepareTick(1);
+        var frames = PublishFrames(state, engine, ids).ToArray();
+        var sources = frames.Take(4).ToArray();
+        var results = new TargetingResult[sources.Length];
+
+        SpaceBattleTargeting.FindNearestBatch(
+            state.GetAcquisitionTransaction(workerId: 0, tickNumber: 1),
+            state,
+            sources,
+            results,
+            out var metrics);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(metrics.DirectQueryCount, Is.EqualTo(4));
+            Assert.That(metrics.BatchedQueryCount, Is.Zero);
+            Assert.That(metrics.GatherCandidateCount, Is.Zero);
+            Assert.That(metrics.ExactDistanceTestCount, Is.GreaterThan(0));
+            for (var index = 0; index < sources.Length; index++)
+            {
+                var bruteForceKey = SpaceBattleTargeting.FindNearestBruteForce(
+                    frames,
+                    sources[index],
+                    out var bruteForceDistance);
+                Assert.That(results[index].EntityId.EntityKey, Is.EqualTo(bruteForceKey));
+                Assert.That(results[index].DistanceSquared, Is.EqualTo(bruteForceDistance));
+            }
+        });
+    }
+
+    [Test]
+    public void TargetingBatch_MatchesBruteForceWithExpandedGatherBinsAndRules()
+    {
+        var definition = new SimulationDefinition(
+            shipCount: 8,
+            worldWidth: 2_000f,
+            worldHeight: 1_000f,
+            worldDepth: 400f,
+            maximumCompletedTicks: 1);
+        SpaceBattleHost.BootstrapOnly(definition, _root, CancellationToken.None, new RecordingSink());
+        var databaseDirectory = SpaceBattlePaths.DatabaseDirectory(_root);
+
+        using var engine = SpaceBattleDatabase.Open(definition, databaseDirectory);
+        var ids = ReadShipIds(engine);
+        SetPositions(engine, ids, [
+            new(0f, 0f, 0f),
+            new(200f, 0f, 0f),
+            new(200f, 0f, 0f),
+            new(201f, 10f, 10f),
+            new(500f, 50f, 100f),
+            new(550f, 50f, 100f),
+            new(600f, 50f, 100f),
+            new(900f, 50f, 100f)]);
+
+        using var state = new SpaceBattleSimulationState(engine, definition, new RecordingSink(), workerCount: 1);
+        state.PrepareTick(1);
+        var frames = PublishFrames(state, engine, ids).ToArray();
+        frames[1] = frames[1] with { Vitals = new Vitals { CurrentHealth = 0 } };
+        state.PublishFrame(ids[1], frames[1]);
+        var sources = frames.Take(5).ToArray();
+        var results = new TargetingResult[sources.Length];
+
+        SpaceBattleTargeting.FindNearestBatch(
+            state.GetAcquisitionTransaction(workerId: 0, tickNumber: 1),
+            state,
+            sources,
+            results,
+            out var metrics);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(metrics.DirectQueryCount, Is.Zero);
+            Assert.That(metrics.BatchedQueryCount, Is.EqualTo(1));
+            Assert.That(metrics.GatherCandidateCount, Is.GreaterThan(0));
+            Assert.That(metrics.GatherCandidateCount, Is.LessThan(frames.Length));
+            Assert.That(metrics.ExactDistanceTestCount, Is.GreaterThan(0));
+            for (var index = 0; index < sources.Length; index++)
+            {
+                var bruteForceKey = SpaceBattleTargeting.FindNearestBruteForce(
+                    frames,
+                    sources[index],
+                    out var bruteForceDistance);
+                Assert.That(results[index].EntityId.EntityKey, Is.EqualTo(bruteForceKey));
+                Assert.That(results[index].DistanceSquared, Is.EqualTo(bruteForceDistance));
+            }
+
+            Assert.That(results[0].EntityId.EntityKey, Is.EqualTo(ids[2].EntityKey));
+            Assert.That(results[0].DistanceSquared, Is.EqualTo(40_000d));
+        });
+    }
+
+
+    [Test]
     public void Host_EntersApproachOrAttackAfterTheFirstLockAttempt()
     {
         var definition = new SimulationDefinition(
