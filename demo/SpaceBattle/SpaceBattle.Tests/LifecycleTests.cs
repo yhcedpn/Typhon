@@ -125,9 +125,28 @@ public sealed class LifecycleTests
         runtime.Start();
         Assert.That(aborted.Wait(TimeSpan.FromSeconds(5)), Is.True);
         var runsAtAbort = Volatile.Read(ref successfulSystemRuns);
-        var tickAtAbort = runtime.CurrentTickNumber;
         runtime.FatalStop();
-        Assert.That(runtime.CurrentTickNumber, Is.EqualTo(tickAtAbort));
+
+        // 引擎语义：FatalStop 只停止产生新 tick，当前已 abort 的 tick 的
+        // telemetry 与 CurrentTickNumber 收尾可能在其返回后落地（上游
+        // Log2n-io/Typhon#404、PR #689 记录的采样时序）。因此先等待计数稳定，
+        // 再断言之后不会产生任何后续 tick。
+        var tickAfterStop = runtime.CurrentTickNumber;
+        for (var i = 0; i < 200; i++)
+        {
+            Thread.Sleep(5);
+            var current = runtime.CurrentTickNumber;
+            if (current == tickAfterStop)
+            {
+                break;
+            }
+
+            tickAfterStop = current;
+        }
+
+        Assert.That(runtime.CurrentTickNumber, Is.EqualTo(tickAfterStop));
+        Thread.Sleep(50); // 观察窗口：确认无后续 tick 推进
+        Assert.That(runtime.CurrentTickNumber, Is.EqualTo(tickAfterStop));
 
         Behavior persistedBehavior;
         using (var transaction = engine.CreateReadOnlyTransaction())
