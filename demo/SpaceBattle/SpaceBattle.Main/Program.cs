@@ -86,11 +86,13 @@ internal static class Program
                     tick.Telemetry is not null &&
                     SpaceBattleTelemetrySampling.IsSampleTick(tick.TickNumber) &&
                     Interlocked.Exchange(ref _lastPrintedTick, tick.TickNumber) != tick.TickNumber:
+                    Console.WriteLine();
                     Console.WriteLine(SpaceBattleTelemetryFormatter.Format(tick.Telemetry));
                     break;
                 case SimulationTelemetrySample sample when
                     SpaceBattleTelemetrySampling.IsSampleTick(sample.Telemetry.TickNumber) &&
                     Interlocked.Exchange(ref _lastPrintedTick, sample.Telemetry.TickNumber) != sample.Telemetry.TickNumber:
+                    Console.WriteLine();
                     Console.WriteLine(SpaceBattleTelemetryFormatter.Format(sample.Telemetry));
                     break;
             }
