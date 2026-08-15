@@ -107,6 +107,15 @@ internal sealed class SpaceBattleFrameStore
 
     public ref readonly ShipSnapshot GetObserved(int index) => ref _observedFrames[index];
 
+    // 引擎缺陷（fork #53）：运行期簇 SoA Vitals 读值不可靠（fence 后被归 0）。
+    // 内存 health 权威：返回上一 tick 已发布血（Publish 写入、Damage 的 UpdateHealth 同步，
+    // 二者共同维护 _publishedFrames 链），供 Publish 在簇读 0 时续用；真死船该值同样为 0。
+    // 无 generation 检查（Publish 是当 tick 首写者）。
+    public uint PreviousHealth(long entityKey) =>
+        (ulong)entityKey < (ulong)_publishedFrames.Length
+            ? _publishedFrames[entityKey].Vitals.CurrentHealth
+            : 0u;
+
     public EntityId GetEntityId(int index) => _entityIds[index];
 
     public bool MarkModified(long entityKey)
