@@ -89,12 +89,6 @@ internal static class Program
                     Console.WriteLine();
                     Console.WriteLine(SpaceBattleTelemetryFormatter.FormatHumanReadable(tick.Telemetry));
                     break;
-                case SimulationTelemetrySample sample when
-                    SpaceBattleTelemetrySampling.IsSampleTick(sample.Telemetry.TickNumber) &&
-                    Interlocked.Exchange(ref _lastPrintedTick, sample.Telemetry.TickNumber) != sample.Telemetry.TickNumber:
-                    Console.WriteLine();
-                    Console.WriteLine(SpaceBattleTelemetryFormatter.FormatHumanReadable(sample.Telemetry));
-                    break;
             }
         }
     }

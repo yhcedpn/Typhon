@@ -155,7 +155,6 @@ public sealed class DeterminismTests
             fixedDeltaSeconds: SimulationDefinition.FixedSimulationDeltaSeconds,
             maximumCompletedTicks: 8,
             spatialCellSize: 10f,
-            runName: "determinism",
             workerCount: workerCount);
 
     private sealed class RecordingSink : ISpaceBattleObservationSink

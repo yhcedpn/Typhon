@@ -51,7 +51,7 @@ public sealed class TargetingTests
         var source = frames.Single(frame => frame.EntityKey == ids[0].EntityKey);
         var bruteForceKey = SpaceBattleTargeting.FindNearestBruteForce(frames, source, out var bruteForceDistance);
         var direct = SpaceBattleTargeting.FindNearest(
-            state.GetAcquisitionTransaction(workerId: 0, tickNumber: 1),
+            state.AcquisitionTransactions.Get(workerId: 0, tickNumber: 1),
             state,
             source,
             out var directDistance);
@@ -87,15 +87,15 @@ public sealed class TargetingTests
         var frames = PublishFrames(state, engine, ids).ToArray();
         var source = frames[0] with
         {
-            Targeting = new Targeting { TargetEntityId = SpaceBattleTargeting.PackRaw(ids[1]) },
+            Targeting = new Targeting { TargetRawEntityId = SpaceBattleTargeting.PackRaw(ids[1]) },
         };
-        state.PublishFrame(ids[0], source);
+        state.Frames.Publish(ids[0], source);
 
         Assert.That(SpaceBattleTargeting.TryReadTarget(state, source, out _, out var boundaryDistance), Is.True);
         Assert.That(boundaryDistance, Is.EqualTo(40_000d));
 
         var deadAtBoundary = frames[1] with { Vitals = new Vitals { CurrentHealth = 0 } };
-        state.PublishFrame(ids[1], deadAtBoundary);
+        state.Frames.Publish(ids[1], deadAtBoundary);
         Assert.That(SpaceBattleTargeting.TryReadTarget(state, source, out _, out _), Is.False);
 
         var aliveOutsideRange = frames[1] with
@@ -113,7 +113,7 @@ public sealed class TargetingTests
                 },
             },
         };
-        state.PublishFrame(ids[1], aliveOutsideRange);
+        state.Frames.Publish(ids[1], aliveOutsideRange);
         Assert.That(SpaceBattleTargeting.TryReadTarget(state, source, out _, out _), Is.False);
     }
 
@@ -139,11 +139,11 @@ public sealed class TargetingTests
         state.PrepareTick(1);
         var frames = PublishFrames(state, engine, ids).ToArray();
         frames[1] = frames[1] with { Vitals = new Vitals { CurrentHealth = 0 } };
-        state.PublishFrame(ids[1], frames[1]);
+        state.Frames.Publish(ids[1], frames[1]);
         var source = frames[0];
 
         var direct = SpaceBattleTargeting.FindNearest(
-            state.GetAcquisitionTransaction(workerId: 0, tickNumber: 1),
+            state.AcquisitionTransactions.Get(workerId: 0, tickNumber: 1),
             state,
             source,
             out _);
@@ -180,7 +180,7 @@ public sealed class TargetingTests
         var results = new TargetingResult[sources.Length];
 
         SpaceBattleTargeting.FindNearestBatch(
-            state.GetAcquisitionTransaction(workerId: 0, tickNumber: 1),
+            state.AcquisitionTransactions.Get(workerId: 0, tickNumber: 1),
             state,
             sources,
             results,
@@ -232,12 +232,12 @@ public sealed class TargetingTests
         state.PrepareTick(1);
         var frames = PublishFrames(state, engine, ids).ToArray();
         frames[1] = frames[1] with { Vitals = new Vitals { CurrentHealth = 0 } };
-        state.PublishFrame(ids[1], frames[1]);
+        state.Frames.Publish(ids[1], frames[1]);
         var sources = frames.Take(5).ToArray();
         var results = new TargetingResult[sources.Length];
 
         SpaceBattleTargeting.FindNearestBatch(
-            state.GetAcquisitionTransaction(workerId: 0, tickNumber: 1),
+            state.AcquisitionTransactions.Get(workerId: 0, tickNumber: 1),
             state,
             sources,
             results,
@@ -267,7 +267,7 @@ public sealed class TargetingTests
 
 
     [Test]
-    public void Host_EntersApproachOrAttackAfterTheFirstLockAttempt()
+    public void Runtime_EntersApproachOrAttackAfterTheFirstLockAttempt()
     {
         var definition = new SimulationDefinition(
             shipCount: 2,
@@ -275,17 +275,17 @@ public sealed class TargetingTests
             worldHeight: 100f,
             worldDepth: 100f,
             maximumCompletedTicks: 53);
-        SpaceBattleHost.Run(definition, _root, CancellationToken.None, new RecordingSink());
-        var snapshot = SpaceBattleHost.ReadSnapshot(definition, _root);
+        var snapshots = SpaceBattleTestRuntime.CaptureSnapshots(definition, _root);
+        var snapshot = snapshots[53];
 
         Assert.That(snapshot.Ships, Has.All.Matches<ShipSnapshot>(ship =>
             (ship.Behavior.Mode is (byte)BehaviorMode.Approaching or (byte)BehaviorMode.Attacking) &&
-            ship.Motion.Speed == SpaceBattleMath.MaximumWanderSpeed &&
-            ship.Targeting.TargetEntityId != 0));
+            ship.Motion.Speed == SpaceBattleCombat.AttackSpeed &&
+            ship.Targeting.TargetRawEntityId != 0));
 
         foreach (var ship in snapshot.Ships)
         {
-            var targetKey = SpaceBattleTargeting.EntityKeyFromRaw(ship.Targeting.TargetEntityId);
+            var targetKey = SpaceBattleTargeting.EntityKeyFromRaw(ship.Targeting.TargetRawEntityId);
             var target = snapshot.Ships.Single(candidate => candidate.EntityKey == targetKey);
             Assert.That(SpaceBattleTargeting.DistanceSquared(ship, target), Is.LessThanOrEqualTo(40_000d));
         }
@@ -300,26 +300,54 @@ public sealed class TargetingTests
         using var engine = SpaceBattleDatabase.Open(definition, databaseDirectory);
         using var state = new SpaceBattleSimulationState(engine, definition, new RecordingSink(), workerCount: 1);
 
-        Assert.That(state.ActiveAcquisitionTransactions, Is.Zero);
-        var first = state.GetAcquisitionTransaction(workerId: 0, tickNumber: 1);
-        var same = state.GetAcquisitionTransaction(workerId: 0, tickNumber: 2);
-        var replacement = state.GetAcquisitionTransaction(workerId: 0, tickNumber: 3);
+        Assert.That(state.AcquisitionTransactions.Active, Is.Zero);
+        var first = state.AcquisitionTransactions.Get(workerId: 0, tickNumber: 1);
+        var same = state.AcquisitionTransactions.Get(workerId: 0, tickNumber: 2);
+        var replacement = state.AcquisitionTransactions.Get(workerId: 0, tickNumber: 3);
 
         Assert.Multiple(() =>
         {
             Assert.That(ReferenceEquals(first, same), Is.True);
-            Assert.That(state.AcquisitionTransactionsCreated, Is.EqualTo(2));
-            Assert.That(state.AcquisitionTransactionsDisposed, Is.EqualTo(1));
-            Assert.That(state.ActiveAcquisitionTransactions, Is.EqualTo(1));
+            Assert.That(state.AcquisitionTransactions.Created, Is.EqualTo(2));
+            Assert.That(state.AcquisitionTransactions.Disposed, Is.EqualTo(1));
+            Assert.That(state.AcquisitionTransactions.Active, Is.EqualTo(1));
         });
 
-        state.ReleaseAcquisitionTransaction(workerId: 0);
+        state.AcquisitionTransactions.Release(workerId: 0);
         Assert.Multiple(() =>
         {
             Assert.That(replacement, Is.Not.Null);
-            Assert.That(state.AcquisitionTransactionsDisposed, Is.EqualTo(2));
-            Assert.That(state.ActiveAcquisitionTransactions, Is.Zero);
+            Assert.That(state.AcquisitionTransactions.Disposed, Is.EqualTo(2));
+            Assert.That(state.AcquisitionTransactions.Active, Is.Zero);
         });
+    }
+
+    [Test]
+    public void AcquisitionTransaction_InvalidationDefersDisposalUntilOwnerNextUsesTheSlot()
+    {
+        var definition = new SimulationDefinition(shipCount: 1, maximumCompletedTicks: 1);
+        SpaceBattleHost.BootstrapOnly(definition, _root, CancellationToken.None, new RecordingSink());
+        using var engine = SpaceBattleDatabase.Open(definition, SpaceBattlePaths.DatabaseDirectory(_root));
+        using var state = new SpaceBattleSimulationState(engine, definition, new RecordingSink(), workerCount: 1);
+
+        var first = state.AcquisitionTransactions.Get(workerId: 0, tickNumber: 1);
+        state.AcquisitionTransactions.InvalidateForNextUse();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(state.AcquisitionTransactions.Created, Is.EqualTo(1));
+            Assert.That(state.AcquisitionTransactions.Disposed, Is.Zero);
+            Assert.That(state.AcquisitionTransactions.Active, Is.EqualTo(1));
+        });
+
+        var replacement = state.AcquisitionTransactions.Get(workerId: 0, tickNumber: 1);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ReferenceEquals(first, replacement), Is.False);
+            Assert.That(state.AcquisitionTransactions.Created, Is.EqualTo(2));
+            Assert.That(state.AcquisitionTransactions.Disposed, Is.EqualTo(1));
+        });
+        state.AcquisitionTransactions.Release(workerId: 0);
     }
 
     private static EntityId[] ReadShipIds(DatabaseEngine engine)
@@ -372,7 +400,7 @@ public sealed class TargetingTests
                 entity.Read(Ship.Vitals),
                 entity.Read(Ship.Targeting),
                 entity.Read(Ship.Behavior));
-            state.PublishFrame(id, frame);
+            state.Frames.Publish(id, frame);
             frames.Add(frame);
         }
 

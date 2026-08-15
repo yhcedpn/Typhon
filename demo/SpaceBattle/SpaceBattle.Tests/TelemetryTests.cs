@@ -47,6 +47,51 @@ public sealed class TelemetryTests
     }
 
     [Test]
+    public void DurationStatisticsKeepOnlyTheLatestBoundedWindow()
+    {
+        const int windowSize = 4_096;
+        var timing = new TickTiming();
+        var system = new SpaceBattleSystemMetricAccumulator();
+
+        for (var index = 0; index <= windowSize; index++)
+        {
+            timing.RecordTick(TimeSpan.FromMilliseconds(index));
+            system.Record(index * Stopwatch.Frequency, entities: 1, workerId: 0);
+        }
+
+        var tickSnapshot = timing.Snapshot();
+        var systemSnapshot = system.Snapshot("test");
+        Assert.Multiple(() =>
+        {
+            Assert.That(tickSnapshot.SampleCount, Is.EqualTo(windowSize));
+            Assert.That(tickSnapshot.P50Milliseconds, Is.GreaterThan(2_048d));
+            Assert.That(tickSnapshot.MaximumMilliseconds, Is.EqualTo(4_096d));
+            Assert.That(systemSnapshot.SampleCount, Is.EqualTo(windowSize));
+            Assert.That(systemSnapshot.MeanMicroseconds, Is.GreaterThan(2_048_000_000d));
+            Assert.That(systemSnapshot.MaximumMicroseconds, Is.EqualTo(4_096_000_000d));
+        });
+    }
+
+    [Test]
+    public void TelemetryRejectsUnknownBehaviorModeInsteadOfCountingItAsWandering()
+    {
+        var frames = new SpaceBattleFrameStore(shipCount: 1);
+        frames.BeginTick();
+        frames.Publish(default, new ShipSnapshot(
+            EntityKey: 1,
+            Hull: default,
+            Motion: default,
+            Vitals: new Vitals { CurrentHealth = 1 },
+            Targeting: default,
+            Behavior: new Behavior { Mode = byte.MaxValue }));
+        var telemetry = new SpaceBattleTelemetryState(workerCount: 1);
+
+        Assert.That(
+            () => telemetry.BuildSnapshot(tickNumber: 0, timing: null, frames),
+            Throws.InvalidOperationException.With.Message.Contains("未知行为模式"));
+    }
+
+    [Test]
     public void FormatterKeepsStableKeysWithoutStragglerGap()
     {
         var snapshot = new SpaceBattleTelemetrySnapshot(

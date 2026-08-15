@@ -44,13 +44,13 @@ termination=tick_limit bootstrap_ships=50000 completed_ticks=22500 remaining_shi
 | `alive` | Publish 后仍有生命值的飞船数。 |
 | `next_wandering`、`next_tracking`、`next_approaching`、`next_attacking`、`next_turning` | 本帧 Behavior 完成后、下一帧预计处于五种模式的数量；五项之和应等于 `alive`。 |
 | `valid_locks` | Movement 后仍满足目标存活且距离不超过 200 的锁定数。 |
-| `tick_p50_ms`、`tick_p95_ms`、`tick_p99_ms`、`tick_max_ms` | 已记录 tick 的墙钟耗时百分位；bootstrap 不在其中。 |
-| `tick_over_40ms` | 严格大于 40 ms 的 tick 数；等于 40 ms 不计入。它是诊断计数，不是 CI 失败条件。 |
+| `tick_p50_ms`、`tick_p95_ms`、`tick_p99_ms`、`tick_max_ms` | 最近 4,096 个 tick 的墙钟耗时百分位；bootstrap 不在其中。 |
+| `tick_over_40ms` | 最近 4,096 个 tick 中严格大于 40 ms 的数量；等于 40 ms 不计入。它是诊断计数，不是 CI 失败条件。 |
 | `actual_hz`、`overload`、`tick_multiplier` | 实测频率、runtime overload 状态和 multiplier。SpaceBattle 固定最低 25 Hz，不用自动降频掩盖超时。 |
 | `workers`、`systems` | 本次运行的 worker 数和系统/围栏指标条目数。 |
 | `query_direct`、`query_batched`、`gather_candidates`、`exact_distance_tests` | 混合目标获取的 direct query、batched gather、候选和精确 3D 距离测试累计计数。 |
 | `weapon_uses`、`in_range_attacks`、`damage`、`deaths` | 武器尝试、射程内攻击、应用伤害总量和死亡数累计计数。 |
-| `system=... mean_us=... p95_us=... max_us=... entities=... workers=...` | 应用系统与 fence 分解；包括 `FramePrepare`、`Publish`、`Behavior`、`Damage`、`Movement`、`Reap`、`Observe`、`dirty_marking`、`AABB_refresh`、`migrate_fence`、`FenceFinalize` 等。 |
+| `system=... mean_us=... p95_us=... max_us=... entities=... workers=...` | 应用系统与 fence 最近 4,096 个 duration 样本的分解；包括 `FramePrepare`、`Publish`、`Behavior`、`Damage`、`Movement`、`Reap`、`Observe`、`dirty_marking`、`AABB_refresh`、`migrate_fence`、`FenceFinalize` 等。 |
 
 `tick`、计数和百分位格式都使用 invariant culture，适合脚本逐字段消费。Profiler trace 是另一条高吞吐诊断管线，不等同 OpenTelemetry；不要把开启 trace 后的耗时当作关闭 trace 的性能基线。
 
@@ -100,12 +100,14 @@ dotnet test demo/SpaceBattle/SpaceBattle.Tests/SpaceBattle.Tests.csproj --no-res
 ```
 这里显式排除 `Performance`/`Manual`，避免某些 adapter 的 Explicit-selection 配置把 release-only 场景带入默认测试；issue 验收的原始过滤器 `TestCategory!=Quarantine` 也可在默认 NUnit discovery 下使用，但不会改变本段的“默认不跑性能场景”约定。
 
+默认套件中只验证逻辑帧结果的长状态机场景通过 `SpaceBattleTestRuntime` 以 1,000 Hz 调度运行，同时保持 `FixedDeltaSeconds=0.04`，因此不会为非墙钟契约等待真实 25 Hz 节拍。下面的 Explicit 性能场景仍使用生产 25 Hz 配置。
+
 `PerformanceTests.FiftyThousandShips_25Hz_500Ticks_ReportsMeasuredBreakdown` 是 `[Explicit]` + `[Category("Performance")]` 的 Release-only 场景（另带 `Manual` 类别，避免共享 CI 误运行）。默认测试不会执行它。手工测量时使用 Release，并显式选择该测试：
 
 ```powershell
 dotnet test demo/SpaceBattle/SpaceBattle.Tests/SpaceBattle.Tests.csproj -c Release --no-restore --filter "FullyQualifiedName~PerformanceTests.FiftyThousandShips_25Hz_500Ticks_ReportsMeasuredBreakdown" --logger "console;verbosity=detailed"
 ```
-场景配置为 50,000 艘、25 Hz、500 tick；Host 在停止边界可能完成一个已经 in-flight 的额外 tick，因此 `completed_ticks` 可为 500 或 501，但测量窗口固定按 zero-based 125–499 取 375 个 tick。前 125 tick 只作为 warmup，丢弃后用这 375 个 `SimulationTickCompleted.Duration` 计算 p50/p95/p99/max。它同时打印 bootstrap、最新 telemetry sample 的系统/fence 实测分解和稳定计数；该系统 snapshot 是 runtime 已暴露的累积窗口（截至采样 tick，包含 warmup），不冒充 warmup-trimmed 的 phase 百分位。当前 runtime 未提供有效样本的 fence 条目会稳定显示 0，并在报告中标为“未暴露测量”，不把 0 解读为零成本。p95 严格超过 40 ms 只打印 `warning=p95_over_40ms`，不会 `Assert` 失败；40 ms 不是跨机器 CI SLA，机器、worker 拓扑、磁盘和 profiler 状态必须随报告记录。
+场景配置为 50,000 艘、25 Hz、500 tick；Host 在停止边界可能完成一个已经 in-flight 的额外 tick，因此 `completed_ticks` 可为 500 或 501，但测量窗口固定按 zero-based 125–499 取 375 个 tick。前 125 tick 只作为 warmup，丢弃后用这 375 个 `SimulationTickCompleted.Duration` 计算 p50/p95/p99/max。它同时打印 bootstrap、最新 telemetry sample 的系统/fence 实测分解和稳定计数；该系统 snapshot 是每项最近 4,096 个 duration 样本的固定窗口，不冒充 warmup-trimmed 的 phase 百分位，也不保证早期 warmup 仍在窗口内。当前 runtime 未提供有效样本的 fence 条目会稳定显示 0，并在报告中标为“未暴露测量”，不把 0 解读为零成本。p95 严格超过 40 ms 只打印 `warning=p95_over_40ms`，不会 `Assert` 失败；40 ms 不是跨机器 CI SLA，机器、worker 拓扑、磁盘和 profiler 状态必须随报告记录。
 
 ## ADR 与边界
 

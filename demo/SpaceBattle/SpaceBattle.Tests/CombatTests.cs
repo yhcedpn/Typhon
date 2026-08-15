@@ -81,31 +81,31 @@ public sealed class CombatTests
         using var state = new SpaceBattleSimulationState(engine, definition, new RecordingSink(), workerCount: 3);
         state.PrepareTick(1);
 
-        state.RecordIncomingDamage(workerId: 0, targetEntityKey: 1, damage: 250);
-        state.RecordIncomingDamage(workerId: 0, targetEntityKey: 1, damage: 250);
-        state.RecordIncomingDamage(workerId: 1, targetEntityKey: 1, damage: 250);
-        state.RecordIncomingDamage(workerId: 2, targetEntityKey: 2, damage: 250);
+        state.Settlement.RecordIncomingDamage(workerId: 0, targetEntityKey: 1, damage: 250);
+        state.Settlement.RecordIncomingDamage(workerId: 0, targetEntityKey: 1, damage: 250);
+        state.Settlement.RecordIncomingDamage(workerId: 1, targetEntityKey: 1, damage: 250);
+        state.Settlement.RecordIncomingDamage(workerId: 2, targetEntityKey: 2, damage: 250);
 
         Assert.Multiple(() =>
         {
-            Assert.That(state.ReduceIncomingDamage(1), Is.EqualTo(750u));
-            Assert.That(state.ReduceIncomingDamage(2), Is.EqualTo(250u));
-            Assert.That(state.IncomingDamageTouchedCount(0), Is.EqualTo(1));
-            Assert.That(state.IncomingDamageTouchedCount(1), Is.EqualTo(1));
-            Assert.That(state.IncomingDamageTouchedCount(2), Is.EqualTo(1));
-            Assert.That(state.IncomingDamageTouchedKeys(0).ToArray(), Is.EqualTo(new long[] { 1 }));
+            Assert.That(state.Settlement.ReduceIncomingDamage(1), Is.EqualTo(750u));
+            Assert.That(state.Settlement.ReduceIncomingDamage(2), Is.EqualTo(250u));
+            Assert.That(state.Settlement.IncomingDamageTouchedCount(0), Is.EqualTo(1));
+            Assert.That(state.Settlement.IncomingDamageTouchedCount(1), Is.EqualTo(1));
+            Assert.That(state.Settlement.IncomingDamageTouchedCount(2), Is.EqualTo(1));
+            Assert.That(state.Settlement.IncomingDamageTouchedKeys(0).ToArray(), Is.EqualTo(new long[] { 1 }));
         });
 
-        state.ClearIncomingDamage();
+        state.Settlement.ClearIncomingDamage();
 
         Assert.Multiple(() =>
         {
-            Assert.That(state.ReduceIncomingDamage(1), Is.Zero);
-            Assert.That(state.ReduceIncomingDamage(2), Is.Zero);
-            Assert.That(state.IncomingDamageTouchedCount(0), Is.Zero);
-            Assert.That(state.IncomingDamageTouchedCount(1), Is.Zero);
-            Assert.That(state.IncomingDamageTouchedCount(2), Is.Zero);
-            Assert.That(state.ReadIncomingDamage(0, 3), Is.Zero);
+            Assert.That(state.Settlement.ReduceIncomingDamage(1), Is.Zero);
+            Assert.That(state.Settlement.ReduceIncomingDamage(2), Is.Zero);
+            Assert.That(state.Settlement.IncomingDamageTouchedCount(0), Is.Zero);
+            Assert.That(state.Settlement.IncomingDamageTouchedCount(1), Is.Zero);
+            Assert.That(state.Settlement.IncomingDamageTouchedCount(2), Is.Zero);
+            Assert.That(state.Settlement.ReadIncomingDamage(0, 3), Is.Zero);
         });
     }
 
@@ -121,49 +121,52 @@ public sealed class CombatTests
 
         for (var shot = 0; shot < 4; shot++)
         {
-            state.RecordIncomingDamage(workerId: 0, targetEntityKey: 1, damage: SpaceBattleCombat.WeaponDamage);
-            state.RecordIncomingDamage(workerId: 1, targetEntityKey: 2, damage: SpaceBattleCombat.WeaponDamage);
+            state.Settlement.RecordIncomingDamage(workerId: 0, targetEntityKey: 1, damage: SpaceBattleCombat.WeaponDamage);
+            state.Settlement.RecordIncomingDamage(workerId: 1, targetEntityKey: 2, damage: SpaceBattleCombat.WeaponDamage);
         }
 
         Assert.Multiple(() =>
         {
-            Assert.That(state.ReduceIncomingDamage(1), Is.EqualTo(1_000u));
-            Assert.That(state.ReduceIncomingDamage(2), Is.EqualTo(1_000u));
+            Assert.That(state.Settlement.ReduceIncomingDamage(1), Is.EqualTo(1_000u));
+            Assert.That(state.Settlement.ReduceIncomingDamage(2), Is.EqualTo(1_000u));
         });
-        state.ClearIncomingDamage();
-        state.RecordIncomingDamage(workerId: 0, targetEntityKey: 1, damage: 1_000u);
-        state.RecordIncomingDamage(workerId: 1, targetEntityKey: 2, damage: 1_000u);
+        state.Settlement.ClearIncomingDamage();
+        state.Settlement.RecordIncomingDamage(workerId: 0, targetEntityKey: 1, damage: 1_000u);
+        state.Settlement.RecordIncomingDamage(workerId: 1, targetEntityKey: 2, damage: 1_000u);
         Assert.Multiple(() =>
         {
-            Assert.That(state.ReduceIncomingDamage(1), Is.EqualTo(1_000u));
-            Assert.That(state.ReduceIncomingDamage(2), Is.EqualTo(1_000u));
+            Assert.That(state.Settlement.ReduceIncomingDamage(1), Is.EqualTo(1_000u));
+            Assert.That(state.Settlement.ReduceIncomingDamage(2), Is.EqualTo(1_000u));
         });
-        state.ClearIncomingDamage();
+        state.Settlement.ClearIncomingDamage();
 
-        state.UpdateFrameHealth(1, 0);
-        state.UpdateFrameHealth(2, 0);
-        Assert.That(state.TryGetFrameIndex(1, out var lethalFrameIndex), Is.True);
-        Assert.That(MovementSystem.CanMove(state.GetFrame(lethalFrameIndex), pendingReap: true), Is.False);
-        state.MarkForReap(workerId: 0, entityKey: 1);
-        state.MarkForReap(workerId: 1, entityKey: 2);
+        state.Frames.UpdateHealth(1, 0);
+        state.Frames.UpdateHealth(2, 0);
+        Assert.That(state.Frames.TryGetIndex(1, out var lethalFrameIndex), Is.True);
+        ref readonly var lethalFrame = ref state.Frames.GetPublished(lethalFrameIndex);
+        Assert.That(
+            state.BehaviorModes.TryMove(lethalFrame, lethalFrame.Motion, pendingReap: true, out _, out _),
+            Is.False);
+        state.Settlement.MarkForReap(workerId: 0, entityKey: 1);
+        state.Settlement.MarkForReap(workerId: 1, entityKey: 2);
 
         Span<EntityId> deaths = stackalloc EntityId[2];
-        var deathCount = state.CopyPendingReaps(deaths);
+        var deathCount = state.Settlement.CopyPendingReaps(deaths);
         var deathKeys = deaths[..deathCount].ToArray().Select(static id => id.EntityKey).ToArray();
         Assert.Multiple(() =>
         {
             Assert.That(deathCount, Is.EqualTo(2));
             Assert.That(deathKeys, Is.EqualTo(new long[] { 1, 2 }));
-            Assert.That(state.BuildPublishedSnapshot().Ships, Is.Empty);
+            Assert.That(state.Frames.BuildPublishedSnapshot().Ships, Is.Empty);
         });
 
-        state.ClearIncomingDamage();
+        state.Settlement.ClearIncomingDamage();
         Assert.Multiple(() =>
         {
-            Assert.That(state.ReduceIncomingDamage(1), Is.Zero);
-            Assert.That(state.ReduceIncomingDamage(2), Is.Zero);
-            Assert.That(state.IsPendingReap(1), Is.True);
-            Assert.That(state.IsPendingReap(2), Is.True);
+            Assert.That(state.Settlement.ReduceIncomingDamage(1), Is.Zero);
+            Assert.That(state.Settlement.ReduceIncomingDamage(2), Is.Zero);
+            Assert.That(state.Settlement.IsPendingReap(1), Is.True);
+            Assert.That(state.Settlement.IsPendingReap(2), Is.True);
         });
     }
 
@@ -177,36 +180,19 @@ public sealed class CombatTests
         state.PrepareTick(1);
         PublishFrames(state, engine, 3);
 
-        state.MarkForReap(workerId: 1, entityKey: 2);
-        state.MarkForReap(workerId: 0, entityKey: 1);
-        state.MarkForReap(workerId: 1, entityKey: 3);
+        state.Settlement.MarkForReap(workerId: 1, entityKey: 2);
+        state.Settlement.MarkForReap(workerId: 0, entityKey: 1);
+        state.Settlement.MarkForReap(workerId: 1, entityKey: 3);
 
         Span<EntityId> destination = stackalloc EntityId[3];
-        var count = state.CopyPendingReaps(destination);
+        var count = state.Settlement.CopyPendingReaps(destination);
         Assert.That(destination[..count].ToArray().Select(static id => id.EntityKey), Is.EqualTo(new long[] { 1, 2, 3 }));
-        Assert.That(state.PendingReapCount, Is.EqualTo(3));
+        Assert.That(state.Settlement.PendingReapCount, Is.EqualTo(3));
 
-        state.CompleteReaps();
-        Assert.That(state.PendingReapCount, Is.Zero);
+        state.Settlement.CompleteReaps();
+        Assert.That(state.Settlement.PendingReapCount, Is.Zero);
     }
 
-    [Test]
-    public void CloseShips_ConsumePeriodicDamageAndAreReaped()
-    {
-        var definition = new SimulationDefinition(
-            shipCount: 2,
-            seed: SimulationDefinition.DefaultSeed,
-            worldWidth: 1f,
-            worldHeight: 1f,
-            worldDepth: 1f,
-            maximumHealth: 1_000,
-            maximumCompletedTicks: 130);
-
-        var result = SpaceBattleHost.Run(definition, _root, CancellationToken.None, new RecordingSink());
-
-        Assert.That(result.RemainingShips, Is.LessThan(2));
-        Assert.That(SpaceBattleHost.ReadShipCount(definition, _root), Is.EqualTo(result.RemainingShips));
-    }
 
     private static SimulationDefinition CreateDefinition(int shipCount, ulong maximumCompletedTicks) =>
         new(
@@ -224,7 +210,7 @@ public sealed class CombatTests
         foreach (var entityId in transaction.QueryExact<Ship>().Execute().OrderBy(static id => id.EntityKey).Take(shipCount))
         {
             var entity = transaction.Open(entityId);
-            state.PublishFrame(entityId, new ShipSnapshot(
+            state.Frames.Publish(entityId, new ShipSnapshot(
                 entityId.EntityKey,
                 entity.Read(Ship.Hull),
                 entity.Read(Ship.Motion),

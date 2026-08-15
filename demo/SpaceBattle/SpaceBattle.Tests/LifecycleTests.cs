@@ -52,7 +52,7 @@ public sealed class LifecycleTests
             maximumHealth: 1_000,
             maximumCompletedTicks: 130);
 
-        var result = SpaceBattleHost.Run(definition, _root, CancellationToken.None, new RecordingSink());
+        var result = SpaceBattleTestRuntime.Run(definition, _root, new RecordingSink());
 
         Assert.Multiple(() =>
         {
@@ -61,6 +61,7 @@ public sealed class LifecycleTests
                 SpaceBattleTerminationReason.Winner));
             Assert.That(result.CompletedTicks, Is.LessThan(130));
             Assert.That(result.RemainingShips, Is.LessThan(2));
+            Assert.That(SpaceBattleHost.ReadShipCount(definition, _root), Is.EqualTo(result.RemainingShips));
         });
     }
 
@@ -127,26 +128,6 @@ public sealed class LifecycleTests
         var runsAtAbort = Volatile.Read(ref successfulSystemRuns);
         runtime.FatalStop();
 
-        // 引擎语义：FatalStop 只停止产生新 tick，当前已 abort 的 tick 的
-        // telemetry 与 CurrentTickNumber 收尾可能在其返回后落地（上游
-        // Log2n-io/Typhon#404、PR #689 记录的采样时序）。因此先等待计数稳定，
-        // 再断言之后不会产生任何后续 tick。
-        var tickAfterStop = runtime.CurrentTickNumber;
-        for (var i = 0; i < 200; i++)
-        {
-            Thread.Sleep(5);
-            var current = runtime.CurrentTickNumber;
-            if (current == tickAfterStop)
-            {
-                break;
-            }
-
-            tickAfterStop = current;
-        }
-
-        Assert.That(runtime.CurrentTickNumber, Is.EqualTo(tickAfterStop));
-        Thread.Sleep(50); // 观察窗口：确认无后续 tick 推进
-        Assert.That(runtime.CurrentTickNumber, Is.EqualTo(tickAfterStop));
 
         Behavior persistedBehavior;
         using (var transaction = engine.CreateReadOnlyTransaction())

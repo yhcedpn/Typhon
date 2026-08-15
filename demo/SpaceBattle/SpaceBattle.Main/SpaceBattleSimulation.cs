@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Diagnostics;
 using System.Numerics;
 using Typhon.Engine;
@@ -9,99 +8,52 @@ namespace SpaceBattle;
 internal sealed class SpaceBattleSimulationState : IDisposable
 {
     private readonly object _tickGate = new();
-    private readonly int[] _frameGenerations;
-    private readonly int[] _modifiedGenerations;
-    private readonly int[] _reapGenerations;
-    private readonly EntityId[] _entityIds;
-    private readonly ShipSnapshot[] _telemetryFrames;
-    private readonly ShipSnapshot[] _frames;
-    private readonly uint[][] _incomingDamageLanes;
-    private readonly long[][] _incomingDamageTouchedKeys;
-    private readonly int[][] _incomingDamageTouchedGenerations;
-    private readonly int[] _incomingDamageTouchedCounts;
-    private readonly EntityId[][] _reapBuffers;
-    private readonly int[] _reapCounts;
-    private readonly long[] _directTargetingQueries;
-    private readonly long[] _batchedTargetingQueries;
-    private readonly long[] _gatherTargetingCandidates;
-    private readonly long[] _exactTargetingDistanceTests;
-    private readonly SpaceBattleSystemMetricAccumulator[] _systemMetrics;
-    private readonly object _telemetryGate = new();
-    private TyphonRuntime _runtime;
-    private SpaceBattleTelemetrySnapshot _lastTelemetry;
-    private long _dirtyMarkTicks;
-    private long _dirtyMarkCount;
-    private int _dirtyMarkWorkerMask;
-    private long _weaponUses;
-    private long _inRangeAttacks;
-    private long _damageApplied;
-    private long _deaths;
-    private long _lastCapturedRuntimeTick = -1;
     private readonly SimulationDefinition _definition;
-    private long _preparedTick = -1;
     private readonly ISpaceBattleObservationSink _observationSink;
-    private int _generation;
-    private int _publishedShipCount;
-    private int _publishedAliveShipCount;
+    private readonly Action _tickCompleted;
+    private readonly bool _enforceMaximumCompletedTicks;
+    private long _preparedTick = -1;
     private long _tickStartedAt;
     private long _lastCompletedTickStartedAt;
-    private bool _disposed;
-    private readonly AcquisitionTransactionSlot[] _acquisitionTransactions;
-    private long _acquisitionTransactionsCreated;
-    private long _acquisitionTransactionsDisposed;
     private int _lastCompletedRemainingShips;
     private long _completedTicks;
+    private bool _disposed;
+
     public SpaceBattleSimulationState(
         DatabaseEngine engine,
         SimulationDefinition definition,
         ISpaceBattleObservationSink observationSink,
-        int workerCount)
+        int workerCount,
+        Action tickCompleted = null,
+        bool enforceMaximumCompletedTicks = false)
     {
         Engine = engine ?? throw new ArgumentNullException(nameof(engine));
         _definition = definition ?? throw new ArgumentNullException(nameof(definition));
         _observationSink = observationSink ?? throw new ArgumentNullException(nameof(observationSink));
+        _tickCompleted = tickCompleted;
+        _enforceMaximumCompletedTicks = enforceMaximumCompletedTicks;
         WorkerCount = workerCount;
         ChunkCount = Math.Max(1, workerCount * 2);
-        var capacity = checked(definition.ShipCount + 1);
-        _frameGenerations = new int[capacity];
-        _modifiedGenerations = new int[capacity];
-        _reapGenerations = new int[capacity];
-        _entityIds = new EntityId[capacity];
-        _frames = new ShipSnapshot[capacity];
-        _telemetryFrames = new ShipSnapshot[capacity];
-        _incomingDamageLanes = new uint[workerCount][];
-        _incomingDamageTouchedKeys = new long[workerCount][];
-        _incomingDamageTouchedGenerations = new int[workerCount][];
-        _incomingDamageTouchedCounts = new int[workerCount];
-        _reapBuffers = new EntityId[workerCount][];
-        _reapCounts = new int[workerCount];
-        _directTargetingQueries = new long[workerCount];
-        _batchedTargetingQueries = new long[workerCount];
-        _gatherTargetingCandidates = new long[workerCount];
-        _exactTargetingDistanceTests = new long[workerCount];
-        _systemMetrics = new SpaceBattleSystemMetricAccumulator[SpaceBattleSystemMetricCatalog.Names.Length];
-        for (var metricId = 0; metricId < _systemMetrics.Length; metricId++)
-        {
-            _systemMetrics[metricId] = new SpaceBattleSystemMetricAccumulator();
-        }
-        _acquisitionTransactions = new AcquisitionTransactionSlot[workerCount];
-        for (var workerId = 0; workerId < workerCount; workerId++)
-        {
-            _incomingDamageLanes[workerId] = new uint[capacity];
-            _incomingDamageTouchedKeys[workerId] = new long[capacity];
-            _incomingDamageTouchedGenerations[workerId] = new int[capacity];
-            _reapBuffers[workerId] = new EntityId[capacity];
-        }
-        for (var workerId = 0; workerId < workerCount; workerId++)
-        {
-            _acquisitionTransactions[workerId] = new AcquisitionTransactionSlot();
-        }
+        Frames = new SpaceBattleFrameStore(definition.ShipCount);
+        Settlement = new SpaceBattleCombatSettlement(Frames, workerCount);
+        AcquisitionTransactions = new SpaceBattleAcquisitionTransactions(engine, workerCount);
+        BehaviorModes = new SpaceBattleBehaviorModes(this);
+        Telemetry = new SpaceBattleTelemetryState(workerCount);
         Accessor = new PointInTimeAccessor();
     }
 
     public DatabaseEngine Engine { get; }
 
     public PointInTimeAccessor Accessor { get; }
+
+    public SpaceBattleFrameStore Frames { get; }
+
+    public SpaceBattleCombatSettlement Settlement { get; }
+
+    public SpaceBattleAcquisitionTransactions AcquisitionTransactions { get; }
+    public SpaceBattleBehaviorModes BehaviorModes { get; }
+
+    public SpaceBattleTelemetryState Telemetry { get; }
 
     public int WorkerCount { get; }
 
@@ -116,468 +68,26 @@ internal sealed class SpaceBattleSimulationState : IDisposable
     public float FixedDeltaSeconds => _definition.FixedDeltaSeconds;
 
     public float WorldWidth => _definition.WorldWidth;
+
     public float WorldHeight => _definition.WorldHeight;
+
     public float WorldDepth => _definition.WorldDepth;
+
     public ulong MaximumCompletedTicks => _definition.MaximumCompletedTicks;
 
     public long CompletedTicks => Interlocked.Read(ref _completedTicks);
-    public long TickStartedAt => Volatile.Read(ref _tickStartedAt);
-    public bool IsTickInFlight => Volatile.Read(ref _tickStartedAt) != Volatile.Read(ref _lastCompletedTickStartedAt);
-    public bool IsAtCompletionBoundary(long zeroBasedTickNumber) =>
-        zeroBasedTickNumber >= 0 &&
-        CompletedTicks >= zeroBasedTickNumber + 1 &&
-        !IsTickInFlight;
 
+    public bool IsTickInFlight =>
+        Volatile.Read(ref _tickStartedAt) != Volatile.Read(ref _lastCompletedTickStartedAt);
 
-    public int CurrentGeneration => Volatile.Read(ref _generation);
+    public int PublishedShipCount => Frames.PublishedShipCount;
 
-    public int PublishedShipCount => Volatile.Read(ref _publishedShipCount);
-    public int PublishedAliveShipCount => Volatile.Read(ref _publishedAliveShipCount);
+    public bool ShouldExecuteTick(long tickNumber) =>
+        !_enforceMaximumCompletedTicks || (tickNumber >= 0 && (ulong)tickNumber < MaximumCompletedTicks);
+
+    public int PublishedAliveShipCount => Frames.PublishedAliveShipCount;
 
     public int LastCompletedRemainingShips => Volatile.Read(ref _lastCompletedRemainingShips);
-    public long AcquisitionTransactionsCreated => Interlocked.Read(ref _acquisitionTransactionsCreated);
-    public long AcquisitionTransactionsDisposed => Interlocked.Read(ref _acquisitionTransactionsDisposed);
-
-    public long DirectTargetingQueryCount => Sum(_directTargetingQueries);
-
-    public long BatchedTargetingQueryCount => Sum(_batchedTargetingQueries);
-
-    public long GatherTargetingCandidateCount => Sum(_gatherTargetingCandidates);
-
-    public long ExactTargetingDistanceTestCount => Sum(_exactTargetingDistanceTests);
-    public long WeaponUseCount => Interlocked.Read(ref _weaponUses);
-
-    public long InRangeAttackCount => Interlocked.Read(ref _inRangeAttacks);
-
-    public long DamageApplied => Interlocked.Read(ref _damageApplied);
-
-    public long DeathCount => Interlocked.Read(ref _deaths);
-
-    public SpaceBattleTelemetrySnapshot LastTelemetry
-    {
-        get
-        {
-            lock (_telemetryGate)
-            {
-                return _lastTelemetry;
-            }
-        }
-    }
-
-    public int ActiveAcquisitionTransactions
-    {
-        get
-        {
-            var active = 0;
-            foreach (var slot in _acquisitionTransactions)
-            {
-                if (Volatile.Read(ref slot.Transaction) is not null)
-                {
-                    active++;
-                }
-            }
-
-            return active;
-        }
-    }
-
-    public Transaction GetAcquisitionTransaction(int workerId, long tickNumber)
-    {
-        if ((uint)workerId >= (uint)_acquisitionTransactions.Length)
-        {
-            throw new ArgumentOutOfRangeException(nameof(workerId));
-        }
-
-        var slot = _acquisitionTransactions[workerId];
-        var threadId = Environment.CurrentManagedThreadId;
-        var transaction = Volatile.Read(ref slot.Transaction);
-        if (transaction is not null)
-        {
-            if (slot.OwnerThreadId != threadId)
-            {
-                throw new InvalidOperationException("SpaceBattle acquisition transaction 必须在创建它的 worker 线程上复用。");
-            }
-
-            if (tickNumber - slot.CreatedTick <= 1)
-            {
-                return transaction;
-            }
-
-            ReleaseAcquisitionTransaction(workerId);
-        }
-
-        transaction = Engine.CreateReadOnlyTransaction();
-        slot.OwnerThreadId = threadId;
-        slot.CreatedTick = tickNumber;
-        Volatile.Write(ref slot.Transaction, transaction);
-        Interlocked.Increment(ref _acquisitionTransactionsCreated);
-        return transaction;
-    }
-
-    public void ReleaseAcquisitionTransaction(int workerId)
-    {
-        if ((uint)workerId >= (uint)_acquisitionTransactions.Length)
-        {
-            throw new ArgumentOutOfRangeException(nameof(workerId));
-        }
-
-        var slot = _acquisitionTransactions[workerId];
-        var transaction = Volatile.Read(ref slot.Transaction);
-        if (transaction is null)
-        {
-            return;
-        }
-
-        if (slot.OwnerThreadId != Environment.CurrentManagedThreadId)
-        {
-            throw new InvalidOperationException("SpaceBattle acquisition transaction 只能在原 worker 线程上释放。");
-        }
-
-        Volatile.Write(ref slot.Transaction, null);
-        slot.OwnerThreadId = 0;
-        slot.CreatedTick = -1;
-        transaction.Dispose();
-        Interlocked.Increment(ref _acquisitionTransactionsDisposed);
-    }
-
-    public void ReleaseAcquisitionTransactionIfOwnedByCurrentThread(int workerId)
-    {
-        if ((uint)workerId >= (uint)_acquisitionTransactions.Length)
-        {
-            return;
-        }
-
-        var slot = _acquisitionTransactions[workerId];
-        if (Volatile.Read(ref slot.Transaction) is not null && slot.OwnerThreadId == Environment.CurrentManagedThreadId)
-        {
-            ReleaseAcquisitionTransaction(workerId);
-        }
-    }
-    public int ReleaseAllAcquisitionTransactions()
-    {
-        var released = 0;
-        foreach (var slot in _acquisitionTransactions)
-        {
-            var transaction = Interlocked.Exchange(ref slot.Transaction, null);
-            if (transaction is null)
-            {
-                continue;
-            }
-
-            slot.OwnerThreadId = 0;
-            slot.CreatedTick = -1;
-            try
-            {
-                transaction.Dispose();
-            }
-            catch (Exception)
-            {
-                // runtime 已停止，单个事务清理失败不能阻止其他 worker-owned 事务释放。
-            }
-
-            Interlocked.Increment(ref _acquisitionTransactionsDisposed);
-            released++;
-        }
-
-        return released;
-    }
-
-
-    private sealed class AcquisitionTransactionSlot
-    {
-        public Transaction Transaction;
-        public long CreatedTick = -1;
-        public int OwnerThreadId;
-    }
-    public void RecordTargetingMetrics(int workerId, in TargetingQueryMetrics metrics)
-    {
-        if ((uint)workerId >= (uint)WorkerCount)
-        {
-            throw new ArgumentOutOfRangeException(nameof(workerId));
-        }
-
-        _directTargetingQueries[workerId] += metrics.DirectQueryCount;
-        _batchedTargetingQueries[workerId] += metrics.BatchedQueryCount;
-        _gatherTargetingCandidates[workerId] += metrics.GatherCandidateCount;
-        _exactTargetingDistanceTests[workerId] += metrics.ExactDistanceTestCount;
-    }
-    public void RecordSystemMetric(
-        SpaceBattleSystemMetricId metricId,
-        long startedAt,
-        int entities,
-        int workerId)
-    {
-        var elapsed = Stopwatch.GetTimestamp() - startedAt;
-        if (elapsed < 0)
-        {
-            elapsed = 0;
-        }
-
-        _systemMetrics[(int)metricId].Record(elapsed, entities, workerId);
-    }
-
-    private void RecordSystemMetricAggregate(
-        SpaceBattleSystemMetricId metricId,
-        long elapsed,
-        int entities,
-        int workerCount)
-    {
-        _systemMetrics[(int)metricId].RecordAggregate(elapsed, entities, workerCount);
-    }
-
-    public void RecordWeaponUse() => Interlocked.Increment(ref _weaponUses);
-
-    public void RecordInRangeAttack() => Interlocked.Increment(ref _inRangeAttacks);
-
-    public void RecordDamage(uint damage) => Interlocked.Add(ref _damageApplied, damage);
-
-    public void RecordDeath() => Interlocked.Increment(ref _deaths);
-
-    public void AttachRuntime(TyphonRuntime runtime)
-    {
-        lock (_telemetryGate)
-        {
-            _runtime = runtime;
-        }
-    }
-
-    /// <summary>
-    /// 在 runtime 的围栏完成后读取一条完整 telemetry。Host 不调用时，Observe 仍提供应用侧稳定统计。
-    /// </summary>
-    public void CaptureRuntimeTelemetry(TyphonRuntime runtime = null)
-    {
-        runtime ??= _runtime;
-        if (runtime is null)
-        {
-            return;
-        }
-
-        var ring = runtime.Telemetry;
-        var tickNumber = ring.NewestTick;
-        if (tickNumber < 0)
-        {
-            return;
-        }
-
-        SpaceBattleTelemetrySnapshot baseSnapshot;
-        lock (_telemetryGate)
-        {
-            if (_lastCapturedRuntimeTick >= tickNumber || _lastTelemetry is null || _lastTelemetry.TickNumber != tickNumber)
-            {
-                return;
-            }
-
-            baseSnapshot = _lastTelemetry;
-        }
-
-        try
-        {
-            ref readonly var tick = ref ring.GetTick(tickNumber);
-            var runtimeSystems = BuildRuntimeSystemMetrics(runtime, tickNumber);
-            var performance = baseSnapshot.TickPerformance with
-            {
-                ActualHz = baseSnapshot.TickPerformance.ActualHz,
-                Overload = tick.CurrentLevel.ToString().ToLowerInvariant(),
-                TickMultiplier = Math.Max(1, tick.TickMultiplier),
-                WorkerCount = tick.ActiveWorkerCount > 0 ? tick.ActiveWorkerCount : WorkerCount,
-                SystemCount = runtime.Systems.Length,
-                SystemMetrics = runtimeSystems,
-            };
-            var enriched = baseSnapshot with
-            {
-                TickPerformance = performance,
-                Systems = runtimeSystems,
-                HasRuntimeTelemetry = true,
-            };
-            lock (_telemetryGate)
-            {
-                _lastCapturedRuntimeTick = tickNumber;
-                _lastTelemetry = enriched;
-            }
-
-            _observationSink.Publish(new SimulationTelemetrySample(enriched));
-        }
-        catch (ArgumentOutOfRangeException)
-        {
-            // ring 在最新 tick 读取与访问器之间可能轮转；下一个边界可重试。
-        }
-    }
-
-    private static IReadOnlyList<SpaceBattleSystemTelemetrySnapshot> BuildRuntimeSystemMetrics(
-        TyphonRuntime runtime,
-        long tickNumber)
-    {
-        var definitions = runtime.Systems;
-        var metrics = runtime.Telemetry.GetSystemMetrics(tickNumber);
-        var snapshots = new SpaceBattleSystemTelemetrySnapshot[definitions.Length];
-        for (var index = 0; index < definitions.Length; index++)
-        {
-            var system = metrics[index];
-            var duration = Math.Max(0d, system.DurationUs);
-            snapshots[index] = new SpaceBattleSystemTelemetrySnapshot(
-                definitions[index].Name ?? $"system_{index.ToString(CultureInfo.InvariantCulture)}",
-                duration,
-                duration,
-                duration,
-                system.EntitiesProcessed,
-                system.WorkersTouched,
-                1);
-        }
-
-        return snapshots;
-    }
-
-    private SpaceBattleTelemetrySnapshot BuildTelemetry(long tickNumber, TickTiming timing)
-    {
-        FlushDirtyMarkMetric();
-        var alive = 0;
-        var wandering = 0;
-        var tracking = 0;
-        var approaching = 0;
-        var attacking = 0;
-        var turning = 0;
-        var validLocks = 0;
-        var generation = CurrentGeneration;
-        for (var index = 1; index < _frames.Length; index++)
-        {
-            if (Volatile.Read(ref _frameGenerations[index]) != generation)
-            {
-                continue;
-            }
-
-            ref readonly var ship = ref _telemetryFrames[index];
-            if (ship.Vitals.CurrentHealth == 0)
-            {
-                continue;
-            }
-
-            alive++;
-
-            switch ((BehaviorMode)ship.Behavior.Mode)
-            {
-                case BehaviorMode.Wandering:
-                    wandering++;
-                    break;
-                case BehaviorMode.Tracking:
-                    tracking++;
-                    break;
-                case BehaviorMode.Approaching:
-                    approaching++;
-                    break;
-                case BehaviorMode.Attacking:
-                    attacking++;
-                    break;
-                case BehaviorMode.Turning:
-                    turning++;
-                    break;
-                default:
-                    wandering++;
-                    break;
-            }
-
-            if (ship.Targeting.TargetEntityId != 0 && IsTelemetryLockValid(ship))
-            {
-                validLocks++;
-            }
-        }
-
-        var systems = new SpaceBattleSystemTelemetrySnapshot[_systemMetrics.Length];
-        for (var metricId = 0; metricId < _systemMetrics.Length; metricId++)
-        {
-            var snapshot = _systemMetrics[metricId].Snapshot(SpaceBattleSystemMetricCatalog.Names[metricId]);
-            if (snapshot.SampleCount == 0 && metricId >= (int)SpaceBattleSystemMetricId.DirtyMarking)
-            {
-                snapshot = snapshot with { Workers = WorkerCount };
-            }
-
-            systems[metricId] = snapshot;
-        }
-
-        var performance = timing?.Snapshot(
-            workerCount: WorkerCount,
-            systemCount: SpaceBattleSystemMetricCatalog.Names.Length)
-            ?? new TickPerformanceSnapshot(
-                0,
-                0,
-                0,
-                0,
-                0)
-            {
-                WorkerCount = WorkerCount,
-                SystemCount = SpaceBattleSystemMetricCatalog.Names.Length,
-            };
-        performance = performance with { SystemMetrics = systems };
-        var telemetry = new SpaceBattleTelemetrySnapshot(
-            tickNumber,
-            alive,
-            wandering,
-            tracking,
-            approaching,
-            attacking,
-            turning,
-            validLocks,
-            performance,
-            new SpaceBattleQueryMetricsSnapshot(
-                DirectTargetingQueryCount,
-                BatchedTargetingQueryCount,
-                GatherTargetingCandidateCount,
-                ExactTargetingDistanceTestCount),
-            new SpaceBattleCombatMetricsSnapshot(
-                WeaponUseCount,
-                InRangeAttackCount,
-                DamageApplied,
-                DeathCount),
-            systems);
-
-        lock (_telemetryGate)
-        {
-            _lastTelemetry = telemetry;
-        }
-
-        return telemetry;
-    }
-
-    private bool IsTelemetryLockValid(in ShipSnapshot source)
-    {
-        var targetKey = SpaceBattleTargeting.EntityKeyFromRaw(source.Targeting.TargetEntityId);
-        if (targetKey == 0 || targetKey == source.EntityKey || !TryGetFrameIndex(targetKey, out var targetIndex))
-        {
-            return false;
-        }
-
-        ref readonly var target = ref _telemetryFrames[targetIndex];
-        return target.Vitals.CurrentHealth > 0 &&
-               SpaceBattleTargeting.DistanceSquared(source, target) <=
-               SpaceBattleTargeting.LockRange * SpaceBattleTargeting.LockRange;
-    }
-
-    private void FlushDirtyMarkMetric()
-    {
-        var elapsed = Interlocked.Exchange(ref _dirtyMarkTicks, 0);
-        var count = Interlocked.Exchange(ref _dirtyMarkCount, 0);
-        var workers = Interlocked.Exchange(ref _dirtyMarkWorkerMask, 0);
-        if (count == 0 && elapsed == 0)
-        {
-            return;
-        }
-
-        RecordSystemMetricAggregate(
-            SpaceBattleSystemMetricId.DirtyMarking,
-            elapsed,
-            checked((int)Math.Min(count, int.MaxValue)),
-            BitOperations.PopCount((uint)workers));
-    }
-
-    private static long Sum(long[] values)
-    {
-        var total = 0L;
-        foreach (var value in values)
-        {
-            total += value;
-        }
-
-        return total;
-    }
 
     public void PrepareTick(long tickNumber)
     {
@@ -594,16 +104,11 @@ internal sealed class SpaceBattleSimulationState : IDisposable
             }
 
             _preparedTick = tickNumber;
-            _generation++;
-            _publishedShipCount = 0;
-            _publishedAliveShipCount = 0;
-            ClearIncomingDamage();
-            Array.Clear(_reapCounts);
+            Frames.BeginTick();
             _tickStartedAt = Stopwatch.GetTimestamp();
             Accessor.Attach(Engine, WorkerCount);
         }
     }
-
 
     public EntityAccessor GetWorkerAccessor(int workerId) => Accessor.GetWorkerAccessor(workerId);
 
@@ -621,53 +126,6 @@ internal sealed class SpaceBattleSimulationState : IDisposable
         var end = (int)((long)(chunkIndex + 1) * clusterCount / chunkCount);
         return (start, end);
     }
-    public void PublishFrame(EntityId entityId, in ShipSnapshot frame)
-    {
-        var key = frame.EntityKey;
-        if (key <= 0 || (ulong)key >= (ulong)_frames.Length)
-        {
-            throw new InvalidOperationException($"SpaceBattle EntityKey {key} 超出快照容量。");
-        }
-        var index = (int)key;
-
-        var wasPublished = Volatile.Read(ref _frameGenerations[index]) == CurrentGeneration;
-        var previousHealth = _frames[index].Vitals.CurrentHealth;
-        _entityIds[index] = entityId;
-        _frames[index] = frame;
-        _telemetryFrames[index] = frame;
-        Volatile.Write(ref _frameGenerations[index], CurrentGeneration);
-        if (!wasPublished)
-        {
-            Interlocked.Increment(ref _publishedShipCount);
-            if (frame.Vitals.CurrentHealth > 0)
-            {
-                Interlocked.Increment(ref _publishedAliveShipCount);
-            }
-        }
-        else if (previousHealth > 0 && frame.Vitals.CurrentHealth == 0)
-        {
-            Interlocked.Decrement(ref _publishedAliveShipCount);
-        }
-        else if (previousHealth == 0 && frame.Vitals.CurrentHealth > 0)
-        {
-            Interlocked.Increment(ref _publishedAliveShipCount);
-        }
-    }
-    public bool TryGetFrameIndex(long entityKey, out int index)
-    {
-        if ((ulong)entityKey < (ulong)_frames.Length)
-        {
-            index = (int)entityKey;
-            return Volatile.Read(ref _frameGenerations[index]) == CurrentGeneration;
-        }
-
-        index = -1;
-        return false;
-    }
-
-    public ref readonly ShipSnapshot GetFrame(int index) => ref _frames[index];
-
-    public void MarkModified(long entityKey) => MarkModified(0, entityKey);
 
     public void MarkModified(int workerId, long entityKey)
     {
@@ -677,279 +135,21 @@ internal sealed class SpaceBattleSimulationState : IDisposable
         }
 
         var startedAt = Stopwatch.GetTimestamp();
-        if (!TryGetFrameIndex(entityKey, out var index))
+        if (Frames.MarkModified(entityKey))
         {
-            return;
+            Telemetry.RecordDirtyMark(Stopwatch.GetTimestamp() - startedAt, workerId);
         }
-
-        Volatile.Write(ref _modifiedGenerations[index], CurrentGeneration);
-        var elapsed = Stopwatch.GetTimestamp() - startedAt;
-        Interlocked.Add(ref _dirtyMarkTicks, Math.Max(0, elapsed));
-        Interlocked.Increment(ref _dirtyMarkCount);
-        Interlocked.Or(ref _dirtyMarkWorkerMask, 1 << workerId);
-    }
-
-    public bool WasModified(int index) => Volatile.Read(ref _modifiedGenerations[index]) == CurrentGeneration;
-
-    public void RecordIncomingDamage(int workerId, long targetEntityKey, uint damage)
-    {
-        if ((uint)workerId >= (uint)WorkerCount)
-        {
-            throw new ArgumentOutOfRangeException(nameof(workerId));
-        }
-
-        if (damage == 0 || !TryGetSlotIndex(targetEntityKey, out var index))
-        {
-            return;
-        }
-
-        var touchedGenerations = _incomingDamageTouchedGenerations[workerId];
-        if (touchedGenerations[index] != CurrentGeneration)
-        {
-            touchedGenerations[index] = CurrentGeneration;
-            var touchedCount = _incomingDamageTouchedCounts[workerId];
-            var touchedKeys = _incomingDamageTouchedKeys[workerId];
-            if ((uint)touchedCount >= (uint)touchedKeys.Length)
-            {
-                throw new InvalidOperationException("SpaceBattle incoming damage touched-key 缓冲区不足。");
-            }
-
-            touchedKeys[touchedCount] = targetEntityKey;
-            _incomingDamageTouchedCounts[workerId] = touchedCount + 1;
-        }
-
-        var lane = _incomingDamageLanes[workerId];
-        lane[index] = unchecked(lane[index] + damage);
-    }
-
-    public uint ReadIncomingDamage(int workerId, long targetEntityKey)
-    {
-        if ((uint)workerId >= (uint)WorkerCount)
-        {
-            throw new ArgumentOutOfRangeException(nameof(workerId));
-        }
-
-        return TryGetSlotIndex(targetEntityKey, out var index)
-            ? _incomingDamageLanes[workerId][index]
-            : 0u;
-    }
-
-    public int IncomingDamageTouchedCount(int workerId)
-    {
-        if ((uint)workerId >= (uint)WorkerCount)
-        {
-            throw new ArgumentOutOfRangeException(nameof(workerId));
-        }
-
-        return _incomingDamageTouchedCounts[workerId];
-    }
-
-    public ReadOnlySpan<long> IncomingDamageTouchedKeys(int workerId)
-    {
-        if ((uint)workerId >= (uint)WorkerCount)
-        {
-            throw new ArgumentOutOfRangeException(nameof(workerId));
-        }
-
-        return _incomingDamageTouchedKeys[workerId].AsSpan(0, _incomingDamageTouchedCounts[workerId]);
-    }
-
-    public uint ReduceIncomingDamage(long targetEntityKey)
-    {
-        if (!TryGetSlotIndex(targetEntityKey, out var index))
-        {
-            return 0u;
-        }
-
-        var total = 0u;
-        for (var workerId = 0; workerId < WorkerCount; workerId++)
-        {
-            total = unchecked(total + _incomingDamageLanes[workerId][index]);
-        }
-
-        return total;
-    }
-
-    public void ClearIncomingDamage()
-    {
-        for (var workerId = 0; workerId < WorkerCount; workerId++)
-        {
-            var lane = _incomingDamageLanes[workerId];
-            var touchedKeys = _incomingDamageTouchedKeys[workerId];
-            var touchedGenerations = _incomingDamageTouchedGenerations[workerId];
-            var touchedCount = _incomingDamageTouchedCounts[workerId];
-            for (var index = 0; index < touchedCount; index++)
-            {
-                if (TryGetSlotIndex(touchedKeys[index], out var entityIndex))
-                {
-                    lane[entityIndex] = 0;
-                    touchedGenerations[entityIndex] = 0;
-                }
-            }
-
-            _incomingDamageTouchedCounts[workerId] = 0;
-        }
-    }
-
-    public void UpdateFrameHealth(long entityKey, uint health)
-    {
-        if (!TryGetFrameIndex(entityKey, out var index))
-        {
-            return;
-        }
-
-        var previousHealth = _frames[index].Vitals.CurrentHealth;
-        _frames[index] = _frames[index] with
-        {
-            Vitals = new Vitals { CurrentHealth = health },
-        };
-        _telemetryFrames[index] = _telemetryFrames[index] with
-        {
-            Vitals = new Vitals { CurrentHealth = health },
-        };
-        if (previousHealth > 0 && health == 0)
-        {
-            Interlocked.Decrement(ref _publishedAliveShipCount);
-        }
-        else if (previousHealth == 0 && health > 0)
-        {
-            Interlocked.Increment(ref _publishedAliveShipCount);
-        }
-    }
-    public void UpdateFrameBehavior(
-        long entityKey,
-        in Motion motion,
-        in Targeting targeting,
-        in Behavior behavior)
-    {
-        if (!TryGetFrameIndex(entityKey, out var index))
-        {
-            return;
-        }
-
-        _telemetryFrames[index] = _telemetryFrames[index] with
-        {
-            Motion = motion,
-            Targeting = targeting,
-            Behavior = behavior,
-        };
-    }
-
-    public void UpdateFrameMovement(long entityKey, in Hull hull, in Motion motion)
-    {
-        if (!TryGetFrameIndex(entityKey, out var index))
-        {
-            return;
-        }
-
-        _telemetryFrames[index] = _telemetryFrames[index] with
-        {
-            Hull = hull,
-            Motion = motion,
-        };
-    }
-
-    public void MarkForReap(int workerId, long entityKey)
-    {
-        if ((uint)workerId >= (uint)WorkerCount)
-        {
-            throw new ArgumentOutOfRangeException(nameof(workerId));
-        }
-
-        if (!TryGetFrameIndex(entityKey, out var index) ||
-            _reapGenerations[index] == CurrentGeneration)
-        {
-            return;
-        }
-
-        _reapGenerations[index] = CurrentGeneration;
-        var reapCount = _reapCounts[workerId];
-        var reapBuffer = _reapBuffers[workerId];
-        if ((uint)reapCount >= (uint)reapBuffer.Length)
-        {
-            throw new InvalidOperationException("SpaceBattle per-worker 死亡缓冲区不足。");
-        }
-
-        reapBuffer[reapCount] = _entityIds[index];
-        _reapCounts[workerId] = reapCount + 1;
-    }
-
-    public bool IsPendingReap(long entityKey) =>
-        TryGetFrameIndex(entityKey, out var index) && _reapGenerations[index] == CurrentGeneration;
-
-    public int PendingReapCount
-    {
-        get
-        {
-            var count = 0;
-            for (var workerId = 0; workerId < WorkerCount; workerId++)
-            {
-                count += _reapCounts[workerId];
-            }
-
-            return count;
-        }
-    }
-
-    public int CopyPendingReaps(Span<EntityId> destination)
-    {
-        var total = PendingReapCount;
-        if (destination.Length < total)
-        {
-            throw new ArgumentException("目标缓冲区不足以容纳待回收实体。", nameof(destination));
-        }
-
-        var offset = 0;
-        for (var workerId = 0; workerId < WorkerCount; workerId++)
-        {
-            var count = _reapCounts[workerId];
-            _reapBuffers[workerId].AsSpan(0, count).CopyTo(destination[offset..]);
-            offset += count;
-        }
-
-        return total;
-    }
-
-    public void CompleteReaps() => Array.Clear(_reapCounts);
-
-    private bool TryGetSlotIndex(long entityKey, out int index)
-    {
-        if ((ulong)entityKey < (ulong)_frames.Length)
-        {
-            index = (int)entityKey;
-            return index > 0;
-        }
-
-        index = -1;
-        return false;
-    }
-
-    public SpaceBattleSnapshot BuildPublishedSnapshot()
-    {
-        var ships = new List<ShipSnapshot>(PublishedShipCount);
-        var generation = CurrentGeneration;
-        for (var index = 1; index < _frames.Length; index++)
-        {
-            if (Volatile.Read(ref _frameGenerations[index]) == generation &&
-                _frames[index].Vitals.CurrentHealth > 0)
-            {
-                ships.Add(_frames[index]);
-            }
-        }
-
-        return new SpaceBattleSnapshot(ships);
     }
 
     public void CompleteTick(long tickNumber, TickTiming timing = null)
     {
         var duration = Stopwatch.GetElapsedTime(_tickStartedAt);
         timing?.RecordTick(duration, _tickStartedAt);
-        var remainingShips = PublishedAliveShipCount;
-        Volatile.Write(ref _lastCompletedRemainingShips, remainingShips);
+        Volatile.Write(ref _lastCompletedRemainingShips, PublishedAliveShipCount);
         SpaceBattleTelemetrySnapshot telemetry = null;
         if (SpaceBattleTelemetrySampling.IsSampleTick(tickNumber))
         {
-            telemetry = BuildTelemetry(tickNumber, timing);
+            telemetry = Telemetry.BuildSnapshot(tickNumber, timing, Frames);
             telemetry = telemetry with
             {
                 TickPerformance = telemetry.TickPerformance with
@@ -957,25 +157,22 @@ internal sealed class SpaceBattleSimulationState : IDisposable
                     Overload = duration.TotalSeconds > FixedDeltaSeconds ? "overload" : "normal",
                 },
             };
-            lock (_telemetryGate)
-            {
-                _lastTelemetry = telemetry;
-            }
         }
 
         _observationSink.Publish(new SimulationTickCompleted(
             tickNumber,
             PublishedShipCount,
             duration,
-            tickNumber + 1 == (long)_definition.MaximumCompletedTicks ? BuildPublishedSnapshot() : null)
+            tickNumber + 1 == (long)_definition.MaximumCompletedTicks
+                ? Frames.BuildPublishedSnapshot()
+                : null)
         {
             Telemetry = telemetry,
         });
         Volatile.Write(ref _lastCompletedTickStartedAt, _tickStartedAt);
         Interlocked.Increment(ref _completedTicks);
+        _tickCompleted?.Invoke();
     }
-
-    public TickPerformanceSnapshot GetTimingSnapshot(TickTiming timing) => timing.Snapshot();
 
     public void Dispose()
     {
@@ -985,11 +182,9 @@ internal sealed class SpaceBattleSimulationState : IDisposable
         }
 
         _disposed = true;
-        ReleaseAllAcquisitionTransactions();
-
+        AcquisitionTransactions.ReleaseAllAfterRuntimeStop();
         Accessor.Dispose();
     }
-
 }
 
 internal enum SpaceBattleRandomPurpose : ulong
@@ -1025,10 +220,10 @@ internal static class SpaceBattleMath
         long modeStartedTick,
         SpaceBattleRandomPurpose purpose)
     {
-        var value = Mix(seed ^ 0xD1B5_4A32_9C87_E601UL);
-        value = Mix(value ^ unchecked((ulong)entityKey + 0x9E37_79B9_7F4A_7C15UL));
-        value = Mix(value ^ unchecked((ulong)modeStartedTick));
-        return Mix(value ^ (ulong)purpose);
+        var value = SplitMix64.Mix(seed ^ 0xD1B5_4A32_9C87_E601UL);
+        value = SplitMix64.Mix(value ^ unchecked((ulong)entityKey + 0x9E37_79B9_7F4A_7C15UL));
+        value = SplitMix64.Mix(value ^ unchecked((ulong)modeStartedTick));
+        return SplitMix64.Mix(value ^ (ulong)purpose);
     }
 
     public static float DeriveUnitFloat(
@@ -1263,10 +458,4 @@ internal static class SpaceBattleMath
         return value / MathF.Sqrt(lengthSquared);
     }
 
-    private static ulong Mix(ulong value)
-    {
-        value = unchecked((value ^ (value >> 30)) * 0xBF58_476D_1CE4_E5B9UL);
-        value = unchecked((value ^ (value >> 27)) * 0x94D0_49BB_1331_11EBUL);
-        return value ^ (value >> 31);
-    }
 }

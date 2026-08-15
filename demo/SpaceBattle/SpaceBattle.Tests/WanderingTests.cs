@@ -1,7 +1,5 @@
-using System.Diagnostics;
 using System.Numerics;
 using NUnit.Framework;
-using Typhon.Engine;
 using Typhon.Schema.Definition;
 
 namespace SpaceBattle.Tests;
@@ -177,7 +175,7 @@ public sealed class WanderingTests
     }
 
     [Test]
-    public void Host_TransitionsAfterTheFiftiethFlyingMoveAndMovesLockedShipsNextTick()
+    public void Runtime_TransitionsAfterTheFiftiethFlyingMoveAndMovesLockedShipsNextTick()
     {
         var definition = new SimulationDefinition(
             shipCount: 1,
@@ -186,41 +184,31 @@ public sealed class WanderingTests
             worldHeight: 10_000f,
             worldDepth: 10_000f,
             maximumHealth: 1_000,
-            maximumCompletedTicks: 1);
+            maximumCompletedTicks: 53);
         var root = Path.Combine(Path.GetTempPath(), "SpaceBattle.Tests", TestContext.CurrentContext.Test.ID);
-        Directory.CreateDirectory(root);
-        try
-        {
-            var initial = Run(definition, root, 1);
-            var firstMove = Run(definition with { MaximumCompletedTicks = 2 }, root, 2);
-            var fiftiethMove = Run(definition with { MaximumCompletedTicks = 51 }, root, 51);
-            var lockedBeforeMove = Run(definition with { MaximumCompletedTicks = 52 }, root, 52);
-            var lockedAfterMove = Run(definition with { MaximumCompletedTicks = 53 }, root, 53);
+        var snapshots = SpaceBattleTestRuntime.CaptureSnapshots(definition, root);
+        var initial = ReadShip(snapshots[1], entityKey: 1);
+        var firstMove = ReadShip(snapshots[2], entityKey: 1);
+        var fiftiethMove = ReadShip(snapshots[51], entityKey: 1);
+        var lockedBeforeMove = ReadShip(snapshots[52], entityKey: 1);
+        var lockedAfterMove = ReadShip(snapshots[53], entityKey: 1);
 
-            Assert.Multiple(() =>
-            {
-                Assert.That(initial.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Wandering));
-                Assert.That(initial.Behavior.Phase, Is.EqualTo((byte)BehaviorPhase.Flying));
-                Assert.That(initial.Behavior.TicksRemaining, Is.EqualTo(SpaceBattleMath.WanderFlightTicks));
-                Assert.That(initial.Motion.Speed, Is.InRange(0f, SpaceBattleMath.MaximumWanderSpeed));
-                Assert.That(firstMove.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Wandering));
-                Assert.That(firstMove.Behavior.TicksRemaining, Is.EqualTo(SpaceBattleMath.WanderFlightTicks - 1));
-                Assert.That(fiftiethMove.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Wandering));
-                Assert.That(fiftiethMove.Behavior.TicksRemaining, Is.Zero);
-                Assert.That(lockedBeforeMove.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Tracking));
-                Assert.That(lockedBeforeMove.Hull, Is.EqualTo(fiftiethMove.Hull));
-                Assert.That(lockedBeforeMove.Motion.Speed, Is.EqualTo(fiftiethMove.Motion.Speed));
-                Assert.That(lockedAfterMove.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Tracking));
-                Assert.That(lockedAfterMove.Hull, Is.Not.EqualTo(lockedBeforeMove.Hull));
-            });
-        }
-        finally
+        Assert.Multiple(() =>
         {
-            if (Directory.Exists(root))
-            {
-                Directory.Delete(root, recursive: true);
-            }
-        }
+            Assert.That(initial.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Wandering));
+            Assert.That(initial.Behavior.Phase, Is.EqualTo((byte)BehaviorPhase.Flying));
+            Assert.That(initial.Behavior.TicksRemaining, Is.EqualTo(SpaceBattleMath.WanderFlightTicks));
+            Assert.That(initial.Motion.Speed, Is.InRange(0f, SpaceBattleMath.MaximumWanderSpeed));
+            Assert.That(firstMove.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Wandering));
+            Assert.That(firstMove.Behavior.TicksRemaining, Is.EqualTo(SpaceBattleMath.WanderFlightTicks - 1));
+            Assert.That(fiftiethMove.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Wandering));
+            Assert.That(fiftiethMove.Behavior.TicksRemaining, Is.Zero);
+            Assert.That(lockedBeforeMove.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Tracking));
+            Assert.That(lockedBeforeMove.Hull, Is.EqualTo(fiftiethMove.Hull));
+            Assert.That(lockedBeforeMove.Motion.Speed, Is.EqualTo(fiftiethMove.Motion.Speed));
+            Assert.That(lockedAfterMove.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Tracking));
+            Assert.That(lockedAfterMove.Hull, Is.Not.EqualTo(lockedBeforeMove.Hull));
+        });
     }
 
 
@@ -235,7 +223,8 @@ public sealed class WanderingTests
             worldDepth: 10f,
             maximumHealth: 250,
             maximumCompletedTicks: 200);
-        var snapshots = RunStateMachine(definition);
+        var root = Path.Combine(Path.GetTempPath(), "SpaceBattle.Tests", TestContext.CurrentContext.Test.ID);
+        var snapshots = SpaceBattleTestRuntime.CaptureSnapshots(definition, root);
 
         Assert.That(snapshots, Has.Count.EqualTo((int)definition.MaximumCompletedTicks + 1));
         var afterDeath = ReadShip(snapshots[64], entityKey: 3);
@@ -249,7 +238,7 @@ public sealed class WanderingTests
             Assert.That(afterDeath.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Attacking));
             Assert.That(invalidationTick.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Turning));
             Assert.That(invalidationTick.Behavior.Phase, Is.EqualTo((byte)BehaviorPhase.Ready));
-            Assert.That(invalidationTick.Targeting.TargetEntityId, Is.Zero);
+            Assert.That(invalidationTick.Targeting.TargetRawEntityId, Is.Zero);
             Assert.That(invalidationTick.Motion.Speed, Is.EqualTo(SpaceBattleCombat.AttackSpeed));
             Assert.That(invalidationTick.Hull, Is.Not.EqualTo(afterDeath.Hull));
             Assert.That(otherShipAfterInvalidation.Vitals, Is.EqualTo(otherShipBeforeInvalidation.Vitals));
@@ -325,146 +314,7 @@ public sealed class WanderingTests
         }
     }
 
-    private static Dictionary<long, SpaceBattleSnapshot> RunStateMachine(SimulationDefinition definition)
-    {
-        var root = Path.Combine(Path.GetTempPath(), "SpaceBattle.Tests", TestContext.CurrentContext.Test.ID);
-        Directory.CreateDirectory(root);
-        try
-        {
-            var sink = new RecordingSink();
-            SpaceBattleHost.BootstrapOnly(definition, root, CancellationToken.None, sink);
-            using var engine = SpaceBattleDatabase.Open(definition, SpaceBattlePaths.DatabaseDirectory(root));
-            using var state = new SpaceBattleSimulationState(engine, definition, sink, workerCount: 1);
-            var snapshots = new Dictionary<long, SpaceBattleSnapshot>();
-            using var snapshotsCompleted = new ManualResetEventSlim();
-            var timing = new TickTiming();
-            // 仅加速 runtime 调度，玩法仍使用配置中的 0.04 秒固定逻辑步长。
-            var runtimeOptions = new RuntimeOptions
-            {
-                BaseTickRate = 1_000,
-                WorkerCount = 1,
-                EnableParallelFence = true,
-                AdaptiveFenceCost = false,
-                SystemExceptionPolicy = SystemExceptionPolicy.AbortTickAndStop,
-                Overload = new OverloadOptions
-                {
-                    MinTickRateHz = 1_000,
-                },
-            };
-
-            using var runtime = TyphonRuntime.Create(
-                engine,
-                schedule => BuildStateMachineSchedule(schedule, state, timing, snapshots, snapshotsCompleted),
-                runtimeOptions);
-            using var runtimeAborted = new ManualResetEventSlim();
-            runtime.OnTickAborted += (_, _) => runtimeAborted.Set();
-            runtime.Start();
-            try
-            {
-                var deadline = Stopwatch.GetTimestamp() + (Stopwatch.Frequency * 15);
-                while (!snapshotsCompleted.Wait(1))
-                {
-                    if (runtimeAborted.IsSet)
-                    {
-                        throw new InvalidOperationException("状态机测试运行时提前中止。");
-                    }
-
-                    if (Stopwatch.GetTimestamp() >= deadline)
-                    {
-                        throw new TimeoutException("状态机测试运行时未在限定时间内完成。");
-                    }
-                }
-            }
-            finally
-            {
-                runtime.Shutdown();
-            }
-
-            return snapshots;
-        }
-        finally
-        {
-            if (Directory.Exists(root))
-            {
-                Directory.Delete(root, recursive: true);
-            }
-        }
-    }
-
-    private static void BuildStateMachineSchedule(
-        RuntimeSchedule schedule,
-        SpaceBattleSimulationState state,
-        TickTiming timing,
-        Dictionary<long, SpaceBattleSnapshot> snapshots,
-        ManualResetEventSlim snapshotsCompleted)
-    {
-        var dag = schedule.PublicTrack.DeclareDag("SpaceBattleStateMachine")
-            .Phases(
-                SpaceBattlePhases.Publish,
-                SpaceBattlePhases.Behavior,
-                SpaceBattlePhases.Damage,
-                SpaceBattlePhases.Movement,
-                SpaceBattlePhases.Reap,
-                SpaceBattlePhases.Observe);
-        dag.Add(new FramePrepareSystem(state));
-        dag.Add(new PublishSystem(state));
-        dag.Add(new BehaviorSystem(state));
-        dag.Add(new DamageSystem(state));
-        dag.Add(new DamageCleanupSystem(state));
-        dag.Add(new MovementSystem(state));
-        dag.Add(new ReapSystem(state));
-        dag.Add(new AcquisitionCleanupSystem(state));
-        dag.Add(new ObserveSystem(state, timing));
-        dag.Add(new SnapshotCaptureSystem(state, snapshots, snapshotsCompleted));
-    }
-
     private static ShipSnapshot ReadShip(SpaceBattleSnapshot snapshot, long entityKey) =>
         snapshot.Ships.Single(ship => ship.EntityKey == entityKey);
 
-    private static ShipSnapshot Run(SimulationDefinition definition, string root, ulong expectedTicks)
-    {
-        var result = SpaceBattleHost.Run(definition with { MaximumCompletedTicks = expectedTicks }, root, CancellationToken.None, new RecordingSink());
-        Assert.That(result.CompletedTicks, Is.EqualTo((long)expectedTicks));
-        return SpaceBattleHost.ReadSnapshot(definition with { MaximumCompletedTicks = expectedTicks }, root).Ships.Single();
-    }
-    private sealed class SnapshotCaptureSystem : ChunkedCallbackSystem
-    {
-        private readonly SpaceBattleSimulationState _state;
-        private readonly Dictionary<long, SpaceBattleSnapshot> _snapshots;
-        private readonly ManualResetEventSlim _completed;
-
-        public SnapshotCaptureSystem(
-            SpaceBattleSimulationState state,
-            Dictionary<long, SpaceBattleSnapshot> snapshots,
-            ManualResetEventSlim completed)
-        {
-            _state = state;
-            _snapshots = snapshots;
-            _completed = completed;
-        }
-
-        protected override void Configure(SystemBuilder b) => b
-            .Name("SnapshotCapture")
-            .Priority(SystemPriority.Critical)
-            .CanShed(false)
-            .Phase(SpaceBattlePhases.Observe)
-            .After("Observe")
-            .ChunkedParallel(1);
-
-        protected override void Execute(TickContext ctx)
-        {
-            _snapshots[ctx.TickNumber] = _state.BuildPublishedSnapshot();
-            if ((ulong)ctx.TickNumber == _state.MaximumCompletedTicks)
-            {
-                _completed.Set();
-            }
-        }
-
-    }
-    private sealed class RecordingSink : ISpaceBattleObservationSink
-    {
-        public void Publish(SpaceBattleObservation observation)
-        {
-        }
-    }
 }

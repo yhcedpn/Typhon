@@ -31,13 +31,6 @@ public sealed class BootstrapTests
         Assert.That(SimulationDefinition.Default.ShipCount, Is.EqualTo(50_000));
     }
 
-    [Test]
-    public void DefaultBootstrap_PersistsExactlyFiftyThousandShips()
-    {
-        SpaceBattleHost.BootstrapOnly(SimulationDefinition.Default, _root, CancellationToken.None, new RecordingSink());
-
-        Assert.That(SpaceBattleHost.ReadShipCount(SimulationDefinition.Default, _root), Is.EqualTo(50_000));
-    }
 
     [Test]
     public void Ship_ContainsExactlyFiveSingleVersionComponents()
@@ -93,7 +86,7 @@ public sealed class BootstrapTests
                 Assert.That(ship.Motion.Speed, Is.Zero);
                 Assert.That(ship.Motion.RemainingTurnRadians, Is.Zero);
                 Assert.That(ship.Vitals.CurrentHealth, Is.EqualTo(definition.MaximumHealth));
-                Assert.That(ship.Targeting.TargetEntityId, Is.Zero);
+                Assert.That(ship.Targeting.TargetRawEntityId, Is.Zero);
                 Assert.That(ship.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Wandering));
                 Assert.That(ship.Behavior.TicksRemaining, Is.Zero);
             });

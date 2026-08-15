@@ -36,8 +36,6 @@ public sealed record SimulationTickCompleted(
     public SpaceBattleTelemetrySnapshot Telemetry { get; init; }
 }
 
-public sealed record SimulationTelemetrySample(
-    SpaceBattleTelemetrySnapshot Telemetry) : SpaceBattleObservation;
 
 public sealed record SimulationCompleted(
     long CompletedTicks,
@@ -46,8 +44,6 @@ public sealed record SimulationCompleted(
     SpaceBattleSnapshot PublishedSnapshot) : SpaceBattleObservation
 {
     public SpaceBattleTerminationReason TerminationReason { get; init; }
-    public SpaceBattleTelemetrySnapshot Telemetry { get; init; }
-
     public string FailedSystemName { get; init; }
 
     public Exception FatalException { get; init; }
@@ -64,11 +60,7 @@ public sealed record TickPerformanceSnapshot(
 {
     public long Over40Milliseconds { get; init; }
 
-    public long Over40MsCount => Over40Milliseconds;
-
     public double ActualHz { get; init; }
-
-    public double ActualHertz => ActualHz;
 
     public string Overload { get; init; } = "none";
 
@@ -78,7 +70,6 @@ public sealed record TickPerformanceSnapshot(
 
     public int SystemCount { get; init; }
 
-    public IReadOnlyList<SpaceBattleSystemTelemetrySnapshot> SystemMetrics { get; init; } = [];
 }
 
 public sealed record SpaceBattleRunResult(
@@ -87,9 +78,6 @@ public sealed record SpaceBattleRunResult(
     TimeSpan BootstrapDuration,
     TickPerformanceSnapshot TickPerformance)
 {
-    public SpaceBattleTelemetrySnapshot Telemetry { get; init; }
-
-    public string TraceFilePath { get; init; }
     public long CompletedTicks { get; init; }
 
     public int RemainingShips { get; init; }

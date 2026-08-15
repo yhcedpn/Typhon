@@ -43,7 +43,6 @@ public sealed class PerformanceTests
 
         var definition = SimulationDefinition.Default with
         {
-            RunName = "release-50k-performance",
             ShipCount = ShipCount,
             TickRate = TickRate,
             FixedDeltaSeconds = SimulationDefinition.FixedSimulationDeltaSeconds,
@@ -86,8 +85,8 @@ public sealed class PerformanceTests
             "threshold=warning_only_no_ci_failure");
         TestContext.Progress.WriteLine(SpaceBattleTelemetryFormatter.Format(latestTelemetry!));
         TestContext.Progress.WriteLine(
-            "system_breakdown_scope=cumulative_telemetry_through_latest_sample " +
-            "warmup_included=true fence_metrics=unexposed_zero_not_cost");
+            "system_breakdown_scope=rolling_4096_duration_samples " +
+            "warmup_inclusion=window_dependent fence_metrics=unexposed_zero_not_cost");
     }
 
     private static TickPerformanceSnapshot Measure(double[] durations)
@@ -142,10 +141,6 @@ public sealed class PerformanceTests
                     {
                         _telemetrySamples.Add(tick.Telemetry);
                     }
-                }
-                else if (observation is SimulationTelemetrySample sample)
-                {
-                    _telemetrySamples.Add(sample.Telemetry);
                 }
             }
         }

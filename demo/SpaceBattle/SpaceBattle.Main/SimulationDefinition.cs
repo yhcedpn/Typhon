@@ -8,7 +8,7 @@ public sealed record SimulationDefinition
     public const float DefaultWorldHeight = 1_000f;
     public const float DefaultWorldDepth = 400f;
     public const uint DefaultMaximumHealth = 1_000;
-    public const int FixedTickRate = 25;
+    public const int DefaultTickRate = 25;
     public const float FixedSimulationDeltaSeconds = 0.04f;
     public const ulong DefaultMaximumCompletedTicks = 22_500;
     public const float DefaultSpatialCellSize = 100f;
@@ -19,14 +19,13 @@ public sealed record SimulationDefinition
 
     public SimulationDefinition()
     {
-        RunName = "default";
         ShipCount = DefaultShipCount;
         Seed = DefaultSeed;
         WorldWidth = DefaultWorldWidth;
         WorldHeight = DefaultWorldHeight;
         WorldDepth = DefaultWorldDepth;
         MaximumHealth = DefaultMaximumHealth;
-        TickRate = FixedTickRate;
+        TickRate = DefaultTickRate;
         FixedDeltaSeconds = FixedSimulationDeltaSeconds;
         MaximumCompletedTicks = DefaultMaximumCompletedTicks;
         SpatialCellSize = DefaultSpatialCellSize;
@@ -40,14 +39,12 @@ public sealed record SimulationDefinition
         float worldHeight = DefaultWorldHeight,
         float worldDepth = DefaultWorldDepth,
         uint maximumHealth = DefaultMaximumHealth,
-        int tickRate = FixedTickRate,
+        int tickRate = DefaultTickRate,
         float fixedDeltaSeconds = FixedSimulationDeltaSeconds,
         ulong maximumCompletedTicks = DefaultMaximumCompletedTicks,
         float spatialCellSize = DefaultSpatialCellSize,
-        string runName = "test",
         int workerCount = AutomaticWorkerCount)
     {
-        RunName = runName;
         ShipCount = shipCount;
         Seed = seed;
         WorldWidth = worldWidth;
@@ -61,7 +58,6 @@ public sealed record SimulationDefinition
         WorkerCount = workerCount;
     }
 
-    public string RunName { get; init; }
     public int ShipCount { get; init; }
     public ulong Seed { get; init; }
     public float WorldWidth { get; init; }
@@ -78,7 +74,6 @@ public sealed record SimulationDefinition
 
     public void Validate()
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(RunName);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(ShipCount);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(WorldWidth);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(WorldHeight);

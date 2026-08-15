@@ -17,7 +17,6 @@ internal enum SpaceBattleSystemMetricId : byte
     DamageCleanup,
     Movement,
     Reap,
-    AcquisitionCleanup,
     Observe,
     DirtyMarking,
     AabbRefresh,
@@ -36,7 +35,6 @@ internal static class SpaceBattleSystemMetricCatalog
         "DamageCleanup",
         "Movement",
         "Reap",
-        "AcquisitionCleanup",
         "Observe",
         "dirty_marking",
         "AABB_refresh",
@@ -44,21 +42,91 @@ internal static class SpaceBattleSystemMetricCatalog
         "FenceFinalize",
     ];
 
-    public static string Name(SpaceBattleSystemMetricId id) => Names[(int)id];
 }
 
 public static class SpaceBattleTelemetrySampling
 {
+    public const long SamplePeriodTicks = 125;
+
     public static bool IsSampleTick(long zeroBasedTickNumber) =>
         zeroBasedTickNumber >= 0 &&
-        (zeroBasedTickNumber == 0 || zeroBasedTickNumber % 125 == 0);
+        (zeroBasedTickNumber == 0 || zeroBasedTickNumber % SamplePeriodTicks == 0);
+}
+internal readonly record struct DurationStatistics(
+    int SampleCount,
+    double Mean,
+    double P50,
+    double P95,
+    double P99,
+    double Maximum);
+
+/// <summary>保存最近一段固定容量的耗时样本，并以有界成本计算统计值。</summary>
+internal sealed class BoundedDurationWindow
+{
+    public const int Capacity = 4_096;
+
+    private readonly double[] _samples = new double[Capacity];
+    private int _next;
+    private int _count;
+    private double _sum;
+
+    public int Count => _count;
+
+    public void Add(double sample)
+    {
+        if (_count == Capacity)
+        {
+            _sum -= _samples[_next];
+        }
+        else
+        {
+            _count++;
+        }
+
+        _samples[_next] = sample;
+        _sum += sample;
+        _next = (_next + 1) % Capacity;
+    }
+
+    public DurationStatistics Snapshot()
+    {
+        if (_count == 0)
+        {
+            return default;
+        }
+
+        var ordered = new double[_count];
+        Array.Copy(_samples, ordered, _count);
+        Array.Sort(ordered);
+        return new DurationStatistics(
+            _count,
+            _sum / _count,
+            Percentile(ordered, 0.50),
+            Percentile(ordered, 0.95),
+            Percentile(ordered, 0.99),
+            ordered[^1]);
+    }
+
+    public int CountGreaterThan(double threshold)
+    {
+        var count = 0;
+        for (var index = 0; index < _count; index++)
+        {
+            if (_samples[index] > threshold)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
 }
 
-/// <summary>一个系统在本次运行内的持续统计。</summary>
+/// <summary>一个系统在最近固定样本窗口内的持续统计。</summary>
 internal sealed class SpaceBattleSystemMetricAccumulator
 {
     private readonly object _gate = new();
-    private readonly List<double> _durationsMicroseconds = [];
+    private readonly BoundedDurationWindow _durations = new();
     private long _entities;
     private int _workerMask;
 
@@ -69,7 +137,7 @@ internal sealed class SpaceBattleSystemMetricAccumulator
             : elapsedStopwatchTicks * 1_000_000d / Stopwatch.Frequency;
         lock (_gate)
         {
-            _durationsMicroseconds.Add(microseconds);
+            _durations.Add(microseconds);
             _entities = entities;
             if ((uint)workerId < 31u)
             {
@@ -77,6 +145,7 @@ internal sealed class SpaceBattleSystemMetricAccumulator
             }
         }
     }
+
     public void RecordAggregate(long elapsedStopwatchTicks, int entities, int workerCount)
     {
         var microseconds = elapsedStopwatchTicks <= 0
@@ -84,7 +153,7 @@ internal sealed class SpaceBattleSystemMetricAccumulator
             : elapsedStopwatchTicks * 1_000_000d / Stopwatch.Frequency;
         lock (_gate)
         {
-            _durationsMicroseconds.Add(microseconds);
+            _durations.Add(microseconds);
             _entities = entities;
             _workerMask = workerCount >= 31
                 ? int.MaxValue
@@ -96,27 +165,15 @@ internal sealed class SpaceBattleSystemMetricAccumulator
     {
         lock (_gate)
         {
-            if (_durationsMicroseconds.Count == 0)
-            {
-                return new SpaceBattleSystemTelemetrySnapshot(name, 0d, 0d, 0d, 0, 0, 0);
-            }
-
-            var ordered = _durationsMicroseconds.ToArray();
-            Array.Sort(ordered);
-            var sum = 0d;
-            foreach (var value in ordered)
-            {
-                sum += value;
-            }
-
+            var statistics = _durations.Snapshot();
             return new SpaceBattleSystemTelemetrySnapshot(
                 name,
-                sum / ordered.Length,
-                Percentile(ordered, 0.95),
-                ordered[^1],
-                checked((int)Math.Min(_entities, int.MaxValue)),
-                BitOperations.PopCount((uint)_workerMask),
-                ordered.Length);
+                statistics.Mean,
+                statistics.P95,
+                statistics.Maximum,
+                statistics.SampleCount == 0 ? 0 : checked((int)Math.Min(_entities, int.MaxValue)),
+                statistics.SampleCount == 0 ? 0 : BitOperations.PopCount((uint)_workerMask),
+                statistics.SampleCount);
         }
     }
 }
@@ -126,26 +183,14 @@ public sealed record SpaceBattleQueryMetricsSnapshot(
     long DirectQueries,
     long BatchedQueries,
     long GatherCandidates,
-    long ExactDistanceTests)
-{
-    public long DirectQueryCount => DirectQueries;
-    public long BatchedQueryCount => BatchedQueries;
-    public long GatherCandidateCount => GatherCandidates;
-    public long ExactTargetingDistanceTestCount => ExactDistanceTests;
-}
+    long ExactDistanceTests);
 
 /// <summary>稳定的战斗计数口径。</summary>
 public sealed record SpaceBattleCombatMetricsSnapshot(
     long WeaponUses,
     long InRangeAttacks,
     long Damage,
-    long Deaths)
-{
-    public long WeaponUseCount => WeaponUses;
-    public long InRangeAttackCount => InRangeAttacks;
-    public long DamageCount => Damage;
-    public long DeathCount => Deaths;
-}
+    long Deaths);
 
 /// <summary>一个应用系统或围栏阶段的耗时摘要。</summary>
 public sealed record SpaceBattleSystemTelemetrySnapshot(
@@ -155,14 +200,7 @@ public sealed record SpaceBattleSystemTelemetrySnapshot(
     double MaximumMicroseconds,
     int Entities,
     int Workers,
-    int SampleCount)
-{
-    public double MeanUs => MeanMicroseconds;
-    public double P95Us => P95Microseconds;
-    public double MaxUs => MaximumMicroseconds;
-    public int EntityCount => Entities;
-    public int WorkerCount => Workers;
-}
+    int SampleCount);
 
 /// <summary>Observe 阶段发布的稳定战况和成本统计。</summary>
 public sealed record SpaceBattleTelemetrySnapshot(
@@ -179,15 +217,6 @@ public sealed record SpaceBattleTelemetrySnapshot(
     SpaceBattleCombatMetricsSnapshot Combat,
     IReadOnlyList<SpaceBattleSystemTelemetrySnapshot> Systems)
 {
-    public int AliveCount => AliveShips;
-    public int NextTickWandering => WanderingNextTick;
-    public int NextTickTracking => TrackingNextTick;
-    public int NextTickApproaching => ApproachingNextTick;
-    public int NextTickAttacking => AttackingNextTick;
-    public int NextTickTurning => TurningNextTick;
-    public int ValidLockCount => ValidLocksAfterMovement;
-    public bool HasRuntimeTelemetry { get; init; }
-
     public int NextTickModeTotal =>
         WanderingNextTick + TrackingNextTick + ApproachingNextTick + AttackingNextTick + TurningNextTick;
 }

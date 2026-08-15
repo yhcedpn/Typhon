@@ -113,12 +113,12 @@ internal static class SpaceBattleTargeting
         var bins = new Dictionary<TemporaryBinKey, List<EntityId>>(candidateIds.Count);
         foreach (var candidateId in candidateIds)
         {
-            if (!state.TryGetFrameIndex(candidateId.EntityKey, out var frameIndex))
+            if (!state.Frames.TryGetIndex(candidateId.EntityKey, out var frameIndex))
             {
                 continue;
             }
 
-            var position = PositionOf(state.GetFrame(frameIndex));
+            var position = PositionOf(state.Frames.GetPublished(frameIndex));
             var key = new TemporaryBinKey(
                 BinCoordinate(position.X),
                 BinCoordinate(position.Y),
@@ -222,12 +222,12 @@ internal static class SpaceBattleTargeting
         ref int exactDistanceTestCount)
     {
         var candidateKey = candidateId.EntityKey;
-        if (candidateKey == source.EntityKey || !state.TryGetFrameIndex(candidateKey, out var frameIndex))
+        if (candidateKey == source.EntityKey || !state.Frames.TryGetIndex(candidateKey, out var frameIndex))
         {
             return;
         }
 
-        ref readonly var candidate = ref state.GetFrame(frameIndex);
+        ref readonly var candidate = ref state.Frames.GetPublished(frameIndex);
         if (candidate.Vitals.CurrentHealth == 0)
         {
             return;
@@ -338,15 +338,15 @@ internal static class SpaceBattleTargeting
         out ShipSnapshot target,
         out double distanceSquared)
     {
-        var targetKey = EntityKeyFromRaw(source.Targeting.TargetEntityId);
-        if (targetKey == 0 || targetKey == source.EntityKey || !state.TryGetFrameIndex(targetKey, out var targetIndex))
+        var targetKey = EntityKeyFromRaw(source.Targeting.TargetRawEntityId);
+        if (targetKey == 0 || targetKey == source.EntityKey || !state.Frames.TryGetIndex(targetKey, out var targetIndex))
         {
             target = default;
             distanceSquared = double.PositiveInfinity;
             return false;
         }
 
-        target = state.GetFrame(targetIndex);
+        target = state.Frames.GetPublished(targetIndex);
         if (target.Vitals.CurrentHealth == 0)
         {
             distanceSquared = double.PositiveInfinity;

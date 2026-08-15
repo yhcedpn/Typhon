@@ -72,7 +72,7 @@ public sealed class SimulationTests
         SpaceBattleHost.BootstrapOnly(definition, bootstrapRoot, CancellationToken.None, new RecordingSink());
         var before = SpaceBattleHost.ReadSnapshot(definition, bootstrapRoot);
 
-        SpaceBattleHost.Run(definition, _root, CancellationToken.None, new RecordingSink());
+        SpaceBattleTestRuntime.Run(definition, _root);
         var after = SpaceBattleHost.ReadSnapshot(definition, _root);
 
         foreach (var ship in after.Ships)

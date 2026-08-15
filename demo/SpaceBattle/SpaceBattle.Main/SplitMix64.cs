@@ -14,11 +14,15 @@ internal struct SplitMix64
 
     public ulong NextUInt64()
     {
-        ulong value = unchecked(_state += Increment);
+        return Mix(unchecked(_state += Increment));
+    }
+    internal static ulong Mix(ulong value)
+    {
         value = unchecked((value ^ (value >> 30)) * MultiplierA);
         value = unchecked((value ^ (value >> 27)) * MultiplierB);
         return value ^ (value >> 31);
     }
+
 
     public float NextUnitFloat()
     {

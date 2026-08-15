@@ -33,11 +33,11 @@ public struct Vitals
     [Field] public uint CurrentHealth;
 }
 
-[Component("SpaceBattle.Targeting", 1, StorageMode = StorageMode.SingleVersion)]
+[Component("SpaceBattle.Targeting", 2, StorageMode = StorageMode.SingleVersion)]
 [StructLayout(LayoutKind.Sequential)]
 public struct Targeting
 {
-    [Field] public long TargetEntityId;
+    [Field] public long TargetRawEntityId;
 }
 
 [Component("SpaceBattle.Behavior", 1, StorageMode = StorageMode.SingleVersion)]

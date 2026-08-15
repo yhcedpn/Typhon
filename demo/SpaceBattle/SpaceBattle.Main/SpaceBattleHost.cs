@@ -7,6 +7,7 @@ namespace SpaceBattle;
 internal static class SpaceBattleHost
 {
     private const int ProgressBatchSize = 2_048;
+    private const int TickOutcomeLivenessWaitMilliseconds = 10;
 
     public static SpaceBattleRunResult Run(
         SimulationDefinition definition,
@@ -201,10 +202,17 @@ internal static class SpaceBattleHost
         }
 
         var workerCount = ResolveWorkerCount(definition);
+        using var completionSignal = new AutoResetEvent(false);
         var finalTickObservationSink = new FinalTickObservationSink(
             observationSink,
             definition.MaximumCompletedTicks);
-        using var state = new SpaceBattleSimulationState(engine, definition, finalTickObservationSink, workerCount);
+        using var state = new SpaceBattleSimulationState(
+            engine,
+            definition,
+            finalTickObservationSink,
+            workerCount,
+            tickCompleted: () => completionSignal.Set(),
+            enforceMaximumCompletedTicks: definition.WorkerCount > 0);
         var runtimeOptions = new RuntimeOptions
         {
             BaseTickRate = definition.TickRate,
@@ -253,6 +261,7 @@ internal static class SpaceBattleHost
                 {
                     fatalOutcome = outcome;
                 }
+                completionSignal.Set();
             };
             using var cancellationRegistration = cancellationToken.Register(() =>
             {
@@ -264,6 +273,7 @@ internal static class SpaceBattleHost
                     ref cancellationRequestedAtRuntimeTick,
                     runtime.CurrentTickNumber,
                     -1);
+                completionSignal.Set();
             });
 
 
@@ -279,7 +289,7 @@ internal static class SpaceBattleHost
                     ReadFatalOutcome,
                     () => Volatile.Read(ref cancellationRequestedAtCompletedTicks),
                     () => Volatile.Read(ref cancellationRequestedAtRuntimeTick),
-                    definition.WorkerCount > 0);
+                    completionSignal);
             }
             finally
             {
@@ -292,7 +302,7 @@ internal static class SpaceBattleHost
                         state.CompletedTicks,
                         runtime.CurrentTickNumber,
                         ReadFatalOutcome,
-                        definition.WorkerCount > 0);
+                        completionSignal);
                     observedFatal = ReadFatalOutcome();
                 }
 
@@ -324,7 +334,7 @@ internal static class SpaceBattleHost
             // Observe 在 tick 事务 flush 前执行；最终结果必须读取 flush 后的数据库组件，而不是旧镜像。
             finalTickObservationSink.PublishCommittedSnapshot(finalSnapshot);
             var remainingShips = finalSnapshot.Ships.Count;
-            state.ReleaseAllAcquisitionTransactions();
+            state.AcquisitionTransactions.ReleaseAllAfterRuntimeStop();
             var termination = ResolveTerminationReason(
                 requestedTermination,
                 state.CompletedTicks,
@@ -377,7 +387,6 @@ internal static class SpaceBattleHost
         dag.Add(new DamageCleanupSystem(state));
         dag.Add(new MovementSystem(state));
         dag.Add(new ReapSystem(state));
-        dag.Add(new AcquisitionCleanupSystem(state));
         dag.Add(new ObserveSystem(state, timing));
     }
 
@@ -389,9 +398,8 @@ internal static class SpaceBattleHost
         Func<TickOutcome?> readFatalOutcome,
         Func<long> readCancellationCompletedTicks,
         Func<long> readCancellationRuntimeTick,
-        bool highPrecisionWait)
+        AutoResetEvent completionSignal)
     {
-        var observedCompletedTicks = state.CompletedTicks;
         while (true)
         {
             if (readFatalOutcome().HasValue)
@@ -400,18 +408,14 @@ internal static class SpaceBattleHost
             }
 
             var completedTicks = state.CompletedTicks;
-            if (completedTicks != observedCompletedTicks)
+            var boundaryTermination = ResolveBoundaryTermination(
+                completedTicks,
+                state.LastCompletedRemainingShips,
+                state.ShipCount,
+                maximumTicks);
+            if (boundaryTermination.HasValue)
             {
-                observedCompletedTicks = completedTicks;
-                var boundaryTermination = ResolveBoundaryTermination(
-                    completedTicks,
-                    state.LastCompletedRemainingShips,
-                    state.ShipCount,
-                    maximumTicks);
-                if (boundaryTermination.HasValue)
-                {
-                    return boundaryTermination.Value;
-                }
+                return boundaryTermination.Value;
             }
 
             if (cancellationToken.IsCancellationRequested)
@@ -424,19 +428,12 @@ internal static class SpaceBattleHost
                     completedTicksAtRequest >= 0 ? completedTicksAtRequest : completedTicks,
                     runtimeTickAtRequest >= 0 ? runtimeTickAtRequest : runtime.CurrentTickNumber,
                     readFatalOutcome,
-                    highPrecisionWait);
+                    completionSignal);
                 return readFatalOutcome().HasValue
                     ? SpaceBattleTerminationReason.Fatal
                     : SpaceBattleTerminationReason.Cancelled;
             }
-            if (highPrecisionWait)
-            {
-                Thread.SpinWait(1_000);
-            }
-            else
-            {
-                Thread.Sleep(1);
-            }
+            completionSignal.WaitOne();
         }
     }
 
@@ -446,7 +443,7 @@ internal static class SpaceBattleHost
         long completedTicksAtRequest,
         long runtimeTickAtRequest,
         Func<TickOutcome?> readFatalOutcome,
-        bool highPrecisionWait)
+        AutoResetEvent completionSignal)
     {
         var targetCompletedTicks = completedTicksAtRequest;
         if (state.IsTickInFlight && runtimeTickAtRequest >= completedTicksAtRequest)
@@ -474,14 +471,8 @@ internal static class SpaceBattleHost
                 return;
             }
 
-            if (highPrecisionWait)
-            {
-                Thread.SpinWait(1_000);
-            }
-            else
-            {
-                Thread.Sleep(1);
-            }
+            // 正常路径由逻辑帧完成信号唤醒；超时只防止 LastTickOutcome 在 Observe 后发布时丢失唤醒。
+            completionSignal.WaitOne(TickOutcomeLivenessWaitMilliseconds);
         }
     }
 
@@ -641,9 +632,7 @@ internal static class SpaceBattleHost
                     MaxZ = z,
                 },
             };
-            motions[index] = default;
             vitals[index] = new Vitals { CurrentHealth = definition.MaximumHealth };
-            targetings[index] = default;
             behaviors[index] = new Behavior
             {
                 Mode = (byte)BehaviorMode.Wandering,

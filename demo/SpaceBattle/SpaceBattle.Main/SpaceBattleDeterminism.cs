@@ -45,7 +45,7 @@ public sealed record SpaceBattleDeterminismDiagnostic(
             healthChecksum = Append(healthChecksum, ship.Vitals.CurrentHealth);
 
             targetChecksum = Append(targetChecksum, unchecked((ulong)ship.EntityKey));
-            targetChecksum = Append(targetChecksum, unchecked((ulong)ship.Targeting.TargetEntityId));
+            targetChecksum = Append(targetChecksum, unchecked((ulong)ship.Targeting.TargetRawEntityId));
 
             var behavior = ship.Behavior;
             var modeWord = (ulong)behavior.Mode |
@@ -93,7 +93,12 @@ internal sealed class DeterminismAcquisitionResetSystem : ChunkedCallbackSystem
 
     protected override void Execute(TickContext ctx)
     {
-        _state.ReleaseAllAcquisitionTransactions();
+        if (!_state.ShouldExecuteTick(ctx.TickNumber))
+        {
+            return;
+        }
+
+        _state.AcquisitionTransactions.InvalidateForNextUse();
     }
 }
 
