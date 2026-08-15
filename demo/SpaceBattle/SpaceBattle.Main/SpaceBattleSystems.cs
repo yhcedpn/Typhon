@@ -117,6 +117,13 @@ internal sealed class PublishSystem : ShipChunkSystem
             {
                 var entityId = cluster.GetEntityId(slot);
                 var entityKey = entityId.EntityKey;
+                if (entityKey == 0)
+                {
+                    // 并行 fence 的跨 cell 迁移会在本 tick 清空源槽：occupancy 快照之后 EntityKey 已被清零。
+                    // 引擎自己的迁移路径以 entityPK==0 作为 destroyed-in-flight 判别（DatabaseEngine.ClusterMigration），
+                    // 这里采用同一范式跳过；该实体会在目标 cluster 被发布，本逻辑帧不产生该舰船帧。
+                    continue;
+                }
                 var vitals = vitalsSpan[slot];
                 if (vitals.CurrentHealth == 0)
                 {

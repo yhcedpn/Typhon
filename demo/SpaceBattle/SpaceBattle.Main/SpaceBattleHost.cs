@@ -325,7 +325,10 @@ internal static class SpaceBattleHost
                 finalFatalOutcome = fatalOutcome;
             }
 
-            ReapDeadShips(engine, state.CompletedTicks);
+            ReapDeadShips(
+                engine,
+                state.CompletedTicks,
+                definition.ShipCount - state.LastCompletedRemainingShips);
             var committedSnapshot = ReadSnapshotFromOpenEngine(engine);
             var finalSnapshot = new SpaceBattleSnapshot(
                 committedSnapshot.Ships
@@ -333,7 +336,10 @@ internal static class SpaceBattleHost
                     .ToArray());
             // Observe 在 tick 事务 flush 前执行；最终结果必须读取 flush 后的数据库组件，而不是旧镜像。
             finalTickObservationSink.PublishCommittedSnapshot(finalSnapshot);
-            var remainingShips = finalSnapshot.Ships.Count;
+            // 持久化只读口径不等价于内存最终状态（FenceWal 恢复存在 #569 已知缺口）：terminate 后读盘可能得到
+            // 过时/缺失的存活集（曾观测 remaining=0 而最后 tick telemetry 有 32,029 存活）。战果判定必须与
+            // WaitForCompletion 同源——使用内存最终存活数；finalSnapshot 仅供观察者展示。
+            var remainingShips = state.LastCompletedRemainingShips;
             state.AcquisitionTransactions.ReleaseAllAfterRuntimeStop();
             var termination = ResolveTerminationReason(
                 requestedTermination,
@@ -570,7 +576,9 @@ internal static class SpaceBattleHost
     }
 
     // runtime 可能在 Observe 后停止，补做一次幂等回收，避免零血实体留在最终数据库快照中。
-    private static void ReapDeadShips(DatabaseEngine engine, long tickNumber)
+    // expectedDeaths 来自内存口径（ShipCount - 最后 tick 存活数）；只读事务读到的"零血"候选若远超
+    // 预期（持久化只读口径落后于内存，见 #569 缺口），放弃清理——销毁会误杀活船。
+    private static void ReapDeadShips(DatabaseEngine engine, long tickNumber, int expectedDeaths)
     {
         using var readTransaction = engine.CreateReadOnlyTransaction();
         var deadIds = new List<EntityId>();
@@ -584,6 +592,14 @@ internal static class SpaceBattleHost
 
         if (deadIds.Count == 0)
         {
+            return;
+        }
+
+        if (deadIds.Count > expectedDeaths)
+        {
+            Console.Error.WriteLine(
+                $"warning=reap_skipped dead_candidates={deadIds.Count} expected_deaths={expectedDeaths} " +
+                "readonly_snapshot_lags_memory; 跳过终态回收以避免误杀活船。");
             return;
         }
 
