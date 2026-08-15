@@ -27,7 +27,7 @@ public sealed class WanderingTests
             var direction = SpaceBattleMath.RandomDirection(
                 seed,
                 entityKey,
-                (ulong)(entityKey % 7),
+                (long)(entityKey % 7),
                 SpaceBattleRandomPurpose.WanderHeading);
             var speed = SpaceBattleMath.RandomWanderSpeed(seed, entityKey, 23);
             Assert.That(direction.Length(), Is.EqualTo(1f).Within(1e-5f));

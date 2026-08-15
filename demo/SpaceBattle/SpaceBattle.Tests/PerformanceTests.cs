@@ -30,7 +30,7 @@ public sealed class PerformanceTests
         }
     }
 
-    // Release-only wall-clock workload; a shared CI runner cannot provide a stable latency budget.
+    // 仅 Release 的墙钟负载场景；共享 CI 机器无法提供稳定的延迟预算。
     [Test]
     [Explicit("Release-only 50,000-ship performance scenario; run manually on reference hardware.")]
     [Category("Performance")]

@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using Typhon.Engine;
+using static SpaceBattle.PercentileMath;
 
 namespace SpaceBattle;
 
@@ -117,15 +118,6 @@ internal sealed class SpaceBattleSystemMetricAccumulator
                 BitOperations.PopCount((uint)_workerMask),
                 ordered.Length);
         }
-    }
-
-    private static double Percentile(double[] ordered, double percentile)
-    {
-        var position = (ordered.Length - 1) * percentile;
-        var lower = (int)position;
-        var upper = Math.Min(lower + 1, ordered.Length - 1);
-        var fraction = position - lower;
-        return ordered[lower] + ((ordered[upper] - ordered[lower]) * fraction);
     }
 }
 
@@ -244,7 +236,7 @@ public static class SpaceBattleTelemetryFormatter
     {
         var tick = snapshot.TickPerformance;
 
-        // ── Tick header ──
+        // ── Tick 头部 ──
         var tickStr = Int(snapshot.TickNumber + 1);
         builder.Append('─', 3);
         builder.Append(" Tick #").Append(tickStr);
@@ -252,10 +244,10 @@ public static class SpaceBattleTelemetryFormatter
         builder.Append('─', Math.Max(1, 58 - tickStr.Length));
         builder.AppendLine();
 
-        // Alive
+        // 存活
         builder.Append("  Alive: ").AppendLine(Int(snapshot.AliveShips));
 
-        // Next tick modes
+        // 下一 tick 模式
         builder.Append("  Next tick modes:");
         AppendMode(builder, "wand", snapshot.WanderingNextTick);
         AppendMode(builder, "trk", snapshot.TrackingNextTick);
@@ -264,26 +256,26 @@ public static class SpaceBattleTelemetryFormatter
         AppendMode(builder, "trn", snapshot.TurningNextTick);
         builder.AppendLine();
 
-        // Valid locks
+        // 有效锁定
         builder.Append("  Valid locks: ").AppendLine(Int(snapshot.ValidLocksAfterMovement));
 
-        // Tick timing
+        // Tick 计时
         builder.Append("  Tick timing: p50=").Append(Fixed(tick.P50Milliseconds)).Append("ms")
             .Append(" p95=").Append(Fixed(tick.P95Milliseconds)).Append("ms")
             .Append(" p99=").Append(Fixed(tick.P99Milliseconds)).Append("ms")
             .Append(" max=").Append(Fixed(tick.MaximumMilliseconds)).Append("ms")
             .Append(" over_40ms=").Append(Int(tick.Over40Milliseconds)).AppendLine();
 
-        // Actual Hz, overload, multiplier
+        // 实际 Hz、overload 与倍率
         builder.Append("  Actual Hz: ").Append(Fixed(tick.ActualHz))
             .Append("  Overload: ").Append(tick.Overload ?? "none")
             .Append("  Multiplier: ").Append(Int(tick.TickMultiplier)).AppendLine();
 
-        // Workers, systems
+        // worker 与系统数
         builder.Append("  Workers: ").Append(Int(tick.WorkerCount))
             .Append("  Systems: ").Append(Int(tick.SystemCount)).AppendLine();
 
-        // ── Queries ──
+        // ── 查询 ──
         builder.AppendLine();
         builder.Append('─', 3);
         builder.Append(" Queries ");
@@ -294,7 +286,7 @@ public static class SpaceBattleTelemetryFormatter
         builder.Append("  Candidates: ").Append(Int(snapshot.Queries.GatherCandidates))
             .Append("  Distance tests: ").Append(Int(snapshot.Queries.ExactDistanceTests)).AppendLine();
 
-        // ── Combat ──
+        // ── 战斗 ──
         builder.AppendLine();
         builder.Append('─', 3);
         builder.Append(" Combat ");
@@ -305,14 +297,14 @@ public static class SpaceBattleTelemetryFormatter
         builder.Append("  Damage: ").Append(Int(snapshot.Combat.Damage))
             .Append("  Deaths: ").Append(Int(snapshot.Combat.Deaths)).AppendLine();
 
-        // ── Per-system timing table ──
+        // ── 每系统计时表 ──
         builder.AppendLine();
         builder.Append('─', 3);
         builder.Append(" Per-system timing ");
         builder.Append('─', 38);
         builder.AppendLine();
 
-        // Compute max name width
+        // 计算名称最大宽度
         var nameWidth = "System".Length;
         foreach (var sys in snapshot.Systems)
         {
@@ -320,7 +312,7 @@ public static class SpaceBattleTelemetryFormatter
         }
         if (nameWidth > 40) nameWidth = 40;
 
-        // Header
+        // 表头
         builder.Append("  ");
         AppendPaddedRight(builder, "System", nameWidth);
         builder.Append("  "); AppendPaddedLeft(builder, "Mean_us", 12);
@@ -331,7 +323,7 @@ public static class SpaceBattleTelemetryFormatter
         builder.Append("  "); AppendPaddedLeft(builder, "Samples", 7);
         builder.AppendLine();
 
-        // Data rows
+        // 数据行
         foreach (var sys in snapshot.Systems)
         {
             builder.Append("  ");

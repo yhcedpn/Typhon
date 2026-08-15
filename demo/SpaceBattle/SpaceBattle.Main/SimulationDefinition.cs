@@ -22,7 +22,6 @@ public sealed record SimulationDefinition
         RunName = "default";
         ShipCount = DefaultShipCount;
         Seed = DefaultSeed;
-        RulesetVersion = 1;
         WorldWidth = DefaultWorldWidth;
         WorldHeight = DefaultWorldHeight;
         WorldDepth = DefaultWorldDepth;
@@ -46,13 +45,11 @@ public sealed record SimulationDefinition
         ulong maximumCompletedTicks = DefaultMaximumCompletedTicks,
         float spatialCellSize = DefaultSpatialCellSize,
         string runName = "test",
-        uint rulesetVersion = 1,
         int workerCount = AutomaticWorkerCount)
     {
         RunName = runName;
         ShipCount = shipCount;
         Seed = seed;
-        RulesetVersion = rulesetVersion;
         WorldWidth = worldWidth;
         WorldHeight = worldHeight;
         WorldDepth = worldDepth;
@@ -67,7 +64,6 @@ public sealed record SimulationDefinition
     public string RunName { get; init; }
     public int ShipCount { get; init; }
     public ulong Seed { get; init; }
-    public uint RulesetVersion { get; init; }
     public float WorldWidth { get; init; }
     public float WorldHeight { get; init; }
     public float WorldDepth { get; init; }

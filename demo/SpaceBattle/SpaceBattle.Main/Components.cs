@@ -59,7 +59,7 @@ public struct Behavior
     [Field] public byte Mode;
     [Field] public byte Phase;
     [Field] public ushort TicksRemaining;
-    [Field] public uint ModeStartedTick;
+    [Field] public long ModeStartedTick;
 }
 
 public enum BehaviorMode : byte

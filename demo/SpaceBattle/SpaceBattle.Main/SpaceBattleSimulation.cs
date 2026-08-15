@@ -404,7 +404,7 @@ internal sealed class SpaceBattleSimulationState : IDisposable
         }
         catch (ArgumentOutOfRangeException)
         {
-            // Ring may rotate between the newest-tick read and the accessor; the next boundary can retry.
+            // ring 在最新 tick 读取与访问器之间可能轮转；下一个边界可重试。
         }
     }
 
@@ -1020,32 +1020,33 @@ internal static class SpaceBattleMath
     public const float MaximumTurnRadians = MaximumTurnDegrees * MathF.PI / 180f;
 
     private const float TwoPi = 2f * MathF.PI;
-    private const float UnitFloatScale = 1f / 16_777_216f;
+    // 24 位分位数缩放到 [0,1] 闭区间：速度可达 [0,200] 上界，转向量程可达 300°。
+    private const float UnitFloatScale = 1f / 16_777_215f;
     private const float VectorEpsilonSquared = 1e-12f;
 
     public static ulong DeriveUInt64(
         ulong seed,
         long entityKey,
-        ulong modeStartedTick,
+        long modeStartedTick,
         SpaceBattleRandomPurpose purpose)
     {
         var value = Mix(seed ^ 0xD1B5_4A32_9C87_E601UL);
         value = Mix(value ^ unchecked((ulong)entityKey + 0x9E37_79B9_7F4A_7C15UL));
-        value = Mix(value ^ modeStartedTick);
+        value = Mix(value ^ unchecked((ulong)modeStartedTick));
         return Mix(value ^ (ulong)purpose);
     }
 
     public static float DeriveUnitFloat(
         ulong seed,
         long entityKey,
-        ulong modeStartedTick,
+        long modeStartedTick,
         SpaceBattleRandomPurpose purpose)
         => (DeriveUInt64(seed, entityKey, modeStartedTick, purpose) >> 40) * UnitFloatScale;
 
     public static Vector3 RandomDirection(
         ulong seed,
         long entityKey,
-        ulong modeStartedTick,
+        long modeStartedTick,
         SpaceBattleRandomPurpose purpose)
     {
         var azimuthUnit = DeriveUnitFloat(
@@ -1067,7 +1068,7 @@ internal static class SpaceBattleMath
             z);
     }
 
-    public static float RandomTurnRadians(ulong seed, long entityKey, ulong modeStartedTick) =>
+    public static float RandomTurnRadians(ulong seed, long entityKey, long modeStartedTick) =>
         MinimumTurnRadians
         + (DeriveUnitFloat(seed, entityKey, modeStartedTick, SpaceBattleRandomPurpose.TurnAngle)
            * (MaximumTurnRadians - MinimumTurnRadians));
@@ -1075,7 +1076,7 @@ internal static class SpaceBattleMath
     public static Vector3 RandomTurnTarget(
         ulong seed,
         long entityKey,
-        ulong modeStartedTick,
+        long modeStartedTick,
         Vector3 current,
         out float turnRadians)
     {
@@ -1093,7 +1094,7 @@ internal static class SpaceBattleMath
             from);
     }
 
-    public static float RandomWanderSpeed(ulong seed, long entityKey, ulong modeStartedTick)
+    public static float RandomWanderSpeed(ulong seed, long entityKey, long modeStartedTick)
         => DeriveUnitFloat(seed, entityKey, modeStartedTick, SpaceBattleRandomPurpose.WanderSpeed) * MaximumWanderSpeed;
 
     public static float AngleBetween(Vector3 current, Vector3 target)

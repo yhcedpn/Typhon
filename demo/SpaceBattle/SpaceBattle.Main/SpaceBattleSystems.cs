@@ -340,7 +340,7 @@ internal sealed class BehaviorSystem : ShipChunkSystem
             : BehaviorMode.Approaching);
         behavior.Phase = (byte)BehaviorPhase.Ready;
         behavior.TicksRemaining = 0;
-        behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
+        behavior.ModeStartedTick = tickNumber + 1;
         motion.Speed = SpaceBattleCombat.WeaponSpeed;
     }
 
@@ -358,7 +358,7 @@ internal sealed class BehaviorSystem : ShipChunkSystem
             behavior.Mode = (byte)BehaviorMode.Turning;
             behavior.Phase = (byte)BehaviorPhase.Ready;
             behavior.TicksRemaining = 0;
-            behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
+            behavior.ModeStartedTick = tickNumber + 1;
             motion.RemainingTurnRadians = 0f;
             return;
         }
@@ -368,7 +368,7 @@ internal sealed class BehaviorSystem : ShipChunkSystem
             distanceSquared <= SpaceBattleCombat.WeaponRange * SpaceBattleCombat.WeaponRange)
         {
             behavior.Mode = (byte)BehaviorMode.Attacking;
-            behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
+            behavior.ModeStartedTick = tickNumber + 1;
         }
 
         behavior.Phase = (byte)BehaviorPhase.Ready;
@@ -459,7 +459,7 @@ internal sealed class BehaviorSystem : ShipChunkSystem
                 {
                     behavior.Mode = (byte)BehaviorMode.Tracking;
                     behavior.Phase = (byte)BehaviorPhase.Ready;
-                    behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
+                    behavior.ModeStartedTick = tickNumber + 1;
                 }
                 else
                 {
@@ -516,7 +516,7 @@ internal sealed class BehaviorSystem : ShipChunkSystem
                 {
                     behavior.Mode = (byte)BehaviorMode.Wandering;
                     behavior.Phase = (byte)BehaviorPhase.Ready;
-                    behavior.ModeStartedTick = unchecked((uint)(tickNumber + 1));
+                    behavior.ModeStartedTick = tickNumber + 1;
                 }
                 else
                 {

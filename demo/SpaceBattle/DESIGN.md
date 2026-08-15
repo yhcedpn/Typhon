@@ -83,7 +83,7 @@ Wandering --(50 tick flight)--> Tracking --(lock)--> Approaching --(<=100)--> At
 
 ### Wandering
 
-- `Ready` 首次从 `seed + EntityKey + ModeStartedTick` 派生均匀三维球面方向和 `[0, 200)` 速度；已有 heading 时派生下一目标方向。
+- `Ready` 首次从 `seed + EntityKey + ModeStartedTick` 派生均匀三维球面方向和 `[0, 200]` 速度；已有 heading 时派生下一目标方向。
 - 首次无 heading 直接进入 `Flying`；已有 heading 先进入 `Aligning`。
 - `Movement` 每 tick 最多转 `1 rad/s × 0.04 s`，完成后飞行 50 tick；计数归零时下一帧进入 `Tracking`。
 - X/Y/Z 越界都采用反射坐标；位置保持在 `[0, worldSize)` 的有限范围内。
@@ -156,7 +156,7 @@ flowchart LR
 2. **组件事实与派生快照分离**：组件是持久事实；Publish 后 `_frames`/`_telemetryFrames` 在本 tick 内提供跨实体只读视图，不通过未经声明的 ECS accessor 读写。
 3. **无跨实体组件写**：攻击者只写自己 worker 的 damage lane；Damage 的目标船自己写自己的 `Vitals`。没有攻击者直接开目标实体写事务，也没有并行生产者写 `EventQueue`。
 4. **固定归并顺序**：Damage 按 worker ID 0..N-1 累加；Reap 按 worker ID 0..N-1 拷贝；最近目标距离相等时取较小 `EntityKey`。这保证固定 worker 拓扑重复运行的 checksum 稳定。
-5. **生命周期边界**：0 health 只进入 pending-reap；只有 Reap 在所有 Damage/Movement chunk 完成后 destroy。DamageCleanup 在下一阶段清除 touched lane，避免旧伤害泄漏到下一个 tick。
+5. **生命周期边界**：0 health 只进入 pending-reap；只有 Reap 在所有 Damage/Movement chunk 完成后 destroy。DamageCleanup 在 Damage 阶段内紧跟各 worker 伤害应用后清除 touched lane（参见 §4 DAG 图），避免旧伤害泄漏到下一个 tick。
 6. **空间 dirty 纪律**：通过 cluster span 修改持久 component 的每个受影响槽显式 `MarkClusterSlotDirty`；不设置 `SpatialBarrierOnly`，让 tick fence 全量刷新三维 AABB 的 spatial 状态。
 7. **transaction thread affinity**：acquisition transaction 只能在创建它的 worker 线程复用/释放；runtime 停止后 Host 仍做 best-effort `ReleaseAllAcquisitionTransactions`，不能跨线程假装优雅释放。
 8. **边界观察**：Observe 在 tick transaction flush 前发布应用侧观察；Host 停止后在仍打开的 engine 上读取 committed state、补回收 zero-health entity，再把最终 committed snapshot 放入 `SimulationCompleted`，避免把旧镜像当最终事实。

@@ -60,18 +60,35 @@ public sealed class SimulationTests
         Assert.That(result.PublishedSnapshot.Ships.Select(static ship => ship.EntityKey), Is.EqualTo(final.Ships.Select(static ship => ship.EntityKey)));
     }
 
+    /// <summary>
+    /// US110 防护：空间索引必须跟随移动后的 AABB 刷新。若误开 SpatialBarrierOnly，
+    /// tick fence 不再刷新 AABB，此查询会失败——本测试即防止空间索引无声冻结的回归护栏。
+    /// </summary>
     [Test]
     public void SpatialQuery_FindsShipsAtTheirMovedBounds()
     {
         var definition = CreateDefinition(shipCount: 8, maximumCompletedTicks: 70, worldWidth: 200f, worldHeight: 200f, spatialCellSize: 100f);
-        SpaceBattleHost.Run(definition, _root, CancellationToken.None, new RecordingSink());
-        var snapshot = SpaceBattleHost.ReadSnapshot(definition, _root);
+        var bootstrapRoot = Path.Combine(_root, "bootstrap");
+        SpaceBattleHost.BootstrapOnly(definition, bootstrapRoot, CancellationToken.None, new RecordingSink());
+        var before = SpaceBattleHost.ReadSnapshot(definition, bootstrapRoot);
 
-        foreach (var ship in snapshot.Ships)
+        SpaceBattleHost.Run(definition, _root, CancellationToken.None, new RecordingSink());
+        var after = SpaceBattleHost.ReadSnapshot(definition, _root);
+
+        foreach (var ship in after.Ships)
         {
+            var beforeShip = before.Ships.Single(old => old.EntityKey == ship.EntityKey);
+            // 飞船必须确实移动过，否则本测试无法证明空间索引刷新了 AABB。
+            Assert.That(
+                MathF.Abs(ship.Hull.Bounds.MinX - beforeShip.Hull.Bounds.MinX) > 0.001f ||
+                MathF.Abs(ship.Hull.Bounds.MinY - beforeShip.Hull.Bounds.MinY) > 0.001f ||
+                MathF.Abs(ship.Hull.Bounds.MinZ - beforeShip.Hull.Bounds.MinZ) > 0.001f,
+                Is.True,
+                $"EntityKey={ship.EntityKey} 未移动，无法验证空间刷新。");
+
             var bounds = ship.Hull.Bounds;
             var found = SpaceBattleHost.QueryShipKeysInAabb(definition, _root, bounds);
-            Assert.That(found, Does.Contain(ship.EntityKey), $"空间查询未找到 EntityKey={ship.EntityKey}。");
+            Assert.That(found, Does.Contain(ship.EntityKey), $"US110 防护：空间查询未找到 EntityKey={ship.EntityKey}——空间索引可能已冻结。");
         }
     }
 

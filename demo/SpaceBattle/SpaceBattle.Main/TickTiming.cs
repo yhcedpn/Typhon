@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using static SpaceBattle.PercentileMath;
+
 namespace SpaceBattle;
 
 internal sealed class TickTiming
@@ -83,14 +85,5 @@ internal sealed class TickTiming
             WorkerCount = workerCount,
             SystemCount = systemCount,
         };
-    }
-
-    private static double Percentile(double[] ordered, double percentile)
-    {
-        var position = (ordered.Length - 1) * percentile;
-        var lower = (int)position;
-        var upper = Math.Min(lower + 1, ordered.Length - 1);
-        var fraction = position - lower;
-        return ordered[lower] + ((ordered[upper] - ordered[lower]) * fraction);
     }
 }
