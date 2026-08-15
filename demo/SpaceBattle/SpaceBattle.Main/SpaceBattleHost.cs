@@ -162,6 +162,7 @@ internal static class SpaceBattleHost
         try
         {
             Bootstrap(engine, definition, cancellationToken, observationSink);
+            RepairClusterVitals(engine, definition);
         }
         catch (OperationCanceledException)
         {
@@ -611,6 +612,83 @@ internal static class SpaceBattleHost
         }
 
         engine.WriteTickFence(tickNumber);
+    }
+
+    // 引擎缺陷规避（fork issue #53 / ADR-0008）：SpawnBatch 批量 spawn 后簇 SoA 的 Vitals 列仅部分同步
+    // （约 47.5% 槽位为 0，事务视图正确）。在 runtime 启动前用簇写路径（与 Damage 同路径，fence 后持久）
+    // 把 0 槽修复为事务视图的值。仅执行一次；若引擎侧修复该缺陷，应废弃此规避。
+    private static void RepairClusterVitals(DatabaseEngine engine, SimulationDefinition definition)
+    {
+        using var accessor = new PointInTimeAccessor();
+        accessor.Attach(engine, 1);
+        var entityAccessor = accessor.GetWorkerAccessor(0);
+        using var archetype = entityAccessor.For<Ship>();
+        var clusterCount = archetype.ClusterCount;
+
+        using var readTransaction = engine.CreateReadOnlyTransaction();
+        var zeroKeysByChunk = new Dictionary<int, HashSet<long>>();
+        var zeroSlots = 0;
+        for (var chunk = 0; chunk < clusterCount; chunk++)
+        {
+            using var clusters = entityAccessor.GetClusterEnumerator<Ship>(chunk, chunk + 1);
+            while (clusters.MoveNext())
+            {
+                var cluster = clusters.Current;
+                var vitalsSpan = cluster.GetReadOnlySpan(Ship.Vitals);
+                foreach (var slot in new SpaceBattleOccupiedSlots(cluster.OccupancyBits))
+                {
+                    if (vitalsSpan[slot].CurrentHealth == 0)
+                    {
+                        zeroSlots++;
+                        if (!zeroKeysByChunk.TryGetValue(chunk, out var keys))
+                        {
+                            keys = [];
+                            zeroKeysByChunk[chunk] = keys;
+                        }
+
+                        keys.Add(cluster.GetEntityId(slot).EntityKey);
+                    }
+                }
+            }
+        }
+
+        if (zeroKeysByChunk.Count == 0)
+        {
+            Console.Error.WriteLine($"warning=cluster_vitals_repair zero_slots={zeroSlots} repaired=0 (no gap)");
+            return;
+        }
+
+        var repaired = 0;
+        foreach (var (chunk, keys) in zeroKeysByChunk)
+        {
+            using var clusters = entityAccessor.GetClusterEnumerator<Ship>(chunk, chunk + 1);
+            while (clusters.MoveNext())
+            {
+                var cluster = clusters.Current;
+                var vitalsSpan = cluster.GetSpan(Ship.Vitals);
+                var fixedInCluster = 0;
+                foreach (var slot in new SpaceBattleOccupiedSlots(cluster.OccupancyBits))
+                {
+                    var entityId = cluster.GetEntityId(slot);
+                    if (keys.Contains(entityId.EntityKey))
+                    {
+                        vitalsSpan[slot] = readTransaction.Open(entityId).Read(Ship.Vitals);
+                        fixedInCluster++;
+                    }
+                }
+
+                if (fixedInCluster > 0)
+                {
+                    clusters.MarkCurrentDirty();
+                    repaired += fixedInCluster;
+                }
+            }
+        }
+
+        engine.WriteTickFence(0);
+        Console.Error.WriteLine(
+            $"warning=cluster_vitals_repair repaired={repaired} " +
+            "engine SpawnBatch cluster SoA sync gap (fork #53); 已按事务视图修复。");
     }
 
     private static void Bootstrap(

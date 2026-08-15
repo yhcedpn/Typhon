@@ -124,13 +124,9 @@ internal sealed class PublishSystem : ShipChunkSystem
                     // 这里采用同一范式跳过；该实体会在目标 cluster 被发布，本逻辑帧不产生该舰船帧。
                     continue;
                 }
+                // 0 血 = 死亡语义：死亡窗口（Reap 前）与引擎缺陷（#53，bootstrap 已修复）都不伪装发布；
+                // 0 血帧不参与锁定与结算（TryReadTarget/Damage 均有 0 血防护），由 Reap 统一销毁。
                 var vitals = vitalsSpan[slot];
-                if (vitals.CurrentHealth == 0)
-                {
-                    // bootstrap 的批量 spawn 在首个 cluster fence 可能暂读零填充；本逻辑帧尚未进入伤害阶段，按存活事实发布。
-                    vitals = new Vitals { CurrentHealth = State.MaximumHealth };
-                }
-
                 State.Frames.Publish(entityId, new ShipSnapshot(
                     entityKey,
                     hulls[slot],
