@@ -27,7 +27,7 @@ public struct Motion
 }
 
 [Component("SpaceBattle.Vitals", 1, StorageMode = StorageMode.SingleVersion)]
-[StructLayout(LayoutKind.Sequential, Size = 8)]
+[StructLayout(LayoutKind.Sequential)]
 public struct Vitals
 {
     [Field] public uint CurrentHealth;

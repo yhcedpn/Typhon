@@ -215,7 +215,7 @@ public sealed class WanderingTests
     [Test]
     public void Runtime_CompletesTargetLossTurnAndEvasiveFlightCycle()
     {
-        // 引擎缺陷规避（fork #53）后伤害全量生效：3 船互锁场景中观察者会被反杀、无法完成
+        // 引擎簇 Vitals 缺陷修复后伤害全量生效：3 船互锁场景中观察者会被反杀、无法完成
         // target-loss 周期。改为 2 船互锁（1 击死）：先开火方存活并经历完整周期，动态定位
         // 观察者（第一个 target loss 的船），其余断言保持原语义。
         var definition = new SimulationDefinition(

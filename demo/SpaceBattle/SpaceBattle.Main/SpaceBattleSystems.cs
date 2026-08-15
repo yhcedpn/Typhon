@@ -124,14 +124,7 @@ internal sealed class PublishSystem : ShipChunkSystem
                     // 这里采用同一范式跳过；该实体会在目标 cluster 被发布，本逻辑帧不产生该舰船帧。
                     continue;
                 }
-                // 引擎缺陷（fork #53）：运行期簇 SoA Vitals 读值不可靠（fence 后被归 0）。
-                // 以内存最后已知血为准（PreviousHealth 来自 Damage 的 UpdateHealth 同步）；
-                // 真死船该值也是 0（0 血 = 死亡语义，不参与锁定与结算，由 Reap 销毁）。
                 var vitals = vitalsSpan[slot];
-                if (vitals.CurrentHealth == 0)
-                {
-                    vitals = new Vitals { CurrentHealth = State.Frames.PreviousHealth(entityKey) };
-                }
 
                 State.Frames.Publish(entityId, new ShipSnapshot(
                     entityKey,
@@ -391,7 +384,7 @@ internal sealed class DamageSystem : ShipChunkSystem
             foreach (var slot in new SpaceBattleOccupiedSlots(cluster.OccupancyBits))
             {
                 var entityKey = cluster.GetEntityId(slot).EntityKey;
-                if (!State.Frames.TryGetIndex(entityKey, out var frameIndex))
+                if (!State.Frames.TryGetIndex(entityKey, out _))
                 {
                     continue;
                 }
@@ -402,8 +395,8 @@ internal sealed class DamageSystem : ShipChunkSystem
                     continue;
                 }
 
-                // 引擎缺陷（fork #53）：簇 SoA Vitals 读值不可靠（fence 后被归 0），以内存 Frames 血为权威。
-                var currentHealth = State.Frames.GetPublished(frameIndex).Vitals.CurrentHealth;
+                // 簇 SoA 血为本 tick 最新值（Publish 只读不改），直接作为结算基准；帧链由 UpdateHealth 同步维护。
+                var currentHealth = vitals[slot].CurrentHealth;
                 var nextHealth = incomingDamage >= currentHealth
                     ? 0u
                     : currentHealth - incomingDamage;
