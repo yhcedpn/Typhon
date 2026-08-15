@@ -230,6 +230,141 @@ public static class SpaceBattleTelemetryFormatter
         return builder.ToString();
     }
 
+    /// <summary>将稳定字段格式化为带分组标题和表格对齐的可读文本。</summary>
+    public static string FormatHumanReadable(SpaceBattleTelemetrySnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var builder = new StringBuilder(1024);
+        AppendHumanReadableCore(builder, snapshot);
+        return builder.ToString();
+    }
+
+    /// <summary>追加可读格式的核心部分。</summary>
+    private static void AppendHumanReadableCore(StringBuilder builder, SpaceBattleTelemetrySnapshot snapshot)
+    {
+        var tick = snapshot.TickPerformance;
+
+        // ── Tick header ──
+        var tickStr = Int(snapshot.TickNumber + 1);
+        builder.Append('─', 3);
+        builder.Append(" Tick #").Append(tickStr);
+        builder.Append(' ');
+        builder.Append('─', Math.Max(1, 58 - tickStr.Length));
+        builder.AppendLine();
+
+        // Alive
+        builder.Append("  Alive: ").AppendLine(Int(snapshot.AliveShips));
+
+        // Next tick modes
+        builder.Append("  Next tick modes:");
+        AppendMode(builder, "wand", snapshot.WanderingNextTick);
+        AppendMode(builder, "trk", snapshot.TrackingNextTick);
+        AppendMode(builder, "app", snapshot.ApproachingNextTick);
+        AppendMode(builder, "atk", snapshot.AttackingNextTick);
+        AppendMode(builder, "trn", snapshot.TurningNextTick);
+        builder.AppendLine();
+
+        // Valid locks
+        builder.Append("  Valid locks: ").AppendLine(Int(snapshot.ValidLocksAfterMovement));
+
+        // Tick timing
+        builder.Append("  Tick timing: p50=").Append(Fixed(tick.P50Milliseconds)).Append("ms")
+            .Append(" p95=").Append(Fixed(tick.P95Milliseconds)).Append("ms")
+            .Append(" p99=").Append(Fixed(tick.P99Milliseconds)).Append("ms")
+            .Append(" max=").Append(Fixed(tick.MaximumMilliseconds)).Append("ms")
+            .Append(" over_40ms=").Append(Int(tick.Over40Milliseconds)).AppendLine();
+
+        // Actual Hz, overload, multiplier
+        builder.Append("  Actual Hz: ").Append(Fixed(tick.ActualHz))
+            .Append("  Overload: ").Append(tick.Overload ?? "none")
+            .Append("  Multiplier: ").Append(Int(tick.TickMultiplier)).AppendLine();
+
+        // Workers, systems
+        builder.Append("  Workers: ").Append(Int(tick.WorkerCount))
+            .Append("  Systems: ").Append(Int(tick.SystemCount)).AppendLine();
+
+        // ── Queries ──
+        builder.AppendLine();
+        builder.Append('─', 3);
+        builder.Append(" Queries ");
+        builder.Append('─', 47);
+        builder.AppendLine();
+        builder.Append("  Direct: ").Append(Int(snapshot.Queries.DirectQueries))
+            .Append("  Batched: ").Append(Int(snapshot.Queries.BatchedQueries)).AppendLine();
+        builder.Append("  Candidates: ").Append(Int(snapshot.Queries.GatherCandidates))
+            .Append("  Distance tests: ").Append(Int(snapshot.Queries.ExactDistanceTests)).AppendLine();
+
+        // ── Combat ──
+        builder.AppendLine();
+        builder.Append('─', 3);
+        builder.Append(" Combat ");
+        builder.Append('─', 48);
+        builder.AppendLine();
+        builder.Append("  Weapon uses: ").Append(Int(snapshot.Combat.WeaponUses))
+            .Append("  In-range attacks: ").Append(Int(snapshot.Combat.InRangeAttacks)).AppendLine();
+        builder.Append("  Damage: ").Append(Int(snapshot.Combat.Damage))
+            .Append("  Deaths: ").Append(Int(snapshot.Combat.Deaths)).AppendLine();
+
+        // ── Per-system timing table ──
+        builder.AppendLine();
+        builder.Append('─', 3);
+        builder.Append(" Per-system timing ");
+        builder.Append('─', 38);
+        builder.AppendLine();
+
+        // Compute max name width
+        var nameWidth = "System".Length;
+        foreach (var sys in snapshot.Systems)
+        {
+            if (sys.Name.Length > nameWidth) nameWidth = sys.Name.Length;
+        }
+        if (nameWidth > 40) nameWidth = 40;
+
+        // Header
+        builder.Append("  ");
+        AppendPaddedRight(builder, "System", nameWidth);
+        builder.Append("  "); AppendPaddedLeft(builder, "Mean_us", 12);
+        builder.Append("  "); AppendPaddedLeft(builder, "P95_us", 12);
+        builder.Append("  "); AppendPaddedLeft(builder, "Max_us", 12);
+        builder.Append("  "); AppendPaddedLeft(builder, "Entities", 9);
+        builder.Append("  "); AppendPaddedLeft(builder, "Workers", 7);
+        builder.Append("  "); AppendPaddedLeft(builder, "Samples", 7);
+        builder.AppendLine();
+
+        // Data rows
+        foreach (var sys in snapshot.Systems)
+        {
+            builder.Append("  ");
+            AppendPaddedRight(builder, sys.Name, nameWidth);
+            builder.Append("  "); AppendPaddedLeft(builder, Fixed(sys.MeanMicroseconds), 12);
+            builder.Append("  "); AppendPaddedLeft(builder, Fixed(sys.P95Microseconds), 12);
+            builder.Append("  "); AppendPaddedLeft(builder, Fixed(sys.MaximumMicroseconds), 12);
+            builder.Append("  "); AppendPaddedLeft(builder, Int(sys.Entities), 9);
+            builder.Append("  "); AppendPaddedLeft(builder, Int(sys.Workers), 7);
+            builder.Append("  "); AppendPaddedLeft(builder, Int(sys.SampleCount), 7);
+            builder.AppendLine();
+        }
+    }
+
+    private static void AppendPaddedLeft(StringBuilder builder, string value, int totalWidth)
+    {
+        var padding = totalWidth - value.Length;
+        if (padding > 0) builder.Append(' ', padding);
+        builder.Append(value);
+    }
+
+    private static void AppendPaddedRight(StringBuilder builder, string value, int totalWidth)
+    {
+        builder.Append(value);
+        var padding = totalWidth - value.Length;
+        if (padding > 0) builder.Append(' ', padding);
+    }
+
+    private static void AppendMode(StringBuilder builder, string label, int value)
+    {
+        builder.Append(' ').Append(label).Append('=').Append(Int(value));
+    }
+
     private static void AppendCore(StringBuilder builder, SpaceBattleTelemetrySnapshot snapshot)
     {
         var tick = snapshot.TickPerformance;
