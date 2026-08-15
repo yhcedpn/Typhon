@@ -200,7 +200,6 @@ internal sealed class SpaceBattleSimulationState : IDisposable
 
             if (tickNumber - slot.CreatedTick <= 1)
             {
-                slot.LastUsedTick = tickNumber;
                 return transaction;
             }
 
@@ -210,7 +209,6 @@ internal sealed class SpaceBattleSimulationState : IDisposable
         transaction = Engine.CreateReadOnlyTransaction();
         slot.OwnerThreadId = threadId;
         slot.CreatedTick = tickNumber;
-        slot.LastUsedTick = tickNumber;
         Volatile.Write(ref slot.Transaction, transaction);
         Interlocked.Increment(ref _acquisitionTransactionsCreated);
         return transaction;
@@ -238,7 +236,6 @@ internal sealed class SpaceBattleSimulationState : IDisposable
         Volatile.Write(ref slot.Transaction, null);
         slot.OwnerThreadId = 0;
         slot.CreatedTick = -1;
-        slot.LastUsedTick = -1;
         transaction.Dispose();
         Interlocked.Increment(ref _acquisitionTransactionsDisposed);
     }
@@ -269,7 +266,6 @@ internal sealed class SpaceBattleSimulationState : IDisposable
 
             slot.OwnerThreadId = 0;
             slot.CreatedTick = -1;
-            slot.LastUsedTick = -1;
             try
             {
                 transaction.Dispose();
@@ -291,7 +287,6 @@ internal sealed class SpaceBattleSimulationState : IDisposable
     {
         public Transaction Transaction;
         public long CreatedTick = -1;
-        public long LastUsedTick = -1;
         public int OwnerThreadId;
     }
     public void RecordTargetingMetrics(int workerId, in TargetingQueryMetrics metrics)
@@ -1177,70 +1172,33 @@ internal static class SpaceBattleMath
 
     public static AABB3F MoveBounds(
         AABB3F current,
-        float headingX,
-        float headingY,
-        float speed,
-        float deltaSeconds,
-        float worldWidth,
-        float worldHeight,
-        out float resultingHeadingX,
-        out float resultingHeadingY)
-    {
-        var x = ReflectCoordinate(
-            current.MinX,
-            (double)headingX * speed * deltaSeconds,
-            worldWidth,
-            out var xDirection);
-        var y = ReflectCoordinate(
-            current.MinY,
-            (double)headingY * speed * deltaSeconds,
-            worldHeight,
-            out var yDirection);
-        resultingHeadingX = headingX * xDirection;
-        resultingHeadingY = headingY * yDirection;
-        return new AABB3F
-        {
-            MinX = x,
-            MaxX = x,
-            MinY = y,
-            MaxY = y,
-            MinZ = current.MinZ,
-            MaxZ = current.MaxZ,
-        };
-    }
-
-    public static AABB3F MoveBounds(
-        AABB3F current,
-        float headingX,
-        float headingY,
-        float headingZ,
+        Vector3 heading,
         float speed,
         float deltaSeconds,
         float worldWidth,
         float worldHeight,
         float worldDepth,
-        out float resultingHeadingX,
-        out float resultingHeadingY,
-        out float resultingHeadingZ)
+        out Vector3 resultingHeading)
     {
         var x = ReflectCoordinate(
             current.MinX,
-            (double)headingX * speed * deltaSeconds,
+            (double)heading.X * speed * deltaSeconds,
             worldWidth,
             out var xDirection);
         var y = ReflectCoordinate(
             current.MinY,
-            (double)headingY * speed * deltaSeconds,
+            (double)heading.Y * speed * deltaSeconds,
             worldHeight,
             out var yDirection);
         var z = ReflectCoordinate(
             current.MinZ,
-            (double)headingZ * speed * deltaSeconds,
+            (double)heading.Z * speed * deltaSeconds,
             worldDepth,
             out var zDirection);
-        resultingHeadingX = headingX * xDirection;
-        resultingHeadingY = headingY * yDirection;
-        resultingHeadingZ = headingZ * zDirection;
+        resultingHeading = new Vector3(
+            heading.X * xDirection,
+            heading.Y * yDirection,
+            heading.Z * zDirection);
         return new AABB3F
         {
             MinX = x,
@@ -1250,40 +1208,6 @@ internal static class SpaceBattleMath
             MinZ = z,
             MaxZ = z,
         };
-    }
-
-    public static AABB3F MoveBounds(
-        AABB3F current,
-        Vector3 heading,
-        float speed,
-        float deltaSeconds,
-        float worldWidth,
-        float worldHeight,
-        float worldDepth,
-        out Vector3 resultingHeading)
-    {
-        var bounds = MoveBounds(
-            current,
-            heading.X,
-            heading.Y,
-            heading.Z,
-            speed,
-            deltaSeconds,
-            worldWidth,
-            worldHeight,
-            worldDepth,
-            out var resultingHeadingX,
-            out var resultingHeadingY,
-            out var resultingHeadingZ);
-        resultingHeading = new Vector3(resultingHeadingX, resultingHeadingY, resultingHeadingZ);
-        return bounds;
-    }
-
-    public static float ReflectCoordinate(float position, float displacement, float upperBound, out bool reflected)
-    {
-        var result = ReflectCoordinate(position, (double)displacement, upperBound, out var direction);
-        reflected = direction < 0;
-        return result;
     }
 
     private static float ReflectCoordinate(

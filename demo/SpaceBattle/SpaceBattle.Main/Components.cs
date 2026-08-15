@@ -31,12 +31,6 @@ public struct Motion
 public struct Vitals
 {
     [Field] public uint CurrentHealth;
-
-    public uint Current
-    {
-        readonly get => CurrentHealth;
-        set => CurrentHealth = value;
-    }
 }
 
 [Component("SpaceBattle.Targeting", 1, StorageMode = StorageMode.SingleVersion)]
@@ -44,12 +38,6 @@ public struct Vitals
 public struct Targeting
 {
     [Field] public long TargetEntityId;
-
-    public long TargetId
-    {
-        readonly get => TargetEntityId;
-        set => TargetEntityId = value;
-    }
 }
 
 [Component("SpaceBattle.Behavior", 1, StorageMode = StorageMode.SingleVersion)]

@@ -25,10 +25,7 @@ public sealed record InitializationProgress(
 
 public sealed record InitializationCompleted(
     int ShipCount,
-    TimeSpan BootstrapDuration) : SpaceBattleObservation
-{
-    public TimeSpan Duration => BootstrapDuration;
-}
+    TimeSpan BootstrapDuration) : SpaceBattleObservation;
 
 public sealed record SimulationTickCompleted(
     long TickNumber,

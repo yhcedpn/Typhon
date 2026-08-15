@@ -50,7 +50,7 @@ internal static class SpaceBattleTargeting
     private const float TemporaryBinSize = 50f;
     private const double LockRangeSquared = LockRange * LockRange;
 
-    public static EntityId FindNearest(
+    internal static EntityId FindNearest(
         Transaction acquisitionTransaction,
         SpaceBattleSimulationState state,
         in ShipSnapshot source,

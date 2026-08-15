@@ -76,10 +76,6 @@ public sealed record SimulationDefinition
     // -1 保留运行时自动拓扑；正数用于固定 worker 拓扑复现诊断。
     public int WorkerCount { get; init; }
 
-    public float WorldSizeX => WorldWidth;
-    public float WorldSizeY => WorldHeight;
-    public float WorldSizeZ => WorldDepth;
-
     public void Validate()
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(RunName);
