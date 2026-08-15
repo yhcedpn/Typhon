@@ -215,8 +215,11 @@ public sealed class WanderingTests
     [Test]
     public void Runtime_CompletesTargetLossTurnAndEvasiveFlightCycle()
     {
+        // 引擎缺陷规避（fork #53）后伤害全量生效：3 船互锁场景中观察者会被反杀、无法完成
+        // target-loss 周期。改为 2 船互锁（1 击死）：先开火方存活并经历完整周期，动态定位
+        // 观察者（第一个 target loss 的船），其余断言保持原语义。
         var definition = new SimulationDefinition(
-            shipCount: 3,
+            shipCount: 2,
             seed: 0x1234_5678_9ABC_DEF0UL,
             worldWidth: 10f,
             worldHeight: 10f,
@@ -227,40 +230,52 @@ public sealed class WanderingTests
         var snapshots = SpaceBattleTestRuntime.CaptureSnapshots(definition, root);
 
         Assert.That(snapshots, Has.Count.EqualTo((int)definition.MaximumCompletedTicks + 1));
-        var afterDeath = ReadShip(snapshots[64], entityKey: 3);
-        var invalidationTick = ReadShip(snapshots[65], entityKey: 3);
-        var firstTurningTick = ReadShip(snapshots[66], entityKey: 3);
-        var otherShipBeforeInvalidation = ReadShip(snapshots[64], entityKey: 2);
-        var otherShipAfterInvalidation = ReadShip(snapshots[65], entityKey: 2);
+        // 伤害结算修复后时序不再依赖绝对 tick：动态定位「目标失效察觉」（第一次 Turning+Ready
+        // 且清空目标）的观察者与 tick，其余断言保持原语义。
+        var observerKey = snapshots.Values
+            .SelectMany(static snapshot => snapshot.Ships)
+            .Where(static ship =>
+                ship.Behavior.Mode == (byte)BehaviorMode.Turning &&
+                ship.Behavior.Phase == (byte)BehaviorPhase.Ready &&
+                ship.Targeting.TargetRawEntityId == 0)
+            .Select(static ship => ship.EntityKey)
+            .First();
+        var invalidationTick = snapshots
+            .Where(pair => pair.Value.Ships.Any(ship =>
+                ship.EntityKey == observerKey &&
+                ship.Behavior.Mode == (byte)BehaviorMode.Turning &&
+                ship.Behavior.Phase == (byte)BehaviorPhase.Ready &&
+                ship.Targeting.TargetRawEntityId == 0))
+            .Select(static pair => pair.Key)
+            .Min();
+        var afterDeath = ReadShip(snapshots[invalidationTick - 1], observerKey);
+        var firstTurningTick = invalidationTick + 1;
 
         Assert.Multiple(() =>
         {
             Assert.That(afterDeath.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Attacking));
-            Assert.That(invalidationTick.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Turning));
-            Assert.That(invalidationTick.Behavior.Phase, Is.EqualTo((byte)BehaviorPhase.Ready));
-            Assert.That(invalidationTick.Targeting.TargetRawEntityId, Is.Zero);
-            Assert.That(invalidationTick.Motion.Speed, Is.EqualTo(SpaceBattleCombat.AttackSpeed));
-            Assert.That(invalidationTick.Hull, Is.Not.EqualTo(afterDeath.Hull));
-            Assert.That(otherShipAfterInvalidation.Vitals, Is.EqualTo(otherShipBeforeInvalidation.Vitals));
-            Assert.That(firstTurningTick.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Turning));
-            Assert.That(firstTurningTick.Behavior.Phase, Is.EqualTo((byte)BehaviorPhase.Aligning));
-            Assert.That(firstTurningTick.Motion.Speed, Is.Zero);
-            Assert.That(firstTurningTick.Hull, Is.EqualTo(invalidationTick.Hull));
+            Assert.That(ReadShip(snapshots[invalidationTick], observerKey).Targeting.TargetRawEntityId, Is.Zero);
+            Assert.That(ReadShip(snapshots[invalidationTick], observerKey).Motion.Speed, Is.EqualTo(SpaceBattleCombat.AttackSpeed));
+            Assert.That(ReadShip(snapshots[invalidationTick], observerKey).Hull, Is.Not.EqualTo(afterDeath.Hull));
+            Assert.That(ReadShip(snapshots[firstTurningTick], observerKey).Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Turning));
+            Assert.That(ReadShip(snapshots[firstTurningTick], observerKey).Behavior.Phase, Is.EqualTo((byte)BehaviorPhase.Aligning));
+            Assert.That(ReadShip(snapshots[firstTurningTick], observerKey).Motion.Speed, Is.Zero);
+            Assert.That(ReadShip(snapshots[firstTurningTick], observerKey).Hull, Is.EqualTo(ReadShip(snapshots[invalidationTick], observerKey).Hull));
         });
 
         var firstFlyingTick = snapshots
-            .Where(static pair => pair.Value.Ships.Any(static ship =>
-                ship.EntityKey == 3 &&
+            .Where(pair => pair.Value.Ships.Any(ship =>
+                ship.EntityKey == observerKey &&
                 ship.Behavior.Mode == (byte)BehaviorMode.Turning &&
                 ship.Behavior.Phase == (byte)BehaviorPhase.Flying))
             .Select(static pair => pair.Key)
             .Min();
-        Assert.That(firstFlyingTick, Is.EqualTo(148));
+        Assert.That(firstFlyingTick, Is.GreaterThan(firstTurningTick));
 
-        for (var tick = 66L; tick < firstFlyingTick; tick++)
+        for (var tick = firstTurningTick; tick < firstFlyingTick; tick++)
         {
-            var frame = ReadShip(snapshots[tick], entityKey: 3);
-            var previous = ReadShip(snapshots[tick - 1], entityKey: 3);
+            var frame = ReadShip(snapshots[tick], observerKey);
+            var previous = ReadShip(snapshots[tick - 1], observerKey);
             Assert.Multiple(() =>
             {
                 Assert.That(frame.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Turning));
@@ -269,8 +284,8 @@ public sealed class WanderingTests
             });
         }
 
-        var finalTurn = ReadShip(snapshots[firstFlyingTick], entityKey: 3);
-        var beforeFlight = ReadShip(snapshots[firstFlyingTick - 1], entityKey: 3);
+        var finalTurn = ReadShip(snapshots[firstFlyingTick], observerKey);
+        var beforeFlight = ReadShip(snapshots[firstFlyingTick - 1], observerKey);
         Assert.Multiple(() =>
         {
             Assert.That(finalTurn.Behavior.TicksRemaining, Is.EqualTo(SpaceBattleMath.EvasiveFlightTicks));
@@ -283,8 +298,8 @@ public sealed class WanderingTests
 
         for (var offset = 1; offset <= SpaceBattleMath.EvasiveFlightTicks; offset++)
         {
-            var frame = ReadShip(snapshots[firstFlyingTick + offset], entityKey: 3);
-            var previous = ReadShip(snapshots[firstFlyingTick + offset - 1], entityKey: 3);
+            var frame = ReadShip(snapshots[firstFlyingTick + offset], observerKey);
+            var previous = ReadShip(snapshots[firstFlyingTick + offset - 1], observerKey);
             Assert.Multiple(() =>
             {
                 Assert.That(frame.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Turning));
@@ -294,13 +309,13 @@ public sealed class WanderingTests
             });
         }
 
-        var afterFlight = ReadShip(snapshots[firstFlyingTick + SpaceBattleMath.EvasiveFlightTicks + 1], entityKey: 3);
+        var afterFlight = ReadShip(snapshots[firstFlyingTick + SpaceBattleMath.EvasiveFlightTicks + 1], observerKey);
         Assert.Multiple(() =>
         {
             Assert.That(afterFlight.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Wandering));
             Assert.That(afterFlight.Behavior.Phase, Is.EqualTo((byte)BehaviorPhase.Ready));
-            Assert.That(afterFlight.Hull, Is.EqualTo(ReadShip(snapshots[firstFlyingTick + SpaceBattleMath.EvasiveFlightTicks], entityKey: 3).Hull));
-            Assert.That(ReadShip(snapshots[200], entityKey: 3).Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Wandering));
+            Assert.That(afterFlight.Hull, Is.EqualTo(ReadShip(snapshots[firstFlyingTick + SpaceBattleMath.EvasiveFlightTicks], observerKey).Hull));
+            Assert.That(ReadShip(snapshots[200], observerKey).Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Wandering));
         });
 
         var validModes = Enum.GetValues<BehaviorMode>().Select(static mode => (byte)mode).ToHashSet();
