@@ -63,7 +63,7 @@ public sealed class CombatTests
             Assert.That(SpaceBattleCombat.WeaponRange, Is.EqualTo(100f));
             Assert.That(SpaceBattleCombat.WeaponDamage, Is.EqualTo(250u));
             Assert.That(SpaceBattleCombat.WeaponPeriodTicks, Is.EqualTo(15));
-            Assert.That(SpaceBattleCombat.WeaponSpeed, Is.EqualTo(200f));
+            Assert.That(SpaceBattleCombat.AttackSpeed, Is.EqualTo(200f));
             Assert.That(SpaceBattleCombat.DamageForDistance(100d * 100d), Is.EqualTo(250u));
             Assert.That(SpaceBattleCombat.DamageForDistance(100.0001d * 100.0001d), Is.Zero);
             Assert.That(SpaceBattleCombat.DamageForDistance(150d * 150d), Is.Zero);

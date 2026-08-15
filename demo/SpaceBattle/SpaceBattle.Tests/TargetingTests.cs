@@ -280,7 +280,7 @@ public sealed class TargetingTests
 
         Assert.That(snapshot.Ships, Has.All.Matches<ShipSnapshot>(ship =>
             (ship.Behavior.Mode is (byte)BehaviorMode.Approaching or (byte)BehaviorMode.Attacking) &&
-            ship.Motion.Speed == SpaceBattleTargeting.ApproachSpeed &&
+            ship.Motion.Speed == SpaceBattleMath.MaximumWanderSpeed &&
             ship.Targeting.TargetEntityId != 0));
 
         foreach (var ship in snapshot.Ships)

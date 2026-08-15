@@ -698,7 +698,7 @@ internal sealed class SpaceBattleSimulationState : IDisposable
             throw new ArgumentOutOfRangeException(nameof(workerId));
         }
 
-        if (damage == 0 || !TryGetEntityIndex(targetEntityKey, out var index))
+        if (damage == 0 || !TryGetSlotIndex(targetEntityKey, out var index))
         {
             return;
         }
@@ -729,7 +729,7 @@ internal sealed class SpaceBattleSimulationState : IDisposable
             throw new ArgumentOutOfRangeException(nameof(workerId));
         }
 
-        return TryGetEntityIndex(targetEntityKey, out var index)
+        return TryGetSlotIndex(targetEntityKey, out var index)
             ? _incomingDamageLanes[workerId][index]
             : 0u;
     }
@@ -756,7 +756,7 @@ internal sealed class SpaceBattleSimulationState : IDisposable
 
     public uint ReduceIncomingDamage(long targetEntityKey)
     {
-        if (!TryGetEntityIndex(targetEntityKey, out var index))
+        if (!TryGetSlotIndex(targetEntityKey, out var index))
         {
             return 0u;
         }
@@ -780,7 +780,7 @@ internal sealed class SpaceBattleSimulationState : IDisposable
             var touchedCount = _incomingDamageTouchedCounts[workerId];
             for (var index = 0; index < touchedCount; index++)
             {
-                if (TryGetEntityIndex(touchedKeys[index], out var entityIndex))
+                if (TryGetSlotIndex(touchedKeys[index], out var entityIndex))
                 {
                     lane[entityIndex] = 0;
                     touchedGenerations[entityIndex] = 0;
@@ -912,7 +912,7 @@ internal sealed class SpaceBattleSimulationState : IDisposable
 
     public void CompleteReaps() => Array.Clear(_reapCounts);
 
-    private bool TryGetEntityIndex(long entityKey, out int index)
+    private bool TryGetSlotIndex(long entityKey, out int index)
     {
         if ((ulong)entityKey < (ulong)_frames.Length)
         {

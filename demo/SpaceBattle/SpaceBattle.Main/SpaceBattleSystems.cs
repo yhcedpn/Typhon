@@ -9,7 +9,7 @@ internal static class SpaceBattleCombat
     public const float WeaponRange = SpaceBattleTargeting.WeaponRange;
     public const uint WeaponDamage = 250u;
     public const ushort WeaponPeriodTicks = 15;
-    public const float WeaponSpeed = SpaceBattleTargeting.ApproachSpeed;
+    public const float AttackSpeed = 200f;
 
     public static int FirstWeaponPhase(long entityKey)
     {
@@ -341,7 +341,7 @@ internal sealed class BehaviorSystem : ShipChunkSystem
         behavior.Phase = (byte)BehaviorPhase.Ready;
         behavior.TicksRemaining = 0;
         behavior.ModeStartedTick = tickNumber + 1;
-        motion.Speed = SpaceBattleCombat.WeaponSpeed;
+        motion.Speed = SpaceBattleCombat.AttackSpeed;
     }
 
     private void AdvanceTargetedMode(
@@ -363,7 +363,7 @@ internal sealed class BehaviorSystem : ShipChunkSystem
             return;
         }
 
-        motion.Speed = SpaceBattleCombat.WeaponSpeed;
+        motion.Speed = SpaceBattleCombat.AttackSpeed;
         if ((BehaviorMode)source.Behavior.Mode == BehaviorMode.Approaching &&
             distanceSquared <= SpaceBattleCombat.WeaponRange * SpaceBattleCombat.WeaponRange)
         {

@@ -250,7 +250,7 @@ public sealed class WanderingTests
             Assert.That(invalidationTick.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Turning));
             Assert.That(invalidationTick.Behavior.Phase, Is.EqualTo((byte)BehaviorPhase.Ready));
             Assert.That(invalidationTick.Targeting.TargetEntityId, Is.Zero);
-            Assert.That(invalidationTick.Motion.Speed, Is.EqualTo(SpaceBattleCombat.WeaponSpeed));
+            Assert.That(invalidationTick.Motion.Speed, Is.EqualTo(SpaceBattleCombat.AttackSpeed));
             Assert.That(invalidationTick.Hull, Is.Not.EqualTo(afterDeath.Hull));
             Assert.That(otherShipAfterInvalidation.Vitals, Is.EqualTo(otherShipBeforeInvalidation.Vitals));
             Assert.That(firstTurningTick.Behavior.Mode, Is.EqualTo((byte)BehaviorMode.Turning));

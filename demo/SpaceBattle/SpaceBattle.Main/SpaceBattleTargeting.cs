@@ -44,7 +44,6 @@ internal static class SpaceBattleTargeting
 {
     public const float LockRange = 200f;
     public const float WeaponRange = 100f;
-    public const float ApproachSpeed = SpaceBattleMath.MaximumWanderSpeed;
 
     private const int DirectBatchThreshold = 4;
     private const float TemporaryBinSize = 50f;
