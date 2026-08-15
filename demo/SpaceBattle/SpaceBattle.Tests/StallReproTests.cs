@@ -327,6 +327,187 @@ public sealed class StallReproTests
             $"ENGINEMINIMAL_AFTER_REPAIR zero_in_cluster={zeroAfterRepair}");
     }
 
+    // 运行期恶化复现实验：纯引擎 API 下，模拟 Damage 全量写簇 Vitals + fence 迭代，
+    // 观察簇 SoA 读视图是否丢失写入（归 0/回退）——回答「恶化是否需要 runtime 时序」。
+    [Test]
+    [Explicit("临时诊断探针：fence 迭代下簇 SoA Vitals 恶化复现；Release-only。")]
+    public void EngineMinimal_FenceIterations_ClusterVitalsDegradation()
+    {
+        const int shipCount = 5_000;
+        var definition = new SimulationDefinition(shipCount);
+
+        var directory = Path.Combine(_root, "engine-fence-iter");
+        using var engine = SpaceBattleDatabase.Open(definition, directory);
+
+        var hulls = new Hull[shipCount];
+        var motions = new Motion[shipCount];
+        var vitals = new Vitals[shipCount];
+        var targetings = new Targeting[shipCount];
+        var behaviors = new Behavior[shipCount];
+        var random = new SplitMix64(definition.Seed);
+        for (var index = 0; index < shipCount; index++)
+        {
+            var x = random.NextCoordinate(definition.WorldWidth);
+            var y = random.NextCoordinate(definition.WorldHeight);
+            var z = random.NextCoordinate(definition.WorldDepth);
+            hulls[index] = new Hull
+            {
+                Bounds = new AABB3F
+                {
+                    MinX = x,
+                    MinY = y,
+                    MinZ = z,
+                    MaxX = x,
+                    MaxY = y,
+                    MaxZ = z,
+                },
+            };
+            vitals[index] = new Vitals { CurrentHealth = definition.MaximumHealth };
+            behaviors[index] = new Behavior
+            {
+                Mode = (byte)BehaviorMode.Wandering,
+                Phase = (byte)BehaviorPhase.Ready,
+            };
+        }
+
+        var ids = new EntityId[shipCount];
+        using (var transaction = engine.CreateQuickTransaction(DurabilityMode.Immediate))
+        {
+            transaction.SpawnBatchAllocate<Ship>(shipCount, ids);
+            transaction.SpawnBatchWriteAll(0, shipCount, Ship.Hull, hulls);
+            transaction.SpawnBatchWriteAll(0, shipCount, Ship.Motion, motions);
+            transaction.SpawnBatchWriteAll(0, shipCount, Ship.Vitals, vitals);
+            transaction.SpawnBatchWriteAll(0, shipCount, Ship.Targeting, targetings);
+            transaction.SpawnBatchWriteAll(0, shipCount, Ship.Behavior, behaviors);
+            Assert.That(transaction.Commit(), Is.True);
+        }
+
+        engine.WriteTickFence(0);
+
+        using var accessor = new PointInTimeAccessor();
+        accessor.Attach(engine, 1);
+        var entityAccessor = accessor.GetWorkerAccessor(0);
+
+        (int Slots, int Zero) Scan()
+        {
+            var slots = 0;
+            var zero = 0;
+            using var arch = entityAccessor.For<Ship>();
+            for (var chunk = 0; chunk < arch.ClusterCount; chunk++)
+            {
+                using var clusters = entityAccessor.GetClusterEnumerator<Ship>(chunk, chunk + 1);
+                while (clusters.MoveNext())
+                {
+                    var cluster = clusters.Current;
+                    var span = cluster.GetReadOnlySpan(Ship.Vitals);
+                    foreach (var slot in new SpaceBattleOccupiedSlots(cluster.OccupancyBits))
+                    {
+                        slots++;
+                        if (span[slot].CurrentHealth == 0)
+                        {
+                            zero++;
+                        }
+                    }
+                }
+            }
+
+            return (slots, zero);
+        }
+
+        var afterSpawn = Scan();
+        TestContext.Progress.WriteLine(
+            $"FENCEITER after_spawn slots={afterSpawn.Slots} zero={afterSpawn.Zero} ratio={(afterSpawn.Slots == 0 ? 0 : (double)afterSpawn.Zero / afterSpawn.Slots):P1}");
+
+        // 修复 0 槽（簇写满血 + MarkCurrentDirty + fence）
+        using (var arch = entityAccessor.For<Ship>())
+        {
+            for (var chunk = 0; chunk < arch.ClusterCount; chunk++)
+            {
+                using var clusters = entityAccessor.GetClusterEnumerator<Ship>(chunk, chunk + 1);
+                while (clusters.MoveNext())
+                {
+                    var cluster = clusters.Current;
+                    var span = cluster.GetSpan(Ship.Vitals);
+                    var fixedAny = false;
+                    foreach (var slot in new SpaceBattleOccupiedSlots(cluster.OccupancyBits))
+                    {
+                        if (span[slot].CurrentHealth == 0)
+                        {
+                            span[slot] = new Vitals { CurrentHealth = definition.MaximumHealth };
+                            fixedAny = true;
+                        }
+                    }
+
+                    if (fixedAny)
+                    {
+                        clusters.MarkCurrentDirty();
+                    }
+                }
+            }
+        }
+
+        engine.WriteTickFence(0);
+        var afterRepair = Scan();
+        TestContext.Progress.WriteLine(
+            $"FENCEITER after_repair slots={afterRepair.Slots} zero={afterRepair.Zero} ratio={(afterRepair.Slots == 0 ? 0 : (double)afterRepair.Zero / afterRepair.Slots):P1}");
+
+        // 模拟 Damage：全量写簇 Vitals=500 + fence，观察保留率（500 保留 = 簇写路径正常；归 0 = 恶化复现）
+        for (var round = 1; round <= 6; round++)
+        {
+            using (var arch = entityAccessor.For<Ship>())
+            {
+                for (var chunk = 0; chunk < arch.ClusterCount; chunk++)
+                {
+                    using var clusters = entityAccessor.GetClusterEnumerator<Ship>(chunk, chunk + 1);
+                    while (clusters.MoveNext())
+                    {
+                        var cluster = clusters.Current;
+                        var span = cluster.GetSpan(Ship.Vitals);
+                        var wrote = false;
+                        foreach (var slot in new SpaceBattleOccupiedSlots(cluster.OccupancyBits))
+                        {
+                            span[slot] = new Vitals { CurrentHealth = 500u };
+                            wrote = true;
+                        }
+
+                        if (wrote)
+                        {
+                            clusters.MarkCurrentDirty();
+                        }
+                    }
+                }
+            }
+
+            engine.WriteTickFence(0);
+
+            var scan = Scan();
+            var preserved = 0;
+            using (var arch = entityAccessor.For<Ship>())
+            {
+                for (var chunk = 0; chunk < arch.ClusterCount; chunk++)
+                {
+                    using var clusters = entityAccessor.GetClusterEnumerator<Ship>(chunk, chunk + 1);
+                    while (clusters.MoveNext())
+                    {
+                        var cluster = clusters.Current;
+                        var span = cluster.GetReadOnlySpan(Ship.Vitals);
+                        foreach (var slot in new SpaceBattleOccupiedSlots(cluster.OccupancyBits))
+                        {
+                            if (span[slot].CurrentHealth == 500u)
+                            {
+                                preserved++;
+                            }
+                        }
+                    }
+                }
+            }
+
+            TestContext.Progress.WriteLine(
+                $"FENCEITER round={round} zero={scan.Zero}/{scan.Slots} " +
+                $"preserved_500={preserved}/{scan.Slots} ratio={(scan.Slots == 0 ? 0 : (double)preserved / scan.Slots):P1}");
+        }
+    }
+
     private readonly record struct Sample(
         long Tick,
         int Alive,
