@@ -41,7 +41,7 @@ public struct Targeting
 }
 
 [Component("SpaceBattle.Behavior", 1, StorageMode = StorageMode.SingleVersion)]
-[StructLayout(LayoutKind.Sequential)]
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
 public struct Behavior
 {
     [Field] public byte Mode;

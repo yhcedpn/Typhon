@@ -480,7 +480,12 @@ internal sealed class MovementSystem : ShipChunkSystem
         while (clusters.MoveNext())
         {
             var cluster = clusters.Current;
+            // TYPHON009 豁免：WriteSpatial V1 仅支持 AABB2F（AABB3F 会抛 NotSupportedException），
+            // demo 的 Hull 是 AABB3F 无 barrier 可用；tick fence 空间维护按脏位批次从簇字节重读
+            // 组件（ProcessSpatialEntries(…, dirtyBits, …)），GetSpan 写与此处语义等价（见 ADR-0009）。
+#pragma warning disable TYPHON009
             var hulls = cluster.GetSpan(Ship.Hull);
+#pragma warning restore TYPHON009
             var motions = cluster.GetSpan(Ship.Motion);
             var clusterDirty = false;
             foreach (var slot in new SpaceBattleOccupiedSlots(cluster.OccupancyBits))
